@@ -402,3 +402,51 @@ Both were confirmed red before the fix: the first asserted on
 `prohibitedInterfaceTypes` and saw `[]`; the second was proven by running the
 original loop shape against a silent browser, which never returned within 400ms
 while the replacement returned in 53ms.
+
+## Found on hardware, 2026-08-14 — neither side could recover from a radio change
+
+Wi-Fi disconnected from its network, radio on, no cable, no hotspot. A working
+AWDL session died within 400ms of the kernel's
+
+```
+awdl0: interfaceStateChange: Infra link down, disable dynamic SDB
+disableWorkQueueSources: Disable all AWDL timers
+```
+
+and the phone did not get back in for ~100 seconds. On the Mac there was **zero
+`accept:`** in that entire window — so the phone was not being refused, it never
+dialled. Two silences, one per side, and neither side had a sensor for its own.
+
+| Test | Guards against |
+| --- | --- |
+| `DiscoveryRecoveryRegressionTests` — browser rebuild | A wedged `NWBrowser` being permanent. It had **no `stateUpdateHandler` at all**, so a browser that failed when its interface was reconfigured was undetectable; and `start(on:)` guarded on `browser == nil`, so it could not be replaced even deliberately. `firstMatch` then returned nil for the life of the tunnel. |
+| `DiscoveryRecoveryRegressionTests` — staleness | A dead cached endpoint costing the full 12s `connectTimeout` on every retry, at the exact moment the device is trying to recover. `peers()` yielded `latest` unconditionally, so a result from before the radio changed was returned instantly and treated as current. |
+| `AdvertisementRecoveryRegressionTests` — path change | The Mac silently ceasing to be findable. `restartListener()` was reachable only from `start()` and `setPairingCode()`; there was no `NWPathMonitor` anywhere in the kit, and the listener's state handler covered `.failed` alone, emitting an event nothing acted on. A listener that survives a radio change but stops being advertised on the re-derived `awdl0` is, from the Mac's side, indistinguishable from a healthy one. |
+| `AdvertisementRecoveryRegressionTests` — debounce | The fix becoming its own failure. One Wi-Fi disconnect produces a burst of path updates, and the port changes on every rebuild (`NWListener` will not rebind a port it just released), so re-advertising per update makes a browser watch the service flap rather than settle. |
+| `AdvertisementRecoveryRegressionTests` — stop | A host that cannot be stopped. `stop()` cancels the listener, and `.cancelled` is precisely what cancelling reports, so the new rebuild-on-terminal-state rule read a deliberate shutdown as a death and put the Mac straight back on the air — advertisement and bound socket outliving the user quitting. |
+
+### Two notes on method
+
+**The staleness test passed before it tested anything.** Its first version used a
+never-started `PeerDiscovery`, whose `latest` is empty regardless — so it went
+green with the fix deleted. It only became a test once the window was made
+injectable and a peer was actually observed through a seam. This is the same
+failure as the `169.254.4.183/16` case above, and it is now the second time
+coverage has pinned nothing until it was watched red.
+
+**Two of the five bugs were found by reading the tests' own log, not by
+reasoning.** `stop()` resurrecting the listener and `awaitListening`'s 1s bound
+being tighter than a rebuild both appeared as unexplained lines
+(`listener died (cancelled) — rebuilding`, `listener did not bind within 1s`) in
+a run where every assertion passed. Green is not the same as correct; the log a
+passing test emits is evidence worth reading.
+
+### A comment that was wrong, and was reasoned from
+
+`MenuBarModel` claimed `NETransparentProxyManager` is a **subclass** of
+`NETunnelProviderManager`, and both configuration lookups filtered on `is` to
+avoid the resulting cross-contamination. They are **siblings** — both descend
+from `NEVPNManager` — so neither filter could ever fire, which is what the
+compiler had been warning. They now match on the configuration name. The bug was
+harmless; the comment asserting a false fact about the framework was not, because
+it is exactly the kind of thing the next reader takes on trust.
