@@ -54,24 +54,27 @@ actor ProxyState {
 
     /// Flows currently held, by signing identifier.
     ///
-    /// `nonisolated(unsafe)` for the same reason as `hasSession`: the admission
-    /// decision happens inside `handleNewFlow`, which returns a `Bool` and
-    /// cannot await. Mutated only from the flow path, which NetworkExtension
-    /// drives from its own serial context.
-    nonisolated(unsafe) private(set) var flowsPerApp: [String: Int] = [:]
+    /// **Locked, not `nonisolated(unsafe)`.** The first version of this was an
+    /// unguarded dictionary, by analogy with `hasSession` and `currentPolicy`
+    /// above — and the analogy is false. Those are written only from the actor
+    /// and read from `handleNewFlow`; this is WRITTEN from two contexts: the
+    /// increment happens on NetworkExtension's thread inside `handleNewFlow`,
+    /// and the decrement in a `defer` inside a detached `Task`.
+    ///
+    /// Two threads mutating a Swift `Dictionary` is heap corruption, not a stale
+    /// read. Under real flow load the extension took a SIGSEGV about two seconds
+    /// after a session came up, every time:
+    ///
+    ///     exited due to SIGSEGV | sent by exc handler, ran for 70426ms
+    ///     service has crashed 1 times in a row
+    ///
+    /// which presented as the bridge simply not working — the extension
+    /// restarted, the session was gone, and nothing said why.
+    private let flowCounts = FlowCounts()
 
-    /// Records a claimed flow and returns whether the app has just crossed its
-    /// limit, so the crossing is logged once rather than per flow.
-    nonisolated func flowStarted(_ app: String?) {
-        guard let app else { return }
-        flowsPerApp[app, default: 0] += 1
-    }
-
-    nonisolated func flowFinished(_ app: String?) {
-        guard let app, let count = flowsPerApp[app] else { return }
-        if count <= 1 { flowsPerApp.removeValue(forKey: app) }
-        else { flowsPerApp[app] = count - 1 }
-    }
+    nonisolated var flowsPerApp: [String: Int] { flowCounts.snapshot() }
+    nonisolated func flowStarted(_ app: String?) { flowCounts.increment(app) }
+    nonisolated func flowFinished(_ app: String?) { flowCounts.decrement(app) }
 
     /// Seeded from providerConfiguration at startup; the app owns durable
     /// storage. See ``InMemoryDeviceDirectory`` for why this process cannot.
@@ -186,7 +189,7 @@ actor ProxyState {
             hasSession = false
             initiator = nil
             currentPolicy = CapturePolicy()
-            flowsPerApp.removeAll()
+            flowCounts.removeAll()
             // Logged because a session that quietly dies looks exactly like a
             // session that is up and carrying nothing. Both ends keep saying
             // "connected" — the phone because its tunnel is still running, the
