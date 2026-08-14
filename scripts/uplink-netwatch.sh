@@ -22,8 +22,17 @@
 #
 # WHAT IT DOES
 #
-#   bridge live AND no address   ->  manual address, dead gateway, public DNS
-#   bridge not live              ->  back to DHCP, always
+#   bridge live AND NO DEFAULT ROUTE  ->  manual address, dead gateway, public DNS
+#   bridge not live                   ->  back to DHCP, always
+#
+# A FALLBACK, not the primary mechanism. The extension now ships a packet
+# tunnel (`RouteProvider`) whose whole job is to supply the route and resolver,
+# and when it works this daemon does nothing at all — it only acts when there
+# is a live session and STILL no default route, which is precisely the case
+# where NetworkExtension has declined to run a packet tunnel with no underlying
+# network. That is the one assumption the tunnel design rests on and the one
+# thing that cannot be checked off-device, so the fallback exists to make the
+# product work either way rather than betting on the answer.
 #
 # The second rule is unconditional on purpose. Standalone mode points the Mac at
 # a gateway only the bridge can service, so leaving it applied after the bridge
@@ -55,6 +64,18 @@ has_own_network() {
   [[ -n "$addr" && "$addr" != "$SELF_IP" ]]
 }
 
+# The condition that actually matters: can anything on this Mac originate a
+# connection? A transparent proxy only ever receives flows the system was
+# already going to route, so with no default route `connect()` fails before the
+# proxy is consulted and the bridge is never asked to carry anything.
+#
+# Checked instead of "does en0 have an address", because the packet tunnel may
+# have supplied a perfectly good route while en0 has none — and in that case
+# there is nothing for this daemon to do.
+has_default_route() {
+  [[ -n "$(netstat -rn -f inet 2>/dev/null | awk '$1 == "default" {print $2; exit}')" ]]
+}
+
 standalone_applied() {
   [[ "$(networksetup -getinfo "$SERVICE" 2>/dev/null | awk '/^IP address:/{print $3; exit}')" == "$SELF_IP" ]]
 }
@@ -83,7 +104,10 @@ say "watching (interval ${INTERVAL}s, service ${SERVICE})"
 
 while true; do
   if bridge_is_live; then
-    if ! has_own_network && ! standalone_applied; then
+    # Only when the tunnel has NOT supplied a route. If RouteProvider is doing
+    # its job there is a default route via its utun and this does nothing.
+    if ! has_default_route && ! standalone_applied; then
+      say "a session is live and there is still no default route — the packet tunnel did not come up, falling back"
       apply_standalone
     fi
   else
