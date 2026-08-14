@@ -103,7 +103,11 @@ public func pumpDatagramFlow(
                         guard case let .hostPort(host, port) = endpoint else { continue }
 
                         if policy.shouldCapture(remoteEndpoint: "\(host):\(port)") {
-                            log.error("udp -> bridge \("\(host)", privacy: .public):\(port.rawValue) \(datagram.count)B")
+                            // Debug, not error: this fires per datagram, and
+                            // QUIC sends thousands. The routing decision is
+                            // still visible at error level from the phone's
+                            // "udp dial ok" for each destination.
+                            log.debug("udp -> bridge \("\(host)", privacy: .public):\(port.rawValue) \(datagram.count)B")
                             _ = try? await stream.sendDatagram(
                                 datagram, to: "\(host)", port: port.rawValue
                             )

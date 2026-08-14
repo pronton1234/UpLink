@@ -354,7 +354,19 @@ public actor BridgeResponder {
                 break
             }
             replies += 1
-            log.error("udp reply \(replies) from \(host, privacy: .public):\(port) \(bytes.count) bytes")
+            // Only the FIRST reply at error level. That one line is the whole
+            // difference between a working UDP path and a dead one — it is what
+            // "udp dial ok" was missing on 2026-08-13 — and it costs one entry
+            // per destination. Every reply after it is per-packet on the
+            // phone's hot path, and a burst of those evicts the session
+            // diagnostics from the log ring buffer, which is precisely when
+            // they are needed. The running total is still reported once, by
+            // "ended after N replies".
+            if replies == 1 {
+                log.error("udp reply 1 from \(host, privacy: .public):\(port) \(bytes.count) bytes")
+            } else {
+                log.debug("udp reply \(replies) from \(host, privacy: .public):\(port) \(bytes.count) bytes")
+            }
             guard let result = try? mux.sendDatagram(bytes, to: host, port: port, on: streamID) else {
                 log.error("udp reply NOT FRAMED for \(host, privacy: .public):\(port)")
                 break
