@@ -52,6 +52,27 @@ actor ProxyState {
     /// serviced.
     nonisolated(unsafe) private(set) var hasSession = false
 
+    /// Flows currently held, by signing identifier.
+    ///
+    /// `nonisolated(unsafe)` for the same reason as `hasSession`: the admission
+    /// decision happens inside `handleNewFlow`, which returns a `Bool` and
+    /// cannot await. Mutated only from the flow path, which NetworkExtension
+    /// drives from its own serial context.
+    nonisolated(unsafe) private(set) var flowsPerApp: [String: Int] = [:]
+
+    /// Records a claimed flow and returns whether the app has just crossed its
+    /// limit, so the crossing is logged once rather than per flow.
+    nonisolated func flowStarted(_ app: String?) {
+        guard let app else { return }
+        flowsPerApp[app, default: 0] += 1
+    }
+
+    nonisolated func flowFinished(_ app: String?) {
+        guard let app, let count = flowsPerApp[app] else { return }
+        if count <= 1 { flowsPerApp.removeValue(forKey: app) }
+        else { flowsPerApp[app] = count - 1 }
+    }
+
     /// Seeded from providerConfiguration at startup; the app owns durable
     /// storage. See ``InMemoryDeviceDirectory`` for why this process cannot.
     private var store = InMemoryDeviceDirectory()
@@ -165,6 +186,7 @@ actor ProxyState {
             hasSession = false
             initiator = nil
             currentPolicy = CapturePolicy()
+            flowsPerApp.removeAll()
             // Logged because a session that quietly dies looks exactly like a
             // session that is up and carrying nothing. Both ends keep saying
             // "connected" — the phone because its tunnel is still running, the

@@ -106,8 +106,27 @@ final class TransparentProxyProvider: NETransparentProxyProvider, @unchecked Sen
     /// called, not restated, so the regression suite tests this code rather
     /// than a copy of it.
     private var admission: FlowAdmission {
-        FlowAdmission(hasSession: state.hasSession, policy: state.currentPolicy)
+        FlowAdmission(
+            hasSession: state.hasSession,
+            policy: state.currentPolicy,
+            flowsPerApp: state.flowsPerApp
+        )
     }
+
+    /// Says so, once, when an app is being held at its limit.
+    ///
+    /// Logged on the transition only. The condition that motivates the cap is a
+    /// process opening 87 flows a second, so a line per refusal would bury the
+    /// diagnostics under the very flood it is reporting.
+    private func noteIfOverLimit(_ source: String?, gate: FlowAdmission) {
+        guard let source, !gate.withinFlowLimit(source) else { return }
+        guard !cappedApps.contains(source) else { return }
+        cappedApps.insert(source)
+        log.error("\(source, privacy: .public) is at its flow limit (\(FlowAdmission.perAppFlowLimit, privacy: .public)) — declining further flows so other apps keep working")
+    }
+
+    /// Apps already reported as capped, so the message is not repeated.
+    private var cappedApps: Set<String> = []
 
     override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
         let source = flow.metaData.sourceAppSigningIdentifier
@@ -135,6 +154,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider, @unchecked Sen
         guard gate.shouldClaim(remoteEndpoint: remote, sourceSigningIdentifier: source) else {
             // false means "system, handle this normally", which for our own
             // link to the phone is exactly right.
+            noteIfOverLimit(source, gate: gate)
             return false
         }
 
@@ -148,7 +168,9 @@ final class TransparentProxyProvider: NETransparentProxyProvider, @unchecked Sen
         let log = self.log
         let state = self.state
 
+        state.flowStarted(source)
         Task {
+            defer { state.flowFinished(source) }
             guard let initiator = await state.initiator else {
                 handle.closeBoth(BridgeError.noSession)
                 return
@@ -184,6 +206,7 @@ final class TransparentProxyProvider: NETransparentProxyProvider, @unchecked Sen
         // while correctly reporting cellular egress. Hence the direct outlet in
         // `pumpUDP`.
         guard gate.shouldClaimDatagramSession(sourceSigningIdentifier: source) else {
+            noteIfOverLimit(source, gate: gate)
             return false
         }
 
@@ -193,7 +216,9 @@ final class TransparentProxyProvider: NETransparentProxyProvider, @unchecked Sen
         let log = self.log
         let state = self.state
 
+        state.flowStarted(source)
         Task {
+            defer { state.flowFinished(source) }
             guard let initiator = await state.initiator else {
                 handle.close(BridgeError.noSession)
                 return

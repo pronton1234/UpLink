@@ -30,14 +30,37 @@ public struct FlowAdmission: Sendable {
     /// the extension is torn down, which outlives the app and costs a reboot.
     public var ownSigningIdentifier: String
 
+    /// How many flows one app may hold at once.
+    ///
+    /// SYMPTOM: a single app (`com.relay.mac`, whose embedded Tailscale
+    /// reconnect-stormed when the Mac's default route changed) claimed 31,337
+    /// flows in six minutes — about 87 a second. That saturated the one channel
+    /// to the phone in 13 seconds, and from then on EVERY app on the machine
+    /// failed, Chrome included: 30 flows opened against 31,423 failures.
+    ///
+    /// The mux already caps total streams at `Multiplexer.maxConcurrentStreams`
+    /// (4,096), but a global cap is not fairness — it is first-come-first-served,
+    /// which is precisely how one process took the bridge down for everything
+    /// else.
+    ///
+    /// Deliberately generous. This is not for policing normal browsing: a busy
+    /// browser sits in the low hundreds across all its helpers. It exists so no
+    /// single process can consume the whole budget.
+    public static let perAppFlowLimit = 512
+
+    /// Flows currently held, by signing identifier.
+    public var flowsPerApp: [String: Int] = [:]
+
     public init(
         hasSession: Bool,
         policy: CapturePolicy,
-        ownSigningIdentifier: String = UpLinkIdentifiers.macProxyExtension
+        ownSigningIdentifier: String = UpLinkIdentifiers.macProxyExtension,
+        flowsPerApp: [String: Int] = [:]
     ) {
         self.hasSession = hasSession
         self.policy = policy
         self.ownSigningIdentifier = ownSigningIdentifier
+        self.flowsPerApp = flowsPerApp
     }
 
     /// Whether to claim a TCP flow, which names exactly one destination.
@@ -72,6 +95,18 @@ public struct FlowAdmission: Sendable {
         // of anywhere to send the traffic.
         guard hasSession else { return false }
         guard sourceSigningIdentifier != ownSigningIdentifier else { return false }
-        return policy.shouldCapture(app: sourceSigningIdentifier)
+        guard policy.shouldCapture(app: sourceSigningIdentifier) else { return false }
+        return withinFlowLimit(sourceSigningIdentifier)
+    }
+
+    /// Whether this app is under its share of the stream budget.
+    ///
+    /// Declining is the kinder failure: the system then routes the flow
+    /// normally, or fails it fast. Both beat claiming a flow that will die in
+    /// the write — and beat starving every other app on the machine, which is
+    /// what happened without this.
+    public func withinFlowLimit(_ sourceSigningIdentifier: String?) -> Bool {
+        guard let sourceSigningIdentifier else { return true }
+        return (flowsPerApp[sourceSigningIdentifier] ?? 0) < Self.perAppFlowLimit
     }
 }
