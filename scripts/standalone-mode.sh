@@ -81,6 +81,28 @@ case "${1:-status}" in
   on)
     [[ $EUID -ne 0 ]] && { red "Needs root: sudo $0 on"; exit 1; }
 
+    # Refuse without a live bridge. Standalone mode points the Mac at a gateway
+    # only the bridge can service, so turning it on first does not merely fail
+    # to help — it removes the working network and replaces it with nothing.
+    # With no session, handleNewFlow declines every flow, so the symptom is
+    # "0 flows claimed and no internet", which reads exactly like the routing
+    # bug this script exists to fix. That cost a debugging round.
+    STATE=$(/usr/bin/log show --last 10m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
+            | grep -E "session started|session ENDED" | tail -1)
+    case "$STATE" in
+      *"session started"*) green "==> Bridge session is live" ;;
+      *)
+        red "==> No live bridge session — refusing."
+        echo
+        echo "    Connect from the phone FIRST, then turn this on. Order matters:"
+        echo "    this hands the Mac a gateway that only the bridge can service."
+        echo
+        [[ -n "$STATE" ]] && echo "    last event: $STATE" || echo "    (no session events in the last 10 minutes)"
+        exit 2
+        ;;
+    esac
+    echo
+
     # Auto-revert, and it is not optional. If this does not work, the operator
     # loses the connection they would need in order to undo it — and undoing it
     # needs root. So the machine undoes it by itself unless told otherwise.
@@ -111,16 +133,20 @@ case "${1:-status}" in
     # Wait for the route rather than glancing at it. macOS installs it a few
     # seconds after -setmanual returns, and reporting "NONE" in the meantime
     # reads as a total failure of the very thing this script exists to do.
-    blue "==> Waiting for the default route to appear"
-    for _ in $(seq 1 20); do
-      ROUTE=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $2" via "$NF; exit}')
-      [[ -n "$ROUTE" ]] && break
+    # Wait for OUR gateway specifically, not merely for "a" default route. The
+    # previous DHCP route lingers for a few seconds, so checking for any route
+    # returned instantly with the old one — reporting "192.168.1.254 via en0"
+    # as if the change had taken effect when it had not yet.
+    blue "==> Waiting for the default route to become $SELF_ROUTER"
+    for _ in $(seq 1 30); do
+      ROUTE=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $2; exit}')
+      [[ "$ROUTE" == "$SELF_ROUTER" ]] && break
       sleep 1
     done
-    if [[ -n "${ROUTE:-}" ]]; then
-      green "    $ROUTE"
+    if [[ "${ROUTE:-}" == "$SELF_ROUTER" ]]; then
+      green "    default via $SELF_ROUTER"
     else
-      red "    no default route appeared after 20s — this has NOT worked"
+      red "    still ${ROUTE:-no route} after 30s — this has NOT taken effect"
     fi
     echo
     status
