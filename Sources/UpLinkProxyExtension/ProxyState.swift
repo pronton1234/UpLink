@@ -56,6 +56,13 @@ actor ProxyState {
     /// storage. See ``InMemoryDeviceDirectory`` for why this process cannot.
     private var store = InMemoryDeviceDirectory()
 
+    /// Apps whose traffic must never be bridged, from `providerConfiguration`.
+    ///
+    /// Held across sessions because the policy is rebuilt from scratch on every
+    /// `sessionStarted`, and an escape hatch that silently lapses on reconnect
+    /// is worse than none — it works while you are watching and fails later.
+    private var directApps: Set<String> = []
+
     func startHosting(
         queue: DispatchQueue,
         log: Logger,
@@ -74,6 +81,14 @@ actor ProxyState {
             .flatMap { try? JSONDecoder().decode([PairedDevice].self, from: $0) } ?? []
         store = InMemoryDeviceDirectory(seed: seed)
         log.info("seeded with \(seed.count, privacy: .public) paired device(s)")
+
+        directApps = Set((configuration?["directApps"] as? [String]) ?? [])
+        if !directApps.isEmpty {
+            // Error level, like the other session diagnostics: if an app is
+            // being kept off the bridge you need to be able to tell that from
+            // the bridge simply not working for it.
+            log.error("never bridging: \(self.directApps.sorted().joined(separator: ","), privacy: .public)")
+        }
 
         let host = MacSessionHost(
             identity: identity,
@@ -125,7 +140,8 @@ actor ProxyState {
                 .subtracting(UpLinkDNS.servers.map { $0.lowercased() })
             currentPolicy = CapturePolicy(
                 peerEndpoints: [peerDescription],
-                directHosts: resolvers
+                directHosts: resolvers,
+                directApps: directApps
             )
             log?.error("capture policy: peer=\(peerDescription, privacy: .public) resolvers=\(resolvers.sorted().joined(separator: ","), privacy: .public)")
             initiator = await host.initiator

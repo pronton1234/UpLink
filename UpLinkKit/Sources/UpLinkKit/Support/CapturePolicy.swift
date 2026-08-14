@@ -25,9 +25,39 @@ public struct CapturePolicy: Sendable, Equatable {
     /// real internet host by inspection. It has to be named.
     public var directHosts: Set<String> = []
 
-    public init(peerEndpoints: Set<String> = [], directHosts: Set<String> = []) {
+    /// Signing identifiers of apps whose traffic must never cross the bridge.
+    ///
+    /// The developer escape hatch, and the only exclusion that works for UDP.
+    /// The other rules judge a *destination*, which a `NEAppProxyUDPFlow` does
+    /// not have at claim time and which a datagram carries only as an already
+    /// resolved IP — so naming a host cannot keep an app's UDP traffic off the
+    /// bridge, and naming an IP cannot survive a service that rotates them.
+    ///
+    /// The concrete need: the machine driving a device test reaches its own API
+    /// over this Mac's connection. A bridge that misbehaves takes that
+    /// connection down, which takes down the ability to diagnose the bridge —
+    /// so the debugging tool goes offline exactly when it is needed. Naming the
+    /// app declines its flows before anything is claimed, which is the only
+    /// point at which declining is free.
+    public var directApps: Set<String> = []
+
+    public init(
+        peerEndpoints: Set<String> = [],
+        directHosts: Set<String> = [],
+        directApps: Set<String> = []
+    ) {
         self.peerEndpoints = peerEndpoints
         self.directHosts = directHosts
+        self.directApps = directApps
+    }
+
+    /// Whether flows belonging to `signingIdentifier` may be bridged at all.
+    ///
+    /// Judged separately from the endpoint because it applies to UDP sessions,
+    /// which have no endpoint to judge.
+    public func shouldCapture(app signingIdentifier: String?) -> Bool {
+        guard let signingIdentifier, !directApps.isEmpty else { return true }
+        return !directApps.contains(signingIdentifier)
     }
 
     /// Whether a flow to `remoteEndpoint` should be proxied.

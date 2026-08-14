@@ -96,56 +96,52 @@ final class TransparentProxyProvider: NETransparentProxyProvider, @unchecked Sen
         }
     }
 
-    override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
-        // THE most important line in this file. Returning true means "this
-        // extension owns this connection"; with no phone connected there is
-        // nowhere to send it, so the flow would be claimed and then closed.
-        // Doing that to every flow takes down all networking on the Mac and
-        // keeps it down for as long as the extension runs — which outlives the
-        // app. When there is no session, decline and let the system route
-        // normally.
-        guard state.hasSession else { return false }
+    /// The admission gate, rebuilt per flow from the current snapshot.
+    ///
+    /// The decision must be made synchronously — `handleNewFlow` returns a
+    /// `Bool` and the system will not wait for an actor hop — so this reads the
+    /// cached `hasSession` / `currentPolicy` rather than the actor's state.
+    ///
+    /// The rules themselves live in `UpLinkKit`'s ``FlowAdmission`` and are
+    /// called, not restated, so the regression suite tests this code rather
+    /// than a copy of it.
+    private var admission: FlowAdmission {
+        FlowAdmission(hasSession: state.hasSession, policy: state.currentPolicy)
+    }
 
-        // Never capture this extension's own sockets.
-        //
-        // Structural, not incidental. `LocalDatagramRelay` deliberately opens
-        // connections to destinations the capture policy excludes — the Mac's
-        // DNS resolvers and the local network — and the UDP branch below has to
-        // claim every flow because a UDP flow has no remote endpoint to judge.
-        // Without this guard the relay's own socket would be claimed, handed
-        // back to the relay, and opened again: unbounded recursion, the CPU
-        // pegged, and all networking down until the extension is torn down.
-        // That failure outlives the app, so it costs a reboot.
-        //
-        // Judging by process rather than by address also makes the peer-link
-        // exclusion belt-and-braces instead of load-bearing.
-        if flow.metaData.sourceAppSigningIdentifier == UpLinkIdentifiers.macProxyExtension {
-            return false
-        }
+    override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
+        let source = flow.metaData.sourceAppSigningIdentifier
+        let gate = admission
 
         if let tcpFlow = flow as? NEAppProxyTCPFlow {
-            return handle(tcpFlow)
+            return handle(tcpFlow, from: source, gate: gate)
         }
         if let udpFlow = flow as? NEAppProxyUDPFlow {
-            return handle(udpFlow)
+            return handle(udpFlow, from: source, gate: gate)
         }
         return false
     }
 
     // MARK: TCP
 
-    private func handle(_ flow: NEAppProxyTCPFlow) -> Bool {
+    private func handle(
+        _ flow: NEAppProxyTCPFlow,
+        from source: String?,
+        gate: FlowAdmission
+    ) -> Bool {
         guard case let .hostPort(host, port) = flow.remoteFlowEndpoint else { return false }
         let remote = "\(host):\(port)"
 
-        // The capture decision must be made synchronously — handleNewFlow
-        // returns a Bool and the system will not wait for an actor hop — so it
-        // reads a cached snapshot of the policy.
-        guard state.currentPolicy.shouldCapture(remoteEndpoint: remote) else {
+        guard gate.shouldClaim(remoteEndpoint: remote, sourceSigningIdentifier: source) else {
             // false means "system, handle this normally", which for our own
             // link to the phone is exactly right.
             return false
         }
+
+        // The claiming app is logged, not just the destination. It is the value
+        // `UpLinkDirectApps` takes, and there is no other way to discover it —
+        // an app that needs keeping off the bridge has to be nameable first.
+        log.error("claim tcp \(remote, privacy: .public) by \(source ?? "?", privacy: .public)")
 
         let destination = StreamOpen(proto: .tcp, host: "\(host)", port: port.rawValue)
         let handle = TCPFlowHandle(flow)
@@ -169,12 +165,16 @@ final class TransparentProxyProvider: NETransparentProxyProvider, @unchecked Sen
     /// `NEAppProxyUDPFlow` carries datagrams to many destinations — a browser
     /// doing QUIC to several hosts, a resolver talking to several nameservers.
     /// Each datagram therefore carries its own destination across the bridge.
-    private func handle(_ flow: NEAppProxyUDPFlow) -> Bool {
+    private func handle(
+        _ flow: NEAppProxyUDPFlow,
+        from source: String?,
+        gate: FlowAdmission
+    ) -> Bool {
         // `NEAppProxyUDPFlow` has no remote endpoint — a UDP flow is a session
-        // that sends to many destinations, so there is nothing to judge here
-        // and the flow must be claimed. The consequence is that the pump has to
-        // be able to service *every* datagram, including the ones the policy
-        // says must not cross the bridge.
+        // that sends to many destinations, so the only thing judgeable here is
+        // who is asking. Everything else must be claimed, which means the pump
+        // has to be able to service *every* datagram, including the ones the
+        // policy says must not cross the bridge.
         //
         // Dropping those, as this used to, is a black hole: the sender gets no
         // answer and no error, and eventually closes the flow. That filled the
@@ -183,6 +183,12 @@ final class TransparentProxyProvider: NETransparentProxyProvider, @unchecked Sen
         // cannot reach stalled until it timed out. The bridge felt throttled
         // while correctly reporting cellular egress. Hence the direct outlet in
         // `pumpUDP`.
+        guard gate.shouldClaimDatagramSession(sourceSigningIdentifier: source) else {
+            return false
+        }
+
+        log.error("claim udp by \(source ?? "?", privacy: .public)")
+
         let handle = UDPFlowHandle(flow)
         let log = self.log
         let state = self.state

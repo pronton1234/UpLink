@@ -165,6 +165,31 @@ final class MenuBarModel {
         OSSystemExtensionManager.shared.submitRequest(request)
     }
 
+    /// Apps whose traffic must never be bridged.
+    ///
+    /// A developer escape hatch, deliberately not surfaced in the UI. The case
+    /// it exists for: a device test is driven from this Mac, over this Mac's
+    /// own connection, and a bridge fault takes that connection down — so the
+    /// tool needed to diagnose the fault goes offline exactly when the fault
+    /// happens. Recovering meant killing the app, which also ended the session
+    /// being measured.
+    ///
+    /// Read from defaults so it can be changed without a rebuild, which for a
+    /// notarized system extension is the difference between a minute and a
+    /// quarter of an hour:
+    ///
+    ///     defaults write com.uplink.app UpLinkDirectApps -array com.example.tooling
+    ///
+    /// The value is a **signing identifier**, not a hostname. Hostnames cannot
+    /// do this job: a UDP flow has no destination at claim time, and a datagram
+    /// carries only an already-resolved address. See ``CapturePolicy/directApps``.
+    ///
+    /// Find an app's identifier by watching the extension's log while it makes
+    /// a connection — the claim path records it.
+    static func directApps() -> [String] {
+        UserDefaults.standard.stringArray(forKey: "UpLinkDirectApps") ?? []
+    }
+
     private func enableProxyConfiguration() async {
         do {
             let managers = try await NETransparentProxyManager.loadAllFromPreferences()
@@ -190,6 +215,7 @@ final class MenuBarModel {
                 "identity": identity.rawRepresentation,
                 "deviceName": Host.current().localizedName ?? "Mac",
                 "pairedDevices": (try? JSONEncoder().encode(pairedDevices)) ?? Data(),
+                "directApps": Self.directApps(),
             ]
 
             manager.protocolConfiguration = proto
