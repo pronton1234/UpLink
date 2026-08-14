@@ -42,6 +42,24 @@ else
   echo "    (extension not currently active)"
 fi
 
+blue "==> Removing any default route UpLink may have left behind"
+# A transparent proxy only ever sees flows the system was already going to
+# route, so with no network there is no route, no flow, and nothing to bridge —
+# measured 2026-08-14: zero flows claimed with Wi-Fi disconnected. The fix for
+# that installs a default route so the flows exist to be claimed, which means a
+# crash can leave a Mac pointing its default route at an interface that goes
+# nowhere. That is indistinguishable from a broken network and survives a
+# reboot of the app, so this script has to know how to undo it.
+for IFACE in lo0 en9 awdl0; do
+  if netstat -rn 2>/dev/null | awk '$1 == "default" {print $NF}' | grep -qx "$IFACE"; then
+    echo "    found a default route via ${IFACE} — removing"
+    sudo -n route -n delete -inet default -interface "$IFACE" 2>/dev/null \
+      || route -n delete -inet default -interface "$IFACE" 2>/dev/null \
+      || echo "    (needs sudo: sudo route -n delete -inet default -interface ${IFACE})"
+  fi
+done
+echo "    (a default route via a real interface is normal and is left alone)"
+
 blue "==> Nudging the network stack"
 # Cheaper than a reboot and usually enough once the proxy is out of the way.
 sudo -n dscacheutil -flushcache 2>/dev/null || dscacheutil -flushcache 2>/dev/null || true
