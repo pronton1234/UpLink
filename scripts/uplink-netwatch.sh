@@ -44,7 +44,19 @@ SERVICE="${UPLINK_WIFI_SERVICE:-Wi-Fi}"
 SELF_IP="169.254.99.2"
 SELF_MASK="255.255.0.0"
 SELF_ROUTER="169.254.99.1"
-INTERVAL="${UPLINK_NETWATCH_INTERVAL:-5}"
+# One second, not five. The gap between Wi-Fi dropping and this landing is a
+# window in which the Mac has no route and nothing works — and a user who tests
+# during it concludes, correctly from where they are standing, that the product
+# is broken. Observed: a probe at 14:35:32 failed, and the config landed at
+# 14:35:39.
+INTERVAL="${UPLINK_NETWATCH_INTERVAL:-1}"
+
+# How often the (expensive) session check is refreshed. `log show` takes the
+# best part of a second, so running it every tick would put the poll interval
+# back where it started. The route check below is cheap and runs every tick;
+# this only decides whether the bridge is worth applying a config FOR, and that
+# does not change second to second.
+SESSION_REFRESH_TICKS=5
 
 say() { logger -t uplink-netwatch "$1"; echo "$(date '+%H:%M:%S') $1"; }
 
@@ -102,11 +114,31 @@ trap 'revert_dhcp; exit 0' INT TERM
 
 say "watching (interval ${INTERVAL}s, service ${SERVICE})"
 
+TICK=0
+SESSION_LIVE=0
+
 while true; do
-  if bridge_is_live; then
-    # Only when the tunnel has NOT supplied a route. If RouteProvider is doing
-    # its job there is a default route via its utun and this does nothing.
-    if ! has_default_route && ! standalone_applied; then
+  # Cheap check first, every tick. Losing the default route is the event that
+  # matters and `netstat` costs microseconds, so the reaction time is set by
+  # this rather than by the log query.
+  if has_default_route; then
+    HAS_ROUTE=1
+  else
+    HAS_ROUTE=0
+  fi
+
+  # Expensive check, refreshed on a slower cadence — but forced immediately
+  # whenever the route has just gone, because that is exactly the moment the
+  # answer has to be current rather than up to five seconds old.
+  if [[ $((TICK % SESSION_REFRESH_TICKS)) -eq 0 || $HAS_ROUTE -eq 0 ]]; then
+    if bridge_is_live; then SESSION_LIVE=1; else SESSION_LIVE=0; fi
+  fi
+  TICK=$((TICK + 1))
+
+  if [[ $SESSION_LIVE -eq 1 ]]; then
+    # Only when nothing has supplied a route. If RouteProvider is doing its job
+    # there is a default route via its utun and this does nothing.
+    if [[ $HAS_ROUTE -eq 0 ]] && ! standalone_applied; then
       say "a session is live and there is still no default route — the packet tunnel did not come up, falling back"
       apply_standalone
     fi
