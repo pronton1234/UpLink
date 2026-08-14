@@ -37,23 +37,31 @@ what forces egress through the cellular radio.
 
 | Area | State |
 | --- | --- |
-| Wire protocol, multiplexer, flow control | **Done**, 100 tests across the kit |
-| Pairing crypto + Keychain storage | **Done**, tested |
-| Transport / TLS-PSK / discovery / cellular dialer | **Done**, compiles clean under Swift 6 strict concurrency |
-| End-to-end proxying | **Proven** by the loopback integration suite |
+| Wire protocol, multiplexer, flow control | **Done**, 238 tests across the kit |
+| Pairing crypto + Keychain storage | **Done**, verified on hardware |
+| Transport / TLS-PSK / discovery / cellular dialer | **Done**, verified on hardware |
+| End-to-end proxying | **Proven** in-process and, for TCP, on hardware |
 | iOS app + tunnel extension | **Builds**, UI complete |
 | macOS menu bar app + transparent proxy extension | **Builds**, universal TCP/UDP capture |
-| UDP / QUIC / DNS over the bridge | **Done**, 151 tests |
+| TCP over the bridge | **Verified on hardware** — carrier IP, cellular egress, 98 Mbps |
+| UDP / DNS over the bridge | **Fixed off-device, not yet proven on hardware** |
+| QUIC over the bridge | **Untested** — UDP 443 has never been exercised |
 | Coverage harness | **Done** — measures leaks rather than assuming |
-| Mac-side session establishment | **Done and verified live** — Bonjour advertising, SOCKS5 answering |
 | Reconnect (keyed on identity, backoff) | **Done**, tested |
 | Phase 0 spikes | **Written, not run** — needs a physical iPhone |
-| Anything on real hardware | **Unverified** |
 
 ### What is not verified
 
-Every line compiles and the protocol is proven end to end in-process, but no
-byte has crossed a real radio. Specifically unproven:
+Pairing, the TLS-PSK session, cellular egress and real TCP transfer have all
+been observed working end to end on hardware with no hotspot. Still unproven:
+
+- **UDP on hardware.** Three defects were found and fixed off-device — a
+  destination killed by its own first reply, a stream closed when the client
+  stopped sending, and a UDP session OPEN whose placeholder destination was
+  dialled and closed the stream. All three are pinned by tests against real
+  sockets. None has been confirmed on a phone.
+- **QUIC.** UDP 443 is the bulk-UDP case and is a different shape from DNS:
+  long-lived, high-rate, many datagrams per destination.
 
 - **AWDL inside a Network Extension** — the Phase 0 question. `spike/` holds the
   instrument and the procedure; if it fails, drop `.peerToPeer` from
@@ -73,9 +81,10 @@ byte has crossed a real radio. Specifically unproven:
 ./scripts/test.sh
 ```
 
-That runs the kit's 100 unit, regression, and loopback integration tests in well
-under a second. `--all` additionally regenerates the Xcode project and builds
-both app targets.
+That runs the kit's 238 unit, regression, and loopback integration tests in
+about ten seconds — nearly all of it one deliberate timeout test that proves a
+stalled peer fails a write rather than blocking forever. `--all` additionally
+regenerates the Xcode project and builds both app targets.
 
 ```bash
 xcodegen generate && open UpLink.xcodeproj

@@ -2,9 +2,14 @@
 #
 # Installs the built Mac app into /Applications and launches it.
 #
-# NOT required to develop — the Mac app has no system extension, so pressing Run
-# in Xcode works fine. This exists to try the app the way a user would actually
-# get it: installed in /Applications and launched from there.
+# REQUIRED to exercise the bridge. The Mac app DOES ship a system extension
+# (com.uplink.app.proxy), and macOS will not activate one from a build running
+# out of Xcode's derived data — it has to be installed in /Applications, and for
+# a real run it has to be Developer ID signed and notarized. Pressing Run in
+# Xcode gets you the UI and nothing behind it.
+#
+# For a notarized build, use ./scripts/release-mac.sh instead. This script is
+# for the app-shaped parts: menu bar, pairing UI, device list.
 #
 #   ./scripts/run-mac.sh            # copy the newest Debug build and launch
 #   ./scripts/run-mac.sh --build    # build first, then copy and launch
@@ -82,5 +87,5 @@ echo
 green "Installed and launched from /Applications."
 echo
 echo "Check the Mac side is up:"
-echo "  lsof -nP -iTCP:1080 -sTCP:LISTEN     # SOCKS proxy listening"
+echo "  systemextensionsctl list             # the proxy extension, if activated"
 echo "  dns-sd -B _uplink._tcp               # advertising to the phone"

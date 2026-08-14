@@ -82,11 +82,51 @@ The transparent proxy carries TCP and UDP; ICMP has no path through it, so
 it is blocked rather than silently leaking. Reversible, and it backs up
 `/etc/pf.conf` first.
 
+## Before you run anything: keep your own connection
+
+If you are driving the run from the Mac being bridged — which you are — put
+whatever you need to stay online on the never-bridge list first:
+
+```bash
+defaults write com.uplink.app UpLinkDirectApps -array <signing-identifier>
+```
+
+Find the identifier by watching the extension claim a flow:
+
+```bash
+log stream --predicate 'subsystem == "com.uplink.app"' | grep '^.*claim '
+```
+
+A UDP flow is claimed before any destination is known, so this is the **only**
+exclusion that works for UDP. Naming a host does not help.
+
+`./scripts/emergency-off.sh` is still the backstop, but it is a recovery tool,
+not a safety mechanism: it runs after the Mac has already gone dark, and by then
+the session you were measuring is gone.
+
 ## Measuring coverage
 
 ```bash
 ./scripts/coverage-test.sh
 ```
+
+**The baseline must be measured before the bridge is up.** This script refuses
+to run without a live session — correctly — which means it cannot take its own:
+by the time it starts, the transparent proxy is in front of every flow, and a
+proxy claims flows regardless of the interface a socket binds to, so
+`--interface en0` does not escape it. For as long as this harness existed its
+baseline came back as the *carrier's* address, and every genuinely bridged row
+was then scored `DIRECT ✗` for matching it. One run, eight lines apart:
+
+```
+prove-bridge step 4:  216.77.46.31  CHANGED — traffic is leaving via the phone
+coverage row 1:       DIRECT ✗ 216.77.46.31
+```
+
+`prove-bridge.sh` now takes the baseline at step 0, before connecting, and
+exports `UPLINK_BASELINE_V4` / `UPLINK_BASELINE_V6`. Run `coverage-test.sh`
+alone and it refuses rather than guessing. Prefer running it through
+`prove-bridge.sh`.
 
 Prints a matrix of which traffic classes actually egress through the phone.
 Rows 1–6 must show the **carrier's** IP; row 7 (ICMP) must be blocked. Anything

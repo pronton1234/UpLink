@@ -200,18 +200,129 @@ past 75 seconds and never returns, versus 15.7 s with the deadline in place.
 be fast", not "cannot block in practice" — a deadline, and a failure path that
 closes the flow so the app can retry.
 
-## Retired: the capture-policy suite
+## Un-retired: the capture-policy suite
 
-`CapturePolicy` and its four regression tests were deleted when the Mac side
-moved from a `NETransparentProxyProvider` to an in-process SOCKS5 proxy. They
-guarded against the extension capturing its own link to the phone (an unbounded
-loop), capturing loopback, and capturing mDNS.
+This section used to say that `CapturePolicy` and its regression tests had been
+deleted, because the Mac side had moved from `NETransparentProxyProvider` to an
+in-process SOCKS5 proxy, and that the self-capture hazards were therefore
+structurally gone. It ended: *"If a system-wide capture mechanism is ever
+reintroduced, restore that suite first."*
 
-Those hazards are structurally gone rather than merely untested: a SOCKS proxy
-only ever sees connections a local app deliberately sends it, so it cannot
-capture our own traffic, loopback, or multicast discovery. **If a system-wide
-capture mechanism is ever reintroduced, restore that suite first** — the
-self-capture loop is the worst failure this codebase can produce.
+**It was reintroduced.** The tree runs a `NETransparentProxyProvider` again — a
+SOCKS proxy cannot carry UDP at all, so QUIC and DNS bypassed the bridge, and
+DNS bypassing it defeats much of the point. The suite was restored, and
+`CapturePolicy` plus `LocalTrafficRegressionTests` now carry about thirty tests
+between them.
+
+Worth keeping as a warning: for a while this file described, in the present
+tense and with no hint it was stale, an architecture the code no longer had. A
+doc that records decisions has to record the reversals too, or it confidently
+misinforms the next person — which is worse than saying nothing.
+
+The self-capture loop remains the worst failure this codebase can produce.
+
+## UDP: three defects, one symptom
+
+The bridge carried TCP at 98 Mbps and no hostname would resolve. All three
+faults below produce that same symptom, and all three were live at once, which
+is why fixing any one of them alone changed nothing observable.
+
+| Test | Guards against |
+| --- | --- |
+| `A UDP destination answers more than once` | `isComplete` read as end-of-connection |
+| `One destination answers several datagrams in a row` | the same, through the whole session |
+| `A UDP session OPEN does not dial its placeholder destination` | the responder dialling `*:0` and closing the stream |
+| `A reply that arrives after the client stops sending still gets through` | closing the flow when `readDatagrams` completes |
+| `With no reply window the same answer is lost` | the window being removed, or made useless |
+| `An excluded destination goes out directly and its reply comes back` | the direct outlet silently dropping datagrams |
+
+**1. `isComplete` does not mean "the connection is over".** On a UDP
+`NWConnection` it marks the end of each *message*, and every datagram sets it.
+`NWDestinationConnection.pump()` treated it as end-of-stream, so a destination
+died the instant its first reply arrived. A resolver is one destination expected
+to answer many queries, so DNS was the worst victim while TCP was untouched.
+
+**2. A UDP OPEN registers a session, not a connection.** `NEAppProxyUDPFlow`
+carries datagrams to many hosts, so the OPEN carries the placeholder `*:0` and
+each datagram addresses itself. `BridgeResponder.handle` sent every
+`.openRequested` to `openDestination`, which dialled — and a dial of `*` cannot
+succeed, so `failStream` wrote a CLOSE that killed the stream the flow had just
+been given. `failStream` also tears down `datagramConnections[streamID]`, so the
+device log showed a destination dialled and dead in the same breath:
+
+```
+23:55:13.541  udp dial ok 1.1.1.1:53
+23:55:13.544  udp 1.1.1.1:53 ended after 0 replies
+```
+
+Every UDP flow raced that CLOSE. **This was found by an existing test failing
+only when run alongside the rest of the suite and passing in isolation** — a
+race, read at first as a flake. Every other datagram test wires the responder to
+a stub dialer that answers for any host, `*` included, so none of them could see
+it.
+
+**3. A client with nothing more to send may still have something to receive.**
+`readDatagrams` completes as soon as the client is done sending, which for DNS
+is immediately after the single query. Closing the stream there discarded the
+answer. The flow now holds a bounded reply window instead.
+
+Fix 2 was initially suspected of making fix 3 unnecessary, since it produces the
+same 3 ms evidence. It does not: with the dial bug fixed, `With no reply window
+the same answer is lost` still fails without the window. **Two faults with
+identical signatures are not one fault** — the only way to know was a test that
+isolates each.
+
+### The tester's own connection
+
+A device run is driven from the Mac being bridged, over the connection being
+bridged. When the UDP path broke, the operator's own API traffic went with it —
+so the tool needed to diagnose the fault went offline exactly when the fault
+happened, and recovering meant killing the app, which ended the session being
+measured. Every run was one fault away from destroying its own evidence.
+
+`CapturePolicy.directApps` names signing identifiers whose flows are never
+claimed, set without a rebuild:
+
+```bash
+defaults write com.uplink.app UpLinkDirectApps -array <signing-identifier>
+```
+
+Keyed on the **app**, not the host, and that is not a preference. A UDP flow has
+no destination at claim time and a datagram carries only an already-resolved
+address, so no hostname rule can keep an app's UDP traffic off the bridge.
+
+| Test | Guards against |
+| --- | --- |
+| `An excluded app's TCP flow is declined` | the hatch not applying to TCP |
+| `An excluded app's UDP session is declined` | the case that actually broke |
+| `Every other app is unaffected` | over-excluding |
+| `An empty exclusion list changes nothing` | the hatch changing default behaviour |
+| `The original guards are intact` | the new rule displacing self-capture, peer or loopback |
+
+While doing this, `FlowAdmission` was found to have been "extracted so it is
+testable" **into the test target**, while `handleNewFlow` went on inlining its
+own copy of the same gates. The guard this file calls the worst failure the
+codebase can produce was being verified against a replica; changing the code
+that actually runs failed nothing. It now lives in `UpLinkKit/Support/` and
+`handleNewFlow` calls it.
+
+**The lesson worth keeping: a test fixture that reimplements the thing it tests
+proves the fixture works.** Extraction means the production code loses the
+logic, not that the test gains a copy of it.
+
+### Testing across the app-target boundary
+
+`pumpUDP` and everything it routed to lived in `Sources/UpLinkProxyExtension/`,
+which the SwiftPM test bundle cannot import. So the code deciding where every
+UDP packet on the machine goes had **zero** tests, and the only way to exercise
+it was a signed, notarized, user-approved system extension on real hardware.
+
+It now lives in `UpLinkKit/Mux/UDPFlowPump.swift` behind a `UDPFlow` protocol,
+with the extension keeping only the `NEAppProxyUDPFlow` conformance.
+
+**The lesson worth keeping: if the only way to run a piece of code is to deploy
+it, it will only ever be debugged in production.** Where the code lives is a
+testability decision, not just an organisational one.
 
 ## Rules of thumb these encode
 
