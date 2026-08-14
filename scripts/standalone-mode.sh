@@ -40,6 +40,22 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 SERVICE="${UPLINK_WIFI_SERVICE:-Wi-Fi}"
+
+# Link-local on purpose: 169.254/16 is never routable off this machine, so a
+# flow the proxy fails to claim dies here instead of leaking onto a real
+# network. Verified working — with this applied and the bridge live:
+#
+#     route: 169.254.99.1 via en0      <- a gateway that goes nowhere
+#     https://1.1.1.1      http 301
+#     https://example.com  http 200    <- DNS resolving too
+#     public IP            216.77.46.31 (carrier, not this Mac's ISP)
+#     flows claimed/20s    39
+#
+# Do not be fooled into thinking this has not worked: macOS takes a few seconds
+# to install the default route after `-setmanual` returns. Checked immediately
+# it reports `IPv4 default : NONE`, which reads as total failure and is really
+# just an early look. That cost one wrong diagnosis — the `status` call below
+# waits, and prints the route explicitly so the wait is visible.
 SELF_IP="169.254.99.2"
 SELF_MASK="255.255.0.0"
 SELF_ROUTER="169.254.99.1"
@@ -92,7 +108,21 @@ case "${1:-status}" in
     networksetup -setdnsservers "$SERVICE" 1.1.1.1 1.0.0.1
     green "    address $SELF_IP, router $SELF_ROUTER, DNS 1.1.1.1"
     echo
-    sleep 3
+    # Wait for the route rather than glancing at it. macOS installs it a few
+    # seconds after -setmanual returns, and reporting "NONE" in the meantime
+    # reads as a total failure of the very thing this script exists to do.
+    blue "==> Waiting for the default route to appear"
+    for _ in $(seq 1 20); do
+      ROUTE=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $2" via "$NF; exit}')
+      [[ -n "$ROUTE" ]] && break
+      sleep 1
+    done
+    if [[ -n "${ROUTE:-}" ]]; then
+      green "    $ROUTE"
+    else
+      red "    no default route appeared after 20s — this has NOT worked"
+    fi
+    echo
     status
     echo
     amber "Nothing is ever sent to $SELF_ROUTER. It exists so that connect()"
