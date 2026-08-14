@@ -152,8 +152,54 @@ public enum TransportParameters {
         let parameters = NWParameters(tls: tls, tcp: tcp)
         parameters.includePeerToPeer = profile.includesPeerToPeer
         parameters.prohibitedInterfaceTypes = Self.peerLinkProhibitedInterfaces
+        Self.pinToIPv6IfPeerToPeer(parameters, profile: profile)
         return parameters
     }
+
+    /// Pins a peer-to-peer link to IPv6.
+    ///
+    /// MEASURED 2026-08-14, and it is the difference between a session that
+    /// lasts and one that dies in half a minute.
+    ///
+    /// The kernel decides how much airtime to give AWDL from how many *active
+    /// AWDL sockets* it can see. Two seconds before a live session died:
+    ///
+    ///     monitorAWDLState: Active Sockets false ... SocketsActive 0
+    ///     setScheduleState: reason:DiscoveryTimeout sc:Idle and force:YES
+    ///     LQM-WiFi:AWDL State #16 Idle(3)
+    ///
+    /// and at the moment a later session worked:
+    ///
+    ///     monitorAWDLState: Active Sockets true ... SocketsActive 1
+    ///     setScheduleState: reason:UserTriggered sc:Infra Priority
+    ///
+    /// The only difference between the two was the address family the phone
+    /// dialled:
+    ///
+    ///     169.254.203.164:55881              -> SocketsActive 0, dead in 26s
+    ///     fe80::2063:e4ff:fed6:7ce0%awdl0    -> SocketsActive 1, Infra Priority
+    ///
+    /// An IPv4 link-local socket is not attributed to `awdl0`, so the kernel
+    /// concludes nothing is using AWDL, drops the schedule to Idle, and the link
+    /// we are sitting on goes away underneath us. Nothing in the log blames us,
+    /// because from the kernel's side it did exactly what it was asked.
+    ///
+    /// Safe to require rather than merely prefer: the peer link is a *local
+    /// link* by definition — AWDL, shared Wi-Fi, hotspot, or USB — and every
+    /// local link on an Apple platform has an IPv6 link-local address. Bonjour
+    /// publishes it. IPv4 link-local is the accident here, not the baseline.
+    ///
+    /// Related, and the same mistake one layer up: `peerLinkProhibitedInterfaces`
+    /// exists because an unconstrained connection pinned itself to `pdp_ip0` and
+    /// *suppressed* a `169.254.x` peer path. Both are Network.framework picking
+    /// a technically-valid address that cannot do the job.
+    private static func pinToIPv6IfPeerToPeer(_ parameters: NWParameters, profile: TransportProfile) {
+        guard profile.includesPeerToPeer,
+              let ip = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options
+        else { return }
+        ip.version = .v6
+    }
+
 
     /// The peer link is a *local* link by definition — AWDL, a shared Wi-Fi
     /// network, the phone's own hotspot, or USB. The Mac is never reachable
@@ -205,6 +251,10 @@ public enum TransportParameters {
         let parameters = NWParameters(tls: tls, tcp: tcp)
         parameters.includePeerToPeer = profile.includesPeerToPeer
         parameters.prohibitedInterfaceTypes = Self.peerLinkProhibitedInterfaces
+        // Symmetric with the client: a listener that still accepts IPv4
+        // link-local would let the phone open exactly the socket the kernel
+        // does not count. See `pinToIPv6IfPeerToPeer`.
+        Self.pinToIPv6IfPeerToPeer(parameters, profile: profile)
         parameters.allowLocalEndpointReuse = true
         return parameters
     }
