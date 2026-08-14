@@ -141,12 +141,19 @@ actor ProxyState {
             // exactly the way the DNS settings were added to prevent.
             let resolvers = SystemResolvers.current()
                 .subtracting(UpLinkDNS.servers.map { $0.lowercased() })
+            // Read here, not at launch, for the same reason as the resolvers:
+            // the Mac may have joined a different network since.
+            let attached = LocalNetworks.current()
             currentPolicy = CapturePolicy(
                 peerEndpoints: [peerDescription],
                 directHosts: resolvers,
-                directApps: directApps
+                directApps: directApps,
+                localNetworks: attached
             )
-            log?.error("capture policy: peer=\(peerDescription, privacy: .public) resolvers=\(resolvers.sorted().joined(separator: ","), privacy: .public)")
+            let networks = attached
+                .map { "\($0.network.count == 16 ? "v6" : "v4")/\($0.prefixLength)" }
+                .joined(separator: ",")
+            log?.error("capture policy: peer=\(peerDescription, privacy: .public) resolvers=\(resolvers.sorted().joined(separator: ","), privacy: .public) on-link=[\(networks, privacy: .public)]")
             initiator = await host.initiator
             hasSession = true
             // Error level so it survives in `log show`: info-level messages

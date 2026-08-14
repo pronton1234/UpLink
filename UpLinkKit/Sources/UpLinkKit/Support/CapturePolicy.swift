@@ -41,14 +41,25 @@ public struct CapturePolicy: Sendable, Equatable {
     /// point at which declining is free.
     public var directApps: Set<String> = []
 
+    /// Networks this Mac is directly attached to, read from its interfaces.
+    ///
+    /// Rule 5 below catches local addresses by *prefix*, which works for IPv4
+    /// and does not work at all for IPv6: a home LAN holds a globally routable
+    /// /64, so a neighbour's address is indistinguishable from a real internet
+    /// host by inspection. These have to be read from the system. See
+    /// ``OnLinkNetwork`` for what that cost before it was.
+    public var localNetworks: [OnLinkNetwork] = []
+
     public init(
         peerEndpoints: Set<String> = [],
         directHosts: Set<String> = [],
-        directApps: Set<String> = []
+        directApps: Set<String> = [],
+        localNetworks: [OnLinkNetwork] = []
     ) {
         self.peerEndpoints = peerEndpoints
         self.directHosts = directHosts
         self.directApps = directApps
+        self.localNetworks = localNetworks
     }
 
     /// Whether flows belonging to `signingIdentifier` may be bridged at all.
@@ -102,6 +113,20 @@ public struct CapturePolicy: Sendable, Equatable {
         //    is also what the user expects — bridging should not disconnect
         //    them from their own house.
         if Self.isPrivateNetwork(remoteEndpoint) { return false }
+
+        // 6. Never bridge a network this Mac is attached to.
+        //
+        //    Rule 5 judges by prefix, which cannot work for IPv6: the home LAN
+        //    holds a globally routable /64, so the phone sitting next to this
+        //    Mac has an address that looks exactly like a server in another
+        //    country. Bridging those meant handing every IPv6 neighbour to a
+        //    cellular link that cannot reach it — including, worst of all, the
+        //    Mac's own control channel to the phone, which killed the session
+        //    within three seconds. Read from the interfaces, not inferred.
+        if let host = Self.host(of: remoteEndpoint),
+           localNetworks.contains(where: { $0.contains(host) }) {
+            return false
+        }
 
         return true
     }

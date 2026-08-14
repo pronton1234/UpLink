@@ -45,8 +45,21 @@ blue "==> 0. Baseline: what this Mac looks like WITHOUT the bridge"
 # an app that is already running just foregrounds it, so the new environment is
 # never seen and the stop is silently ignored. Measured: the session stayed up
 # through 30s of polling and the baseline came back as the carrier's address.
-if xcrun devicectl device process launch --device "$DEVICE" --terminate-existing \
-     --environment-variables '{"UPLINK_AUTOCONNECT":"stop"}' "$BUNDLE" >/dev/null 2>&1; then
+#
+# Waits for the phone to be unlocked here, not only at step 1. This step now
+# needs the phone too, and without the wait the whole run aborted on a locked
+# screen — while the script's own header promises it waits.
+STOPPED=0
+for _ in $(seq 1 60); do
+  if xcrun devicectl device process launch --device "$DEVICE" --terminate-existing \
+       --environment-variables '{"UPLINK_AUTOCONNECT":"stop"}' "$BUNDLE" >/dev/null 2>&1; then
+    STOPPED=1
+    break
+  fi
+  echo "    waiting for the phone to be unlocked…"
+  sleep 10
+done
+if [[ $STOPPED -eq 1 ]]; then
   echo "    asked the phone to disconnect; waiting for the session to end"
   for _ in $(seq 1 25); do
     # A 10-minute window, and the LAST event must be ENDED. A short window is
