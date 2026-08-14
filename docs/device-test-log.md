@@ -82,6 +82,61 @@ The transparent proxy carries TCP and UDP; ICMP has no path through it, so
 it is blocked rather than silently leaking. Reversible, and it backs up
 `/etc/pf.conf` first.
 
+## Running with no network of your own — read this first
+
+**This is the configuration the product exists for, and it does not work out of
+the box.** Measured 2026-08-14, Wi-Fi disconnected, bridge live and healthy:
+
+```
+IPv4 default route : NONE
+flows claimed      : 0        <- handleNewFlow never fired at all
+curl by IP         : exitcode 7
+scutil --dns       : empty
+```
+
+`NETransparentProxyProvider` only ever receives flows the system was **already
+going to route**. With no route, `connect()` fails before any NECP policy match,
+so there is nothing to intercept: the bridge sits connected and completely idle
+while every request dies in the socket layer. Controlled comparison, same
+machine, same second:
+
+```
+curl --interface en0 (has route)  ->  http 301,    2 flows claimed
+curl --interface en9 (no route)   ->  exitcode 7,  0 flows claimed
+```
+
+Both missing pieces — a route and a resolver — come from having a configured
+network service, so give the Wi-Fi service a standing one:
+
+```bash
+sudo ./scripts/standalone-mode.sh on
+sudo ./scripts/standalone-mode.sh keep     # cancel the 180s auto-revert
+```
+
+Verified working with it applied:
+
+```
+route:  169.254.99.1 via en0     <- a gateway that goes nowhere
+https://1.1.1.1      http 301
+https://example.com  http 200    <- DNS resolving too
+public IP            216.77.46.31 (carrier, not this Mac's ISP)
+```
+
+Nothing is ever sent to that gateway. It exists so `connect()` succeeds and the
+flow reaches the proxy, which carries it to the phone. Link-local on purpose: a
+flow the proxy fails to claim dies on this machine rather than leaking.
+
+**Turn it off when you are not bridging** — `sudo ./scripts/standalone-mode.sh
+off`. With it on and no bridge, the Mac has a default route to nowhere and no
+internet at all.
+
+**This is a configuration workaround, not the finished product.** The app should
+apply and remove it with the session. It cannot today: the extension is
+sandboxed so it cannot call `route`, and the app is not root. Doing it properly
+needs a privileged helper (`SMAppService`) or moving the Mac side to
+`NEPacketTunnelProvider`, which would also fix DNS natively — `NEDNSSettings`
+applies to a packet tunnel and is silently ignored by a transparent proxy.
+
 ## Before you run anything: keep your own connection
 
 If you are driving the run from the Mac being bridged — which you are — put

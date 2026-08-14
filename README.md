@@ -46,9 +46,36 @@ what forces egress through the cellular radio.
 | TCP over the bridge | **Verified on hardware** — carrier IP, cellular egress, 98 Mbps |
 | UDP / DNS over the bridge | **Fixed off-device, not yet proven on hardware** |
 | QUIC over the bridge | **Untested** — UDP 443 has never been exercised |
+| Running with no network of the Mac's own | **Works, with a setup step** — see below |
 | Coverage harness | **Done** — measures leaks rather than assuming |
 | Reconnect (keyed on identity, backoff) | **Done**, tested |
 | Phase 0 spikes | **Written, not run** — needs a physical iPhone |
+
+### The Mac needs a route before it needs a bridge
+
+The product's whole premise is a Mac with no network but the phone. In exactly
+that state it did nothing at all, and the reason is structural:
+
+**`NETransparentProxyProvider` only receives flows the system was already going
+to route.** With no default route, `connect()` fails before any policy match, so
+`handleNewFlow` is never called and the bridge sits connected and idle while
+every request dies in the socket layer. With no network service there is also no
+resolver, so names cannot be looked up either.
+
+Both are fixed by giving the Wi-Fi service a standing address, a gateway that
+goes nowhere, and a public resolver:
+
+```bash
+sudo ./scripts/standalone-mode.sh on
+```
+
+Nothing is ever sent to that gateway; it exists so the flow does. Verified
+carrying real traffic to the carrier's address with the Mac unable to reach its
+own router. **Turn it off when not bridging**, or the Mac has no internet.
+
+This belongs in the app, applied and removed with the session. It cannot be
+today — the extension is sandboxed and the app is not root — so it needs a
+privileged helper or a move to `NEPacketTunnelProvider`.
 
 ### What is not verified
 
