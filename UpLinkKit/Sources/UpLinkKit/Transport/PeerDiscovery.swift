@@ -42,10 +42,32 @@ public actor PeerDiscovery {
     private var browser: NWBrowser?
     private var continuations: [UUID: AsyncStream<[DiscoveredPeer]>.Continuation] = [:]
     private var latest: [DiscoveredPeer] = []
+    /// When `latest` was last refreshed by the browser.
+    ///
+    /// Results are not evidence forever. `peers()` yields whatever it has the
+    /// instant a caller subscribes, so a stale entry from before a radio change
+    /// is returned immediately and the caller then spends the full
+    /// `NWConnectionChannel.connectTimeout` — twelve seconds — dialling an
+    /// endpoint that no longer exists. Every retry, at the exact moment the
+    /// device is trying to recover.
+    private var latestAt: ContinuousClock.Instant?
+    /// Long enough for a healthy browse to refresh, short enough that a dead
+    /// endpoint is not dialled twice. Injectable so the rule can be tested in
+    /// milliseconds rather than by sleeping through the real window.
+    private let staleAfter: Duration
     private let profile: TransportProfile
+    private var queue: DispatchQueue?
+    /// How many browsers have been built over this actor's life.
+    ///
+    /// The only externally observable difference between "the failure was
+    /// noticed and a replacement was built" and "the failure was swallowed and
+    /// the browser is wedged forever" — the second being the bug this file
+    /// exists to prevent, and one with no other signature from outside.
+    public private(set) var generation = 0
 
-    public init(profile: TransportProfile) {
+    public init(profile: TransportProfile, staleAfter: Duration = .seconds(15)) {
         self.profile = profile
+        self.staleAfter = staleAfter
     }
 
     /// A stream of the currently visible peers. Emits the full set on each
@@ -55,7 +77,7 @@ public actor PeerDiscovery {
         AsyncStream { continuation in
             let token = UUID()
             continuations[token] = continuation
-            continuation.yield(latest)
+            continuation.yield(fresh)
             continuation.onTermination = { [weak self] _ in
                 Task { await self?.removeObserver(token) }
             }
@@ -66,8 +88,15 @@ public actor PeerDiscovery {
         continuations.removeValue(forKey: token)
     }
 
+    /// `latest`, or nothing if it is too old to believe.
+    private var fresh: [DiscoveredPeer] {
+        guard let latestAt, latestAt.duration(to: .now) < staleAfter else { return [] }
+        return latest
+    }
+
     public func start(on queue: DispatchQueue) {
         guard browser == nil else { return }
+        self.queue = queue
 
         let parameters = NWParameters()
         parameters.includePeerToPeer = profile.includesPeerToPeer
@@ -83,12 +112,69 @@ public actor PeerDiscovery {
             Task { await self?.update(peers) }
         }
 
+        // THE MISSING SENSOR. Without this a browser that goes `.failed` — which
+        // is what happens when the interface it is scoped to is reconfigured,
+        // exactly what a Wi-Fi disconnect does to AWDL — is completely
+        // invisible. It stays wedged for the life of the tunnel, `firstMatch`
+        // keeps returning nil, and the Mac sees no inbound connection at all.
+        //
+        // Measured: 100 seconds with zero `accept:` on the Mac. The phone was
+        // not being refused; it was never dialling, because the only thing that
+        // could have told it to look again had failed silently.
+        browser.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case let .failed(error):
+                Task { await self?.browserFailed(String(describing: error)) }
+            case .cancelled:
+                Task { await self?.browserFailed("cancelled") }
+            default:
+                break
+            }
+        }
+
         browser.start(queue: queue)
         self.browser = browser
+        generation += 1
     }
+
+    /// Rebuilds after a failure. A browser cannot be restarted once it has
+    /// failed — only replaced.
+    private func browserFailed(_ reason: String) {
+        PhoneDiagnosticLog.shared.write("discovery browser failed (\(reason)) — rebuilding")
+        guard let queue else { return }
+        browser?.cancel()
+        browser = nil
+        latest = []
+        latestAt = nil
+        start(on: queue)
+    }
+
+    /// Tears the browser down and builds a fresh one.
+    ///
+    /// Called between connection attempts. A new browser re-issues the mDNS
+    /// query; one that has stopped receiving cannot be made to look again, and
+    /// the old code reused a single instance for the tunnel's entire lifetime.
+    public func restart() {
+        guard let queue else { return }
+        PhoneDiagnosticLog.shared.write("discovery restart")
+        browser?.cancel()
+        browser = nil
+        latest = []
+        latestAt = nil
+        start(on: queue)
+    }
+
+    /// Test seam: record an observation as though the browser had reported it.
+    func observeForTesting(_ peers: [DiscoveredPeer]) { update(peers) }
+
+    /// Test seam: drive the same path `stateUpdateHandler` drives on `.failed`.
+    /// A real `NWBrowser` failure needs a radio to be reconfigured underneath
+    /// it, which is precisely the event that cannot be staged in a unit test.
+    func simulateBrowserFailureForTesting(_ reason: String) { browserFailed(reason) }
 
     private func update(_ peers: [DiscoveredPeer]) {
         latest = peers.sorted { $0.name < $1.name }
+        latestAt = .now
         for (_, continuation) in continuations { continuation.yield(latest) }
     }
 

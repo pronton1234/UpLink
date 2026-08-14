@@ -6,6 +6,23 @@
 	<array>
 		<string>packet-tunnel-provider</string>
 	</array>
+	<!-- Shared container for the tunnel extension's diagnostic log.
+	     Until this existed there was NO way to learn what the phone did during
+	     a failure: every log line goes to the unified log, which needs a cable
+	     to read live — and attaching the cable changes the very thing under
+	     test, because it gives the Mac a second path to the phone. Every round
+	     of debugging so far has been inference from the phone's silence on the
+	     Mac's side.
+
+	     Retrieve with:
+	       xcrun devicectl device copy from --device <udid> \
+	         --domain-type appGroupDataContainer \
+	         --domain-identifier group.com.uplink.app \
+	         --source uplink-phone.log --destination . -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.uplink.app</string>
+	</array>
 	<key>keychain-access-groups</key>
 	<array>
 		<string>$(AppIdentifierPrefix)com.uplink.app</string>

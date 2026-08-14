@@ -102,7 +102,10 @@ struct ListenerPortRegressionTests {
 }
 
 /// Guards a continuation against a second resume from `stateUpdateHandler`.
-private final class OnceFlag: @unchecked Sendable {
+///
+/// File-scope rather than `private` because more than one regression suite
+/// probes a listener the same way.
+final class OnceFlag: @unchecked Sendable {
     private var used = false
     private let lock = NSLock()
 

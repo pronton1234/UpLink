@@ -58,14 +58,56 @@ INTERVAL="${UPLINK_NETWATCH_INTERVAL:-1}"
 # does not change second to second.
 SESSION_REFRESH_TICKS=5
 
+# How long to leave the interface alone after touching it.
+#
+# THE REASON THIS EXISTS. `networksetup -setmanual` re-derives `awdl0` — the
+# very interface the bridge is trying to re-establish itself on. Applying and
+# reverting on a 1-second poll, which is what a stale session check made
+# possible, means the peer link is being pulled out from under itself during
+# precisely the window it needs to settle. The measured recovery failure had
+# this happening underneath it.
+#
+# Eight seconds is longer than a Bonjour re-advertisement plus a reconnect
+# attempt (the phone retries at 0.5s with a 6s discovery timeout), so a single
+# reconfiguration gets one clean shot at recovery before anything else is
+# allowed to touch the interface.
+SETTLE_SECONDS="${UPLINK_NETWATCH_SETTLE:-8}"
+LAST_CHANGE_AT=0
+
 say() { logger -t uplink-netwatch "$1"; echo "$(date '+%H:%M:%S') $1"; }
 
-bridge_is_live() {
+# Live, ended, or no transition observed in the window.
+#
+# Two minutes, not ten. A ten-minute window answers "was there a session at some
+# point recently", which is not the question — and with the answer driving a
+# root daemon that reconfigures en0, a stale yes applies a dead-gateway config
+# for a session that ended minutes ago, then reverts it a moment later. Each of
+# those flaps re-derives awdl0.
+#
+# Absence of an event is NOT evidence of absence: a session that has been up
+# quietly for an hour logs nothing. So no transition in the window means
+# "unknown", and the caller keeps whatever it last knew, rather than a silent
+# healthy session being read as a dead one.
+session_transition() {
   local last
-  last=$(/usr/bin/log show --last 10m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
+  last=$(/usr/bin/log show --last 2m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
          | grep -E "session started|session ENDED" | tail -1)
-  [[ "$last" == *"session started"* ]]
+  if [[ "$last" == *"session started"* ]]; then
+    echo live
+  elif [[ "$last" == *"session ENDED"* ]]; then
+    echo ended
+  else
+    echo unknown
+  fi
 }
+
+# Seconds since the interface was last reconfigured.
+since_last_change() { echo $(( $(date +%s) - LAST_CHANGE_AT )); }
+
+# Is the interface still settling from the last change?
+settling() { [[ $(since_last_change) -lt $SETTLE_SECONDS ]]; }
+
+note_change() { LAST_CHANGE_AT=$(date +%s); }
 
 # An address that came from a real network. The standalone address does not
 # count, or the watcher would immediately decide the Mac had a network again
@@ -132,6 +174,7 @@ apply_standalone() {
   say "bridge is live and this Mac has no network — applying standalone config"
   networksetup -setmanual "$SERVICE" "$SELF_IP" "$SELF_MASK" "$SELF_ROUTER"
   networksetup -setdnsservers "$SERVICE" 1.1.1.1 1.0.0.1
+  note_change
   for _ in $(seq 1 30); do
     [[ "$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $2; exit}')" == "$SELF_ROUTER" ]] && break
     sleep 1
@@ -143,6 +186,7 @@ revert_dhcp() {
   say "reverting to DHCP"
   networksetup -setdhcp "$SERVICE"
   networksetup -setdnsservers "$SERVICE" 1.1.1.1 1.0.0.1
+  note_change
 }
 
 # Whatever state a crash left behind, start from a known one.
@@ -167,7 +211,12 @@ while true; do
   # whenever the route has just gone, because that is exactly the moment the
   # answer has to be current rather than up to five seconds old.
   if [[ $((TICK % SESSION_REFRESH_TICKS)) -eq 0 || $HAS_ROUTE -eq 0 ]]; then
-    if bridge_is_live; then SESSION_LIVE=1; else SESSION_LIVE=0; fi
+    case "$(session_transition)" in
+      live)  SESSION_LIVE=1 ;;
+      ended) SESSION_LIVE=0 ;;
+      # No transition in the window. Keep what we knew; see session_transition.
+      *)     : ;;
+    esac
   fi
   TICK=$((TICK + 1))
 
@@ -175,10 +224,17 @@ while true; do
   # them reverts; only the last applies. Getting this order wrong is how a
   # fallback becomes the thing the user has to fight.
   if ! app_running; then
+    # Never held back by the settle window. This is the safety rule: if UpLink
+    # is gone, the user gets their network back immediately, full stop.
     if standalone_applied; then
       say "UpLink is not running — handing the network back"
       revert_dhcp
     fi
+  elif settling; then
+    # Deliberately do nothing. The interface was reconfigured $(since_last_change)s
+    # ago and awdl0 is being re-derived underneath us; acting again now is how a
+    # fallback becomes the thing preventing recovery.
+    :
   elif wifi_associated; then
     # A real network is available. Whatever the bridge is doing, the user has
     # somewhere to go and must not be held on a dead gateway.

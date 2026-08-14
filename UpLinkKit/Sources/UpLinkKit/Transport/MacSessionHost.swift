@@ -47,18 +47,52 @@ public actor MacSessionHost {
     private var sessionTask: Task<Void, Never>?
     private var continuations: [UUID: AsyncStream<SessionHostEvent>.Continuation] = [:]
 
+    // MARK: Path awareness
+    //
+    // THE MISSING SENSOR ON THIS SIDE. `restartListener()` was reachable only
+    // from `start()` and `setPairingCode()`, so once the Mac was up it never
+    // re-advertised for any reason. A listener that survives a radio change but
+    // stops being advertised on the re-derived `awdl0` produces exactly the
+    // silence that was measured: the phone browses, finds nothing, and the Mac
+    // logs no error because from its point of view nothing went wrong.
+
+    private var pathMonitor: NWPathMonitor?
+    private var lastPathSignature: PathSignature?
+    private var pathDebounceTask: Task<Void, Never>?
+    private let pathDebounce: Duration
+    private let monitorsPath: Bool
+
+    /// How many listeners have been built. The only observable proof from
+    /// outside that a path change produced a *re-advertisement* rather than
+    /// being swallowed — and the guard that stops `restartListener`'s own
+    /// `cancel()` from being mistaken for a failure worth rebuilding for.
+    public private(set) var listenerGeneration = 0
+
     public init(
         identity: Curve25519.KeyAgreement.PrivateKey,
         deviceName: String,
         store: DeviceDirectory,
         queue: DispatchQueue,
-        profile: TransportProfile = TransportProfile.preferenceOrder.first ?? .localLink
+        profile: TransportProfile = TransportProfile.preferenceOrder.first ?? .localLink,
+        // Long enough that one Wi-Fi disconnect — which produces a burst of
+        // path updates as the interface is torn down and re-derived — settles
+        // into a single rebuild. Short enough that the phone, retrying every
+        // half second, does not spend the whole window browsing for a service
+        // that is not on the air. Injectable so the debounce can be tested
+        // without waiting it out.
+        pathDebounce: Duration = .milliseconds(1500),
+        // Off only in tests. The real monitor reports the *test machine's*
+        // actual network, on its own schedule, which makes any assertion about
+        // what a given path change caused a race against the room's Wi-Fi.
+        monitorsPath: Bool = true
     ) {
         self.identity = identity
         self.deviceName = deviceName
         self.store = store
         self.queue = queue
         self.profile = profile
+        self.pathDebounce = pathDebounce
+        self.monitorsPath = monitorsPath
     }
 
     public var fingerprint: String {
@@ -96,9 +130,15 @@ public actor MacSessionHost {
     public func start() async throws {
         try restartListener()
         await awaitListening()
+        startPathMonitoring()
     }
 
     public func stop() {
+        pathDebounceTask?.cancel()
+        pathDebounceTask = nil
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        lastPathSignature = nil
         sessionTask?.cancel()
         sessionTask = nil
         listener?.cancel()
@@ -136,11 +176,17 @@ public actor MacSessionHost {
     /// does not cover two listeners at once), so the Bonjour re-advertisement is
     /// what carries the new address to the phone.
     private func awaitListening() async {
-        for _ in 0 ..< 100 {
+        // Three seconds, not one. Measured: a rebuild triggered by a path
+        // change repeatedly logged "did not bind within 1s" and then bound
+        // shortly after — so the old bound was reporting a failure that had not
+        // happened, and callers were proceeding as though the Mac were on the
+        // air when it was still a moment away. Only the failure path is slow;
+        // a healthy bind returns in a few milliseconds.
+        for _ in 0 ..< 300 {
             if let port = listener?.port, port.rawValue != 0 { return }
             try? await Task.sleep(for: .milliseconds(10))
         }
-        log.error("listener did not bind within 1s")
+        log.error("listener did not bind within 3s")
     }
 
     private func restartListener() throws {
@@ -196,15 +242,103 @@ public actor MacSessionHost {
         listener.newConnectionHandler = { [weak self] connection in
             Task { await self?.accept(connection) }
         }
+        // Generation-stamped, because `restartListener` cancels the outgoing
+        // listener and that fires `.cancelled` on it. Without the stamp, a
+        // rebuild triggers a rebuild triggers a rebuild.
+        listenerGeneration += 1
+        let generation = listenerGeneration
         listener.stateUpdateHandler = { [weak self] state in
-            if case let .failed(error) = state {
-                Task { await self?.emit(.failed(error.localizedDescription)) }
+            switch state {
+            case let .failed(error):
+                Task { await self?.listenerDied(generation: generation, reason: error.localizedDescription) }
+            case .cancelled:
+                Task { await self?.listenerDied(generation: generation, reason: "cancelled") }
+            case let .waiting(error):
+                // Not terminal — the framework retries on its own — but worth
+                // recording. A listener that waits forever is indistinguishable
+                // from a working one until the phone fails to find it.
+                Task { await self?.noteListenerWaiting(generation: generation, reason: error.localizedDescription) }
+            default:
+                break
             }
         }
 
         listener.start(queue: queue)
         self.listener = listener
         log.error("listening as '\(self.deviceName, privacy: .public)' sessionKeys=\(sessionKeys.count, privacy: .public) pairingCode=\(pairingKey != nil, privacy: .public)")
+    }
+
+    /// A listener reached a terminal state. Rebuild if it was the current one.
+    ///
+    /// Previously this only emitted `.failed` and nothing acted on the event,
+    /// so a dead listener stayed dead until the user restarted the app.
+    private func listenerDied(generation: Int, reason: String) async {
+        guard generation == listenerGeneration else { return }  // already replaced
+        // `stop()` cancels the listener and nils it, and cancelling is exactly
+        // what `.cancelled` reports — so without this a deliberate shutdown
+        // reads as a death and puts the Mac straight back on the air. The host
+        // then cannot be stopped: the advertisement and the bound socket
+        // outlive the user quitting.
+        guard listener != nil else { return }
+        log.error("listener died (\(reason, privacy: .public)) — rebuilding")
+        emit(.failed(reason))
+        await rebuildAdvertisement(because: "listener \(reason)")
+    }
+
+    private func noteListenerWaiting(generation: Int, reason: String) {
+        guard generation == listenerGeneration else { return }
+        log.error("listener waiting: \(reason, privacy: .public)")
+    }
+
+    // MARK: Path awareness
+
+    private func startPathMonitoring() {
+        guard monitorsPath, pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            let signature = PathSignature(path: path)
+            Task { await self?.pathChanged(signature) }
+        }
+        monitor.start(queue: queue)
+        pathMonitor = monitor
+    }
+
+    /// Debounced so one Wi-Fi disconnect produces one re-advertisement.
+    func pathChanged(_ signature: PathSignature) {
+        guard signature != lastPathSignature else { return }
+        let previous = lastPathSignature
+        lastPathSignature = signature
+
+        // The first observation is what the listener was already built for.
+        guard previous != nil else { return }
+
+        log.error("network path changed: \(String(describing: previous), privacy: .public) -> \(signature.description, privacy: .public)")
+        pathDebounceTask?.cancel()
+        pathDebounceTask = Task { [pathDebounce] in
+            try? await Task.sleep(for: pathDebounce)
+            guard !Task.isCancelled else { return }
+            await self.rebuildAdvertisement(because: "path \(signature.description)")
+        }
+    }
+
+    /// Puts this Mac back on the air.
+    ///
+    /// The listener itself may well still be fine; the thing that has to be
+    /// re-issued is the Bonjour advertisement, and there is no API to refresh
+    /// one in place. `restartListener` already handles the port churn and
+    /// `awaitListening` already waits for the rebind.
+    ///
+    /// Note this does NOT disturb a live session: an accepted `NWConnection` is
+    /// independent of the listener that produced it.
+    private func rebuildAdvertisement(because reason: String) async {
+        do {
+            try restartListener()
+            await awaitListening()
+            log.error("re-advertised after \(reason, privacy: .public)")
+        } catch {
+            log.error("could not re-advertise after \(reason, privacy: .public): \(String(describing: error), privacy: .public)")
+            emit(.failed("re-advertise failed: \(error)"))
+        }
     }
 
     // MARK: Accepting

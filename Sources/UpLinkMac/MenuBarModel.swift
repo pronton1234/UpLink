@@ -125,6 +125,12 @@ final class MenuBarModel {
     private var extensionDelegate: SystemExtensionDelegate?
     private let extensionBundleID = UpLinkIdentifiers.macProxyExtension
 
+    /// The names the two NetworkExtension configurations are stored under.
+    /// They are the only reliable way to tell them apart; see the note in
+    /// `enableProxyConfiguration`.
+    private static let proxyConfigurationName = "UpLink"
+    private static let routeConfigurationName = "UpLink Route"
+
     // MARK: Menu text
 
     var statusHeadline: String {
@@ -266,13 +272,18 @@ final class MenuBarModel {
 
     private func enableProxyConfiguration() async {
         do {
-            // `managers.first` was safe while there was one configuration and is
-            // not any more. `NETransparentProxyManager` is a SUBCLASS of
-            // `NETunnelProviderManager`, so each type's `loadAllFromPreferences`
-            // can return the other's configuration, and picking the first would
-            // silently reconfigure the wrong one.
+            // Two configurations now exist under this app — the proxy and the
+            // route tunnel — and reconfiguring the wrong one silently breaks
+            // capture. They are matched by name.
+            //
+            // NOT by `is NETransparentProxyManager`, which is what this used to
+            // do on the belief that it was a subclass of
+            // `NETunnelProviderManager`. It is not: both descend from
+            // `NEVPNManager` as SIBLINGS, so that test was a no-op the compiler
+            // warned about, and the reasoning behind it was simply wrong.
             let managers = try await NETransparentProxyManager.loadAllFromPreferences()
-            let manager = managers.first { $0 is NETransparentProxyManager }
+            let manager = managers.first { $0.localizedDescription == Self.proxyConfigurationName }
+                ?? managers.first
                 ?? NETransparentProxyManager()
 
             let proto = NETunnelProviderProtocol()
@@ -299,7 +310,7 @@ final class MenuBarModel {
             ]
 
             manager.protocolConfiguration = proto
-            manager.localizedDescription = "UpLink"
+            manager.localizedDescription = Self.proxyConfigurationName
             manager.isEnabled = true
 
             try await manager.saveToPreferences()
@@ -333,11 +344,13 @@ final class MenuBarModel {
     private func enableRouteConfiguration() async {
         do {
             let identity = try store.loadOrCreateIdentity()
-            // Filter, and exclude the transparent proxy explicitly: it is a
-            // subclass, so it comes back from this call too and `first` would
-            // hand back the proxy configuration and reconfigure it as a tunnel.
+            // By name, for the reason given in `enableProxyConfiguration`: the
+            // `is NETransparentProxyManager` test that used to be here could
+            // never fire, because the two manager types are siblings rather
+            // than parent and child.
             let managers = try await NETunnelProviderManager.loadAllFromPreferences()
-            let manager = managers.first { !($0 is NETransparentProxyManager) }
+            let manager = managers.first { $0.localizedDescription == Self.routeConfigurationName }
+                ?? managers.first
                 ?? NETunnelProviderManager()
 
             let proto = NETunnelProviderProtocol()
@@ -349,7 +362,7 @@ final class MenuBarModel {
             proto.providerConfiguration = ["identity": identity.rawRepresentation]
 
             manager.protocolConfiguration = proto
-            manager.localizedDescription = "UpLink Route"
+            manager.localizedDescription = Self.routeConfigurationName
             manager.isEnabled = true
 
             try await manager.saveToPreferences()

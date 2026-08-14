@@ -25,6 +25,10 @@ import UpLinkKit
 final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
 
     private let log = Logger(subsystem: UpLinkIdentifiers.logSubsystem, category: "tunnel")
+
+    /// Survives the run, unlike the unified log, which needs a cable to read —
+    /// and the cable changes the peer link being tested.
+    private let diagnostics = PhoneDiagnosticLog.shared
     private let queue = DispatchQueue(label: "com.uplink.app.tunnel")
     private let state = SessionState()
 
@@ -33,6 +37,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     // boundary, which Swift 6 rejects.
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         log.error("startTunnel")
+        diagnostics.write("=== startTunnel (diagnostic log available: \(PhoneDiagnosticLog.shared.isAvailable)) ===")
 
         // Route-less settings. The tunnel is a process host, not a capture
         // mechanism — we are proxying the *Mac's* traffic, not this phone's.
@@ -94,12 +99,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
                 try await connectOnce(config: config, discovery: discovery)
                 policy.recordSuccess()
                 log.error("session ended cleanly (peer closed the link); will look for the Mac again")
+                diagnostics.write("session ended cleanly; looking for the Mac again")
             } catch {
                 let delay = policy.recordFailure()
                 log.error(
                     "session failed (attempt \(policy.attempt)): \(String(describing: error), privacy: .public); retrying in \(delay)s"
                 )
+                // The line that has been missing. On the Mac a failed attempt is
+                // invisible — there is simply no inbound connection — so "the
+                // phone never dialled" and "the phone dialled and was refused"
+                // look identical from there. They have completely different
+                // causes.
+                diagnostics.write("attempt \(policy.attempt) FAILED: \(error); retrying in \(delay)s")
                 try? await Task.sleep(for: .seconds(delay))
+                // A FRESH browse, not another look at the same one. The browser
+                // is scoped to an interface, and the interface is exactly what
+                // changed underneath us; asking a wedged browser again returns
+                // the same nothing forever.
+                await discovery.restart()
             }
         }
 
@@ -107,7 +124,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     }
 
     private func connectOnce(config: BridgeConfiguration, discovery: PeerDiscovery) async throws {
+        diagnostics.write("looking for the Mac (fingerprint \(config.macFingerprint.prefix(8)))")
         guard let peer = await firstMatchingPeer(from: discovery, fingerprint: config.macFingerprint) else {
+            // THE distinction the Mac cannot make. No inbound connection there
+            // means either "the phone never found me" or "the phone found me and
+            // could not connect" — opposite causes, identical silence.
+            diagnostics.write("NOT FOUND — discovery produced no matching Mac; never dialled")
             throw BridgeStartupError.peerNotFound
         }
 
@@ -187,6 +209,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
             return
         }
         switch request {
+        case "diagnostics":
+            // Answered synchronously: it is a file read, and the point is to be
+            // able to get it out even when the session machinery is wedged.
+            completionHandler?(Data(PhoneDiagnosticLog.shared.contents().utf8))
         case "status":
             let state = self.state
             let reply = UncheckedSendableBox(completionHandler)
