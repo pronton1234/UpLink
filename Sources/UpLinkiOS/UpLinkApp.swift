@@ -51,6 +51,14 @@ struct ContentView: View {
                     }
                     .accessibilityLabel("Paired Macs")
                 }
+                ToolbarItem(placement: .topBarLeading) {
+                    NavigationLink {
+                        DiagnosticsView(controller: controller)
+                    } label: {
+                        Image(systemName: "stethoscope")
+                    }
+                    .accessibilityLabel("Diagnostics")
+                }
             }
         }
         .task {

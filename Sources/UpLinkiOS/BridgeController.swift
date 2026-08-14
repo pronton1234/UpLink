@@ -294,6 +294,30 @@ final class BridgeController {
         }
     }
 
+    /// The extension's own account of what it has been doing.
+    ///
+    /// This exists because every cable-free failure so far has been diagnosed by
+    /// inference from the Mac's silence. The file the extension writes needs a
+    /// cable to retrieve, and `log collect` needs root AND fights devicectl for
+    /// the device ("Device not configured"), so on the one configuration this
+    /// product exists for there was no way to read the phone's side at all.
+    /// Reading it on the phone itself needs neither.
+    func fetchDiagnostics() async -> String {
+        guard let session = manager?.connection as? NETunnelProviderSession else {
+            return "The tunnel is not running, so it has nothing to report.\n\nConnect first, then come back."
+        }
+        let reply: String? = await withCheckedContinuation { continuation in
+            do {
+                try session.sendProviderMessage(Data("diagnostics".utf8)) { data in
+                    continuation.resume(returning: data.flatMap { String(data: $0, encoding: .utf8) })
+                }
+            } catch {
+                continuation.resume(returning: "Could not ask the extension: \(error)")
+            }
+        }
+        return reply ?? "The extension did not answer."
+    }
+
     private func refreshStatus(peer: String) async {
         guard let session = manager?.connection as? NETunnelProviderSession else { return }
 

@@ -212,7 +212,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         case "diagnostics":
             // Answered synchronously: it is a file read, and the point is to be
             // able to get it out even when the session machinery is wedged.
-            completionHandler?(Data(PhoneDiagnosticLog.shared.contents().utf8))
+            //
+            // The header is not padding. Last time this produced nothing, the
+            // question "did the extension never run, or did it run and fail to
+            // write?" could not be answered — and those have completely
+            // different fixes. Now the reply says which, even when the log
+            // itself is empty.
+            let log = PhoneDiagnosticLog.shared
+            var report = "extension running, pid \(ProcessInfo.processInfo.processIdentifier)\n"
+            report += "log available: \(log.isAvailable)\n"
+            if !log.diagnosis.isEmpty { report += "log unavailable because: \(log.diagnosis)\n" }
+            report += "---\n"
+            report += log.contents()
+            completionHandler?(Data(report.utf8))
         case "status":
             let state = self.state
             let reply = UncheckedSendableBox(completionHandler)

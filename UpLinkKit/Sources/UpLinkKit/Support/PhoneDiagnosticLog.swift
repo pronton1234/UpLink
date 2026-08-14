@@ -20,7 +20,7 @@ import OSLog
 /// xcrun devicectl device copy from --device <udid> \
 ///   --domain-type appGroupDataContainer \
 ///   --domain-identifier group.com.uplink.app \
-///   --source uplink-phone.log --destination .
+///   --source Library/Caches/uplink-phone.log --destination <absolute path>
 /// ```
 ///
 /// ## What it deliberately is not
@@ -46,12 +46,47 @@ public struct PhoneDiagnosticLog: Sendable {
     public static let shared = PhoneDiagnosticLog()
 
     private let url: URL?
+    /// Why there is no file, when there is no file.
+    ///
+    /// The first version of this returned early on a nil container and said
+    /// nothing, so when it produced no log after a cable-free test there was no
+    /// way to tell "the extension never ran" from "the extension ran and could
+    /// not write" — which is precisely the ambiguity the whole type exists to
+    /// remove. A diagnostic that can fail silently is not a diagnostic.
+    private let unavailableReason: String?
     private let queue = DispatchQueue(label: "com.uplink.app.phonelog")
 
     private init() {
-        url = FileManager.default
-            .containerURL(forSecurityApplicationGroupIdentifier: Self.appGroup)?
-            .appendingPathComponent(Self.fileName)
+        let log = Logger(subsystem: UpLinkIdentifiers.logSubsystem, category: "phonelog")
+        guard let container = FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: Self.appGroup)
+        else {
+            url = nil
+            unavailableReason = "no container for App Group \(Self.appGroup)"
+            log.error("phone log unavailable: no container for App Group \(Self.appGroup, privacy: .public)")
+            return
+        }
+
+        // Library/Caches, not the container root.
+        //
+        // Measured 2026-08-14: with the entitlement present in both the binary
+        // and the provisioning profile, and the container plainly existing on
+        // the device, a write to `<container>/uplink-phone.log` produced no
+        // file at all. `devicectl` reports Library, Library/Caches and
+        // Library/Preferences as Writable and says nothing about the root.
+        // Writing into a directory the system itself created is one fewer
+        // assumption, and costs nothing.
+        let directory = container.appendingPathComponent("Library/Caches", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            url = directory.appendingPathComponent(Self.fileName)
+            unavailableReason = nil
+            log.error("phone log at \(directory.path, privacy: .public)/\(Self.fileName, privacy: .public)")
+        } catch {
+            url = nil
+            unavailableReason = "could not create \(directory.path): \(error)"
+            log.error("phone log unavailable: \(String(describing: error), privacy: .public)")
+        }
     }
 
     /// Whether the container is actually reachable.
@@ -61,8 +96,16 @@ public struct PhoneDiagnosticLog: Sendable {
     /// leave the next failure just as unreadable as the last one.
     public var isAvailable: Bool { url != nil }
 
+    /// Empty when the log is working; otherwise why it is not.
+    public var diagnosis: String { unavailableReason ?? "" }
+
     public func write(_ message: String) {
-        guard let url else { return }
+        guard let url else {
+            // Loud, because the alternative is the silence that wasted a test.
+            Logger(subsystem: UpLinkIdentifiers.logSubsystem, category: "phonelog")
+                .error("dropping log line, \(unavailableReason ?? "unknown", privacy: .public): \(message, privacy: .public)")
+            return
+        }
         let line = "\(Self.timestamp()) \(message)\n"
         queue.async {
             guard let data = line.data(using: .utf8) else { return }
@@ -85,8 +128,9 @@ public struct PhoneDiagnosticLog: Sendable {
 
     /// The whole file, for the `diagnostics` provider message.
     public func contents() -> String {
-        guard let url, let data = try? Data(contentsOf: url) else {
-            return "(no diagnostic log — App Group container unavailable)"
+        guard let url else { return "(no diagnostic log: \(unavailableReason ?? "unknown"))" }
+        guard let data = try? Data(contentsOf: url) else {
+            return "(diagnostic log at \(url.path) could not be read — nothing written yet?)"
         }
         return String(data: data, encoding: .utf8) ?? "(unreadable)"
     }

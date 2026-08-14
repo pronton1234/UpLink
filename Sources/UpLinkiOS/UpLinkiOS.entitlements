@@ -18,7 +18,8 @@
 	       xcrun devicectl device copy from --device <udid> \
 	         --domain-type appGroupDataContainer \
 	         --domain-identifier group.com.uplink.app \
-	         --source uplink-phone.log --destination . -->
+	         --source Library/Caches/uplink-phone.log \
+           --destination <absolute path> -->
 	<key>com.apple.security.application-groups</key>
 	<array>
 		<string>group.com.uplink.app</string>
