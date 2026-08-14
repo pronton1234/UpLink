@@ -154,6 +154,20 @@ public actor BridgeResponder {
         for event in try mux.receive(frame) {
             switch event {
             case let .openRequested(streamID, destination):
+                // A UDP OPEN registers a *session*, it does not name a
+                // destination. `NEAppProxyUDPFlow` carries datagrams to many
+                // hosts, so the OPEN carries the placeholder `*:0` and every
+                // datagram addresses itself; destinations are dialled lazily in
+                // `forwardDatagram`.
+                //
+                // Dialling the placeholder is not merely wasted work. It cannot
+                // succeed, so `serviceDestination` calls `failStream`, which
+                // writes a CLOSE and takes down the stream the flow was just
+                // given. Every UDP flow then raced that CLOSE — win and the
+                // datagrams got through, lose and the stream was gone before
+                // the first reply came back.
+                guard destination.proto == .tcp else { break }
+
                 // Returns immediately: the dial happens in the pipe's task.
                 openDestination(streamID: streamID, destination: destination)
 
