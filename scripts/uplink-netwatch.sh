@@ -88,6 +88,42 @@ has_default_route() {
   [[ -n "$(netstat -rn -f inet 2>/dev/null | awk '$1 == "default" {print $2; exit}')" ]]
 }
 
+# Is the Mac app running at all?
+#
+# The daemon must be inert unless UpLink is actually in use. It owns the
+# machine's network configuration, and a root daemon quietly holding a manual
+# address for an app the user quit an hour ago is not a fallback, it is a fault.
+app_running() {
+  pgrep -f '/Applications/UpLink.app/Contents/MacOS/UpLink' >/dev/null 2>&1
+}
+
+# Has Wi-Fi joined a real network?
+#
+# THE CONDITION THAT WAS MISSING, and it stranded the user. Once the manual
+# address is applied, en0 is static — so rejoining Wi-Fi cannot get a DHCP
+# lease, and the only rule for reverting was "the session ended". With the
+# session still live, the Mac sat on a dead 169.254 gateway with a perfectly
+# good network available and no way back except killing this daemon by hand.
+#
+# `RouterARPVerified` rather than an SSID or `networksetup`, and the choice
+# matters twice over.
+#
+# `networksetup -getairportnetwork` simply lies: measured on this machine
+# reporting "You are not associated with an AirPort network" while the same
+# interface held a DHCP lease of 192.168.1.185 and the router answered ARP.
+# Anything built on it is built on sand.
+#
+# An SSID is better but still wrong for this decision: it says a network was
+# joined, not that it works — a captive portal or a dead AP both have one.
+#
+# `RouterARPVerified : TRUE` says a router replied to an ARP request. It is
+# exactly the question being asked — "does this Mac have somewhere to go that
+# is not us?" — and it cannot be fooled by our own gateway, which is chosen
+# precisely because nothing answers at it.
+wifi_associated() {
+  ipconfig getsummary en0 2>/dev/null | grep -qE 'RouterARPVerified *: *TRUE'
+}
+
 standalone_applied() {
   [[ "$(networksetup -getinfo "$SERVICE" 2>/dev/null | awk '/^IP address:/{print $3; exit}')" == "$SELF_IP" ]]
 }
@@ -135,18 +171,31 @@ while true; do
   fi
   TICK=$((TICK + 1))
 
-  if [[ $SESSION_LIVE -eq 1 ]]; then
-    # Only when nothing has supplied a route. If RouteProvider is doing its job
-    # there is a default route via its utun and this does nothing.
-    if [[ $HAS_ROUTE -eq 0 ]] && ! standalone_applied; then
-      say "a session is live and there is still no default route — the packet tunnel did not come up, falling back"
-      apply_standalone
-    fi
-  else
+  # Ordered by how emphatically each says "give the network back". Every one of
+  # them reverts; only the last applies. Getting this order wrong is how a
+  # fallback becomes the thing the user has to fight.
+  if ! app_running; then
     if standalone_applied; then
-      say "bridge is gone"
+      say "UpLink is not running — handing the network back"
       revert_dhcp
     fi
+  elif wifi_associated; then
+    # A real network is available. Whatever the bridge is doing, the user has
+    # somewhere to go and must not be held on a dead gateway.
+    if standalone_applied; then
+      say "Wi-Fi joined a network — handing it back to DHCP"
+      revert_dhcp
+    fi
+  elif [[ $SESSION_LIVE -eq 0 ]]; then
+    if standalone_applied; then
+      say "bridge is gone — handing the network back"
+      revert_dhcp
+    fi
+  elif [[ $HAS_ROUTE -eq 0 ]] && ! standalone_applied; then
+    # The only branch that applies anything: the app is running, Wi-Fi has
+    # joined nothing, a session is live, and still nothing can be routed.
+    say "session live, no network joined, and no default route — falling back"
+    apply_standalone
   fi
   sleep "$INTERVAL"
 done
