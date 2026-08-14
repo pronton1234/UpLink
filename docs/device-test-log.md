@@ -187,7 +187,8 @@ The two questions the architecture is waiting on. Until these are answered,
 
 | Question | Result | Date |
 | --- | --- | --- |
-| Does AWDL (`includePeerToPeer`) survive inside an `NEPacketTunnelProvider` with the phone locked? | not yet run | |
+| Does AWDL (`includePeerToPeer`) survive inside an `NEPacketTunnelProvider`? | **yes** — carried a full session, `peer=…%awdl0` | 2026-08-14 |
+| …with the phone **locked**? | not yet run — every session so far has been with the phone awake | |
 | Sustained AWDL throughput | not yet run | |
 | Does iOS accept `NEPacketTunnelNetworkSettings` with empty `includedRoutes`, and keep the extension alive? | not yet run | |
 
@@ -310,15 +311,34 @@ reads this machine's real interfaces and asserts they never exclude the
 internet. Confirmed the prefix actually read on this Mac is
 `2001:db8:1:2::/64` — exactly the one containing the phone.
 
-**Not yet confirmed on hardware.** The intended proof is to trim the
-never-bridge list back to just the driving tool and see the session hold on the
-strength of the policy alone. The Mac was redeployed and logged
-`never bridging: [com.anthropic.claude-code]`, but the phone locked and then
-went unavailable before the run could start. To finish it:
+**Confirmed on hardware, 09:17.** The never-bridge list was trimmed to just
+`com.anthropic.claude-code`, so nothing but the policy itself was protecting the
+session:
 
-```bash
-./scripts/prove-bridge.sh          # phone unlocked and connected
+```
+never bridging: [com.anthropic.claude-code]
+capture policy: peer=fe80::2063:e4ff:fed6:7ce0%awdl0:51435 resolvers=
+                on-link=[v6/64,v6/64,v4/24,v6/64]
+
+claims by com.apple.CoreDevice.remotepairingd:  0     (was 1217)
+sessions started: 1     sessions ended: 0       (was: ended within 3s, every time)
 ```
 
-Pass condition: the session stays up, and `claim tcp … by
-com.apple.CoreDevice.remotepairingd` does **not** appear in the Mac's log.
+Stable across the full seven-minute run. The only Apple services claimed were
+`com.apple.curl` and `com.apple.dig` — the coverage probes themselves. Rows 1–6
+bridged, row 7 ICMP as before.
+
+**The peer link ran over AWDL** (`%awdl0`), not the USB cable that was attached.
+The cable serves `devicectl` only — launching the app on the phone from a
+script. No part of the product's path uses it: the Mac↔phone hop was
+peer-to-peer Wi-Fi and egress was the cellular radio. So this run does prove the
+cable-free path, despite a cable being plugged in.
+
+Throughput this run was 50.3 Mbps against a direct reference of 53.3 — about
+94% of what this Mac gets on its own connection, on a sample where the home link
+was slower than the 08:37 run.
+
+Incidentally this answers half of Phase 0's first spike question: **AWDL does
+survive inside a Network Extension** and carried a full session. The other half,
+whether it survives with the phone *locked*, is still unrun — every session so
+far has been with the phone awake.
