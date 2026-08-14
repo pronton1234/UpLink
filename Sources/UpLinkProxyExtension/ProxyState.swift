@@ -204,6 +204,20 @@ actor ProxyState {
             return "connected|\(peer)|\(egress.rawValue)"
         }
 
+        // The Disconnect button did nothing. `MenuBarModel.disconnect()` has
+        // always sent this string; with no case for it, it fell through to
+        // "unknown" and the only thing that changed was the menu bar label. The
+        // session stayed up, the proxy went on claiming every flow, and the
+        // user's one obvious way to stop bridging was a lie.
+        if message == "disconnect" {
+            log?.error("ipc: disconnect requested")
+            await host.stop()
+            // `stop()` now routes through `sessionFinished`, which emits
+            // `.sessionEnded` — that is what clears `hasSession`, releases the
+            // claim path, and lets the app drop the route tunnel.
+            return "ok"
+        }
+
         if message.hasPrefix("pair:") {
             let digits = String(message.dropFirst("pair:".count))
             do {

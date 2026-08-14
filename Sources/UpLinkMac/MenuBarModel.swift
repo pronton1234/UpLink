@@ -75,6 +75,10 @@ final class MenuBarModel {
     /// because it is a separate NE configuration, though the same extension
     /// process serves both.
     private var routeManager: NETunnelProviderManager?
+
+    /// Edge-trigger for the tunnel. `refreshStatus` runs once a second; without
+    /// this it would ask NetworkExtension to start or stop on every tick.
+    private var isRouteTunnelRunning = false
     private var pollTask: Task<Void, Never>?
     private var extensionDelegate: SystemExtensionDelegate?
     private let extensionBundleID = UpLinkIdentifiers.macProxyExtension
@@ -264,8 +268,8 @@ final class MenuBarModel {
             status = .waiting
             notifyObservers()
             startPolling()
-
-            await enableRouteConfiguration(identity: identity)
+            // The route tunnel is NOT started here. It follows the session —
+            // see `setRouteTunnel(running:)`.
         } catch {
             status = .failed(error.localizedDescription)
             notifyObservers()
@@ -284,8 +288,9 @@ final class MenuBarModel {
     /// Failure here is deliberately not fatal to the session. Without it the
     /// bridge still works whenever the Mac has a network of its own, which is
     /// how it behaved before this existed.
-    private func enableRouteConfiguration(identity: Curve25519.KeyAgreement.PrivateKey) async {
+    private func enableRouteConfiguration() async {
         do {
+            let identity = try store.loadOrCreateIdentity()
             // Filter, and exclude the transparent proxy explicitly: it is a
             // subclass, so it comes back from this call too and `first` would
             // hand back the proxy configuration and reconfigure it as a tunnel.
@@ -372,11 +377,46 @@ final class MenuBarModel {
             let new = MacBridgeStatus.connected(peer: name, egress: egress)
             if new != status { status = new; notifyObservers() }
             setBridgeInterface(peer)
+            await setRouteTunnel(running: true)
         case .disconnected:
             if status != .waiting { status = .waiting; notifyObservers() }
             setBridgeInterface(nil)
+            await setRouteTunnel(running: false)
         case .unintelligible:
-            break  // ask again rather than act on noise
+            // Ask again rather than act on noise — and in particular do NOT
+            // tear the tunnel down over one unparsed reply.
+            break
+        }
+    }
+
+    /// **No session ⇒ no tunnel.** The invariant this method exists to hold.
+    ///
+    /// The route tunnel owns the Mac's default route and points it at an
+    /// interface that discards everything, so it is only ever correct while
+    /// something is carrying the traffic. Started from `enableProxyConfiguration`
+    /// it was up from the moment the app configured the extension until the
+    /// moment the app quit — measured:
+    ///
+    ///     11:27:21  route: startTunnel      ← up, with no session at all
+    ///     11:36:51  session started         ← nine minutes later
+    ///     11:42:37  route: stopTunnel       ← only when the app quit
+    ///
+    /// For those nine minutes the Mac had a default route into a black hole and
+    /// no bridge behind it. That is why quitting both apps was the only way to
+    /// get Wi-Fi back: disconnecting the phone ended the session and left the
+    /// route, and the route outlives the app that made it.
+    ///
+    /// Driven from the status poll because that is the Mac's only authority on
+    /// whether a session exists — the extension's own log, not a UI guess.
+    private func setRouteTunnel(running shouldRun: Bool) async {
+        guard shouldRun != isRouteTunnelRunning else { return }
+        isRouteTunnelRunning = shouldRun
+
+        if shouldRun {
+            await enableRouteConfiguration()
+        } else {
+            log.error("route: session gone — dropping the tunnel so normal networking returns")
+            routeManager?.connection.stopVPNTunnel()
         }
     }
 
