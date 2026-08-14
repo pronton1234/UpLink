@@ -178,4 +178,100 @@ ship over the hotspot / shared-Wi-Fi link, which needs no code change elsewhere.
 
 ## Run history
 
-_(none yet)_
+### 2026-08-14 — UDP works on hardware
+
+```
+Date:             2026-08-14 08:37–08:47 PDT
+Build:            cd967f5 (+ harness fixes)
+Transport:        peerToPeer (awdl0) / localLink (en8) both observed
+macOS / iOS:      macOS 15, iOS 17 — MacBook Air ↔ iPhone 15 Plus
+Carrier:          AT&T, 5G NSA (kENDCSub6)
+Config:           Mac on home Wi-Fi (deliberate — see below)
+```
+
+**The line that settles it**, from the phone's own log:
+
+```
+08:37:57.953  udp dial ok 1.1.1.1:53
+08:37:58.201  udp reply 1 from 1.1.1.1:53  51 bytes
+```
+
+248 ms — a cellular round trip. Last night the same two lines were 3 ms apart
+and read `ended after 0 replies`. Three concurrent queries, three answers.
+
+| Measure | 2026-08-13 | 2026-08-14 |
+| --- | --- | --- |
+| `udp flow failed` | 296 in 25 min | **0** |
+| `ended after 0 replies` | every DNS query | **0** |
+| `tcp FAIL` | 4 claims, 0 opens | **0** (77 claims) |
+| `udp dial FAILED` | — | **0** |
+| 25 MB download | 6.71 Mbps | **223.92 Mbps** |
+| 5 MB upload | n/a | 34.45 Mbps |
+
+Coverage matrix, against a baseline taken with the bridge **down**
+(`203.0.113.21` / `2001:db8:1:2:a113:aa40:7944:eaf4`):
+
+```
+1. TCP, proxy-aware (curl)         bridged ✓ 216.77.46.31
+2. TCP, ignores proxy              bridged ✓ 216.77.46.31
+3. TCP, raw socket                 bridged ✓ 2600:387:15:6712::7
+4. UDP (DNS)                       bridged ✓ 2600:382:a609:6fb9:…
+5. QUIC / HTTP-3                   n/a — curl has no HTTP/3
+6. IPv6                            bridged ✓ 2600:387:15:6712::7
+7. ICMP (ping)                     DIRECT ✗ — expected; block-icmp.sh not run
+```
+
+Rows 4 and 6 were `DIRECT ✗` yesterday. Row 7 is the documented API limit:
+`NETransparentProxyProvider` does not intercept ICMP, and `block-icmp.sh` was
+not applied for this run.
+
+QUIC (row 5 reads `n/a` only because this curl lacks HTTP/3 — the phone log is
+better evidence):
+
+```
+udp 2620:149:af6::10:443 ended after 19 replies
+udp 2620:149:af1::10:443 ended after 19 replies
+```
+
+Nineteen replies from one destination is exactly the case the `isComplete` bug
+killed at the first. No stream exhaustion, no credit starvation, no framing
+errors over the run.
+
+**Checklist**
+
+```
+[x] 1. Pair — survived reinstalling both apps
+[x] 2. Connect — phone shows Cellular, egress: Cellular in the Mac log
+[x] 3. User-facing check — egress reported Cellular
+[x] 4. Developer check — carrier IP 216.77.46.31 vs baseline 203.0.113.21
+[ ] 5. Background — not exercised this run
+[x] 6. Throughput — 223.92 Mbps down / 34.45 Mbps up
+       phone's own downlink estimate: 70–84 Mbps (CommCenter, conservative)
+[ ] 7. Watchdog fires — not exercised
+[ ] 8. Watchdog does NOT fire — not exercised
+[x] 9. Stop — clean teardown via UPLINK_AUTOCONNECT=stop
+```
+
+**What this run does NOT prove.** It was taken with the Mac still on home
+Wi-Fi, deliberately: the run was driven from this Mac over this Mac's own
+connection, and with Wi-Fi off there is no path for the operator's traffic at
+all — the never-bridge list keeps it off the phone, which with no other route
+means no route. Rows 1–6 showing the carrier's address proves the traffic
+*went through the phone*; it does not prove the bridge works as the only
+network. That is the Wi-Fi-off run, still outstanding, along with items 5, 7
+and 8.
+
+**Three harness defects found and fixed during this run**, each of which made a
+working bridge look broken:
+
+1. `coverage-test.sh` measured its baseline *through* the live bridge, so every
+   bridged row scored `DIRECT`.
+2. `prove-bridge.sh` baselined without stopping the phone, which reconnects on
+   its own — same defect, one level up. `--terminate-existing` was missing, so
+   `UPLINK_AUTOCONNECT=stop` was silently ignored.
+3. Both scripts judged liveness on a 2-minute log window. A session logs on
+   start and end and nothing in between, so a healthy connection of 140 seconds
+   read as no session at all.
+
+All three share a shape: **treating the absence of a recent log line as
+evidence about the present state.**

@@ -83,12 +83,15 @@ actor ProxyState {
         log.info("seeded with \(seed.count, privacy: .public) paired device(s)")
 
         directApps = Set((configuration?["directApps"] as? [String]) ?? [])
-        if !directApps.isEmpty {
-            // Error level, like the other session diagnostics: if an app is
-            // being kept off the bridge you need to be able to tell that from
-            // the bridge simply not working for it.
-            log.error("never bridging: \(self.directApps.sorted().joined(separator: ","), privacy: .public)")
-        }
+        // Logged unconditionally, including when empty. Logging only the
+        // non-empty case made a misconfigured escape hatch indistinguishable
+        // from a build without the feature — which is exactly what happened:
+        // a stale sandbox container for com.uplink.app meant `defaults write
+        // com.uplink.app` landed in ~/Library/Containers/…, while this app is
+        // deliberately NOT sandboxed and reads ~/Library/Preferences/. The
+        // value was written, read back correctly by `defaults read`, and never
+        // seen by the app. Silence is not evidence of absence.
+        log.error("never bridging: [\(self.directApps.sorted().joined(separator: ","), privacy: .public)]")
 
         let host = MacSessionHost(
             identity: identity,

@@ -178,7 +178,17 @@ final class MenuBarModel {
     /// notarized system extension is the difference between a minute and a
     /// quarter of an hour:
     ///
-    ///     defaults write com.uplink.app UpLinkDirectApps -array com.example.tooling
+    ///     defaults write ~/Library/Preferences/com.uplink.app \
+    ///         UpLinkDirectApps -array com.example.tooling
+    ///
+    /// **Write the path, not the bundle id.** `defaults write com.uplink.app`
+    /// follows a sandbox container if one exists for that identifier, and a
+    /// stale `~/Library/Containers/com.uplink.app` survives on any machine that
+    /// ever ran a sandboxed build. This app is deliberately not sandboxed, so
+    /// it reads `~/Library/Preferences/`, and the two silently disagree:
+    /// `defaults read` shows the value, the app never sees it. The extension
+    /// logs the list it actually received, empty or not — trust that over the
+    /// write appearing to succeed.
     ///
     /// The value is a **signing identifier**, not a hostname. Hostnames cannot
     /// do this job: a UDP flow has no destination at claim time, and a datagram

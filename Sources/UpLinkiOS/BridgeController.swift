@@ -3,6 +3,7 @@ import NetworkExtension
 import Network
 import CryptoKit
 import Observation
+import OSLog
 import UpLinkKit
 
 /// What the user is currently looking at.
@@ -36,6 +37,18 @@ final class BridgeController {
 
     /// Non-nil while a pairing is in progress and the user must type a code.
     var pendingPairingPeer: DiscoveredPeer?
+
+    /// The phone drives every session, and until now it did so in total
+    /// silence: 370 lines with not one log call. When autoconnect failed the
+    /// only trace was a `state` change nobody could see from a script, so a
+    /// harness run that never connected looked identical to one where the Mac
+    /// was at fault — and the Mac's log, which does say plenty, was searched
+    /// for an answer it could not contain.
+    ///
+    /// Error level throughout, deliberately: info and debug live only in the
+    /// memory ring buffer and are the first thing evicted by a burst, which is
+    /// exactly when they are needed.
+    private let log = Logger(subsystem: UpLinkIdentifiers.logSubsystem, category: "bridge")
 
     private var manager: NETunnelProviderManager?
     private let store = PairedDeviceStore()
@@ -128,6 +141,7 @@ final class BridgeController {
             return
         }
         guard request == "1" else { return }
+        log.error("autoconnect: requested, \(self.pairedDevices.count, privacy: .public) paired device(s) known")
 
         // Tear down any tunnel that is already running before starting a new
         // one. Reinstalling the app replaces the extension *binary*, but iOS
@@ -150,11 +164,25 @@ final class BridgeController {
                 guard let fingerprint = peer.fingerprint else { return false }
                 return pairedDevices.contains { $0.fingerprint == fingerprint }
             }) {
+                log.error("autoconnect: connecting to \(peer.name, privacy: .public)")
                 await connect(to: peer)
                 return
             }
             try? await Task.sleep(for: .milliseconds(500))
         }
+
+        // Both counts, because they fail differently and the difference decides
+        // what to do next. Nothing discovered means the Mac is not advertising
+        // or is unreachable on this link; peers discovered but none of them
+        // paired means the phone has lost its half of the pairing — which is
+        // what reinstalling the app does — and someone has to enter a code.
+        // Reporting only "no paired Mac appeared" conflates the two.
+        let seen = peers.map { "\($0.name)/\($0.fingerprint ?? "no-fp")" }.joined(separator: ",")
+        log.error("""
+            autoconnect FAILED after 30s: \
+            \(self.peers.count, privacy: .public) peer(s) discovered [\(seen, privacy: .public)], \
+            \(self.pairedDevices.count, privacy: .public) paired
+            """)
         state = .failed("autoconnect: no paired Mac appeared within 30s")
     }
 

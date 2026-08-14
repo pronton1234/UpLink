@@ -27,6 +27,51 @@ blue()  { printf '\033[0;34m%s\033[0m\n' "$1"; }
 
 blue "==> 0. Baseline: what this Mac looks like WITHOUT the bridge"
 #
+# Take the bridge DOWN first. The phone reconnects on its own — that is the
+# point of the reconnect policy — so "I have not started it yet" is not the same
+# as "it is not running", and a session left over from a previous run silently
+# turns this into a measurement through the bridge. Observed: a baseline of
+# 216.77.46.31, which is the CARRIER's address, followed by step 4 reporting
+# "UNCHANGED — traffic did NOT cross the bridge" about a bridge that was working
+# perfectly. The baseline and the result agreed because both went through the
+# phone.
+#
+# This is the same defect that inverted coverage-test.sh's matrix, one level up.
+# A harness that can measure the wrong thing without saying so produces
+# confident, wrong numbers, and those cost more than no numbers at all.
+#
+# --terminate-existing is load-bearing. The controller reads UPLINK_AUTOCONNECT
+# once, when it is constructed at process launch; `devicectl process launch` on
+# an app that is already running just foregrounds it, so the new environment is
+# never seen and the stop is silently ignored. Measured: the session stayed up
+# through 30s of polling and the baseline came back as the carrier's address.
+if xcrun devicectl device process launch --device "$DEVICE" --terminate-existing \
+     --environment-variables '{"UPLINK_AUTOCONNECT":"stop"}' "$BUNDLE" >/dev/null 2>&1; then
+  echo "    asked the phone to disconnect; waiting for the session to end"
+  for _ in $(seq 1 25); do
+    # A 10-minute window, and the LAST event must be ENDED. A short window is
+    # wrong in the dangerous direction: a session that has been up for a while
+    # logs nothing recent, so "no events" reads as "disconnected" when it means
+    # the exact opposite.
+    STATE=$(/usr/bin/log show --last 10m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
+      | grep -E "session started|session ENDED" | tail -1)
+    [[ -z "$STATE" || "$STATE" == *"session ENDED"* ]] && break
+    sleep 2
+  done
+  case "$STATE" in
+    *"session started"*)
+      red "    the bridge is STILL UP — refusing to take a baseline through it"
+      echo "    Every number from here would be measured through the phone, which"
+      echo "    is how a working bridge came to report 'traffic did NOT cross'."
+      exit 2
+      ;;
+  esac
+  green "    bridge is down; baseline is honest"
+else
+  red "    could not reach the phone to stop it — refusing to guess a baseline"
+  exit 2
+fi
+#
 # This is the ONLY honest moment to take a baseline: the bridge is not up yet.
 # coverage-test.sh cannot take its own — it refuses to run without a live
 # session, so anything it measures is already going through the phone. Both
@@ -43,7 +88,7 @@ export UPLINK_BASELINE_V6="$BASE_IP6"
 blue "==> 1. Waiting for the phone to be unlocked (up to 10 min)"
 LAUNCHED=0
 for i in $(seq 1 60); do
-  if xcrun devicectl device process launch --device "$DEVICE" \
+  if xcrun devicectl device process launch --device "$DEVICE" --terminate-existing \
        --environment-variables '{"UPLINK_AUTOCONNECT":"1"}' "$BUNDLE" >/dev/null 2>&1; then
     LAUNCHED=1
     green "    launched with autoconnect (attempt $i)"

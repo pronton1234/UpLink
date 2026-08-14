@@ -43,11 +43,21 @@ FAILURES=0
 # measure a corpse is worse than no harness: it produces confident, wrong
 # numbers that then drive hours of debugging.
 blue "==> Checking the bridge is actually up"
-SESSION_STATE=$(/usr/bin/log show --last 2m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
+# A 10-minute window, not 2. A session logs when it starts and when it ends and
+# says nothing in between, so a SHORT window makes a healthy long-lived session
+# indistinguishable from no session at all — and this script then refuses to
+# measure a bridge that is working perfectly. Observed: a run connected at
+# 08:42:10 and was declared dead at 08:44:30, 140 seconds later, purely because
+# it had not logged anything since.
+#
+# The same mistake in the opposite direction is what let two runs measure a
+# session that had already ended. What matters is the LAST event, not whether
+# there was a recent one.
+SESSION_STATE=$(/usr/bin/log show --last 10m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
   | grep -E "session started|session ENDED" | tail -1)
 
 if [[ -z "$SESSION_STATE" ]]; then
-  amber "    No session start or end in the last 2 minutes."
+  amber "    No session start or end in the last 10 minutes."
   echo "    Connect from your iPhone first, then re-run. Measuring now would"
   echo "    report 'no connectivity' whether or not the bridge works."
   exit 2
