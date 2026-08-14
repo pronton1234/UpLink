@@ -51,12 +51,17 @@ claims() {
 }
 
 blue "==> Preconditions"
-if route -n get default >/dev/null 2>&1; then
-  red "    A default route already exists — disconnect Wi-Fi first."
+# -inet matters. This box keeps IPv6 default routes via idle utun tunnels even
+# with the network down, so a family-less `route get default` succeeds and this
+# check refused to run in exactly the state it exists to measure. The IPv4
+# default is the one that disappears, and it is the one that breaks browsing.
+if route -n get -inet default >/dev/null 2>&1; then
+  red "    An IPv4 default route already exists — disconnect Wi-Fi first."
   red "    With a working route this measures nothing."
+  netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print "    current: "$0}'
   exit 2
 fi
-green "    no default route, which is the state under test"
+green "    no IPv4 default route, which is the state under test"
 
 STATE=$(/usr/bin/log show --last 10m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
         | grep -E "session started|session ENDED" | tail -1)
