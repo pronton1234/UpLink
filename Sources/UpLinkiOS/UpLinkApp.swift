@@ -171,6 +171,9 @@ struct StatusDial: View {
     private var symbol: String {
         switch state {
         case .connected(_, .cellular): "antenna.radiowaves.left.and.right"
+        // Nothing has been dialled yet, so nothing is known. That is not a
+        // fault and must not look like one — see `headline`.
+        case .connected(_, .unknown): "antenna.radiowaves.left.and.right"
         case .connected: "exclamationmark.triangle"
         case .connecting, .searching: "dot.radiowaves.left.and.right"
         case .failed: "exclamationmark.triangle"
@@ -182,6 +185,12 @@ struct StatusDial: View {
     private var headline: String {
         switch state {
         case .connected(_, .cellular): "Cellular"
+        // "Unknown" meant two different things and showed the alarming one.
+        // The egress is only observed when a destination is actually dialled,
+        // so a healthy session that has carried nothing yet reported `.unknown`
+        // and drew a warning triangle reading "Unknown" — indistinguishable
+        // from the real warning, which is "we looked, and it is NOT cellular".
+        case .connected(_, .unknown): "Connected"
         case let .connected(_, egress): egress.displayName
         case .connecting: "Connecting"
         case .searching: "Searching"
@@ -194,7 +203,8 @@ struct StatusDial: View {
     private var ringColor: Color {
         switch state {
         case .connected(_, .cellular): .green
-        case .connected: .orange   // connected, but not over cellular
+        case .connected(_, .unknown): .blue   // connected, nothing measured yet
+        case .connected: .orange              // measured, and NOT cellular
         case .failed: .red
         default: .blue
         }
@@ -224,6 +234,7 @@ struct StatusCaption: View {
     private var title: String {
         switch state {
         case let .connected(peer, .cellular): "Bridging \(peer)"
+        case let .connected(peer, .unknown): "Connected to \(peer)"
         case let .connected(peer, egress): "Bridging \(peer) over \(egress.displayName)"
         case let .connecting(peer): "Connecting to \(peer)…"
         case .searching: "Looking for your Mac"
@@ -237,6 +248,8 @@ struct StatusCaption: View {
         switch state {
         case .connected(_, .cellular):
             "Your Mac's traffic is going out over cellular. You can lock your phone."
+        case .connected(_, .unknown):
+            "Waiting for your Mac to send something. The route is only reported once real traffic goes out."
         case .connected:
             // The warning that makes the whole egress-reporting path worth it.
             "Traffic is not going over cellular, so you're not bypassing anything. Check that cellular data is on."

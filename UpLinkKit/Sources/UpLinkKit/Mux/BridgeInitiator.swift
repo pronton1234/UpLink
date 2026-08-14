@@ -92,6 +92,13 @@ public actor BridgeInitiator {
     private var decoder = FrameDecoder()
     private var streams: [UInt32: ProxiedStream] = [:]
 
+    /// How many stream slots are currently held.
+    ///
+    /// Exposed because a leak here is invisible until the session is already
+    /// unusable: slots are never reclaimed, so the symptom appears minutes
+    /// after the cause and looks like a network fault rather than a leak.
+    public var openStreamCount: Int { streams.count }
+
     /// Last interface the phone reported using. `nil` until the first stream
     /// egresses, because claiming anything before then would be a guess.
     public private(set) var observedEgress: EgressInterface?
@@ -160,11 +167,55 @@ public actor BridgeInitiator {
     }
 
     public func openStream(to destination: StreamOpen) async throws -> ProxiedStream {
+        // The mux allocates the ID here, before the OPEN has been written. Every
+        // path out of this function after that point must therefore either
+        // return the stream or give the slot back — there are only
+        // `maxConcurrentStreams` of them, and a slot nobody owns is never
+        // reclaimed for the lifetime of the session.
+        //
+        // SYMPTOM when it was not: one misbehaving app (`com.relay.mac`,
+        // reconnect-storming after the Mac lost Wi-Fi) produced 55,536 claims
+        // in a couple of minutes. 50,712 of them failed with
+        // `streamLimitReached` — and the failures did not stop when the storm
+        // did. Every other app on the machine was starved: 13 flows opened in
+        // the window, so pages half-loaded rather than failing outright, which
+        // is a far more confusing symptom than being offline.
         let opened = try mux.openStream(to: destination)
         let stream = ProxiedStream(id: opened.streamID, owner: self)
         streams[opened.streamID] = stream
-        try await write(opened.frame)
+
+        do {
+            try await write(opened.frame)
+        } catch {
+            // The write is bounded (`NWConnectionChannel.sendTimeout`), so under
+            // congestion this throws routinely rather than exceptionally.
+            release(opened.streamID)
+            throw error
+        }
+
+        // The caller's deadline may have expired while the OPEN was in flight.
+        // `withFlowDeadline` abandons the operation rather than unwinding it, so
+        // without this the stream is opened, credited, and owned by nobody —
+        // the dominant leak under load, because congestion is exactly when the
+        // write takes longer than the deadline.
+        guard !Task.isCancelled else {
+            release(opened.streamID)
+            throw CancellationError()
+        }
+
         return stream
+    }
+
+    /// Gives a stream slot back without requiring the peer to answer.
+    ///
+    /// Local bookkeeping first and unconditionally; telling the peer is
+    /// best-effort. If the channel is the reason we are here, waiting on it to
+    /// carry the CLOSE is how one failure becomes a permanent leak.
+    private func release(_ streamID: UInt32) {
+        creditArrived(on: streamID)
+        streams.removeValue(forKey: streamID)
+        guard let frame = try? mux.closeStream(streamID) else { return }
+        Task { [weak self] in try? await self?.write(frame) }
     }
 
     func send(_ data: Data, on streamID: UInt32) async throws {
