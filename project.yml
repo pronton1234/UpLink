@@ -1,0 +1,146 @@
+name: UpLink
+
+options:
+  bundleIdPrefix: com.uplink.app
+  deploymentTarget:
+    macOS: "15.0"
+    iOS: "17.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+packages:
+  UpLinkKit:
+    path: UpLinkKit
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: 9NT85V7Q37
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_HARDENED_RUNTIME: YES
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+
+  # ── macOS ────────────────────────────────────────────────────────────────
+  # The Mac side is entirely passive: it launches at login, advertises itself,
+  # and waits. All session control happens on the phone.
+
+  UpLinkMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/UpLinkMac
+    dependencies:
+      - package: UpLinkKit
+        product: UpLinkKit
+      - target: UpLinkProxyExtension
+        embed: true
+        codeSign: true
+        copy:
+          # `wrapper` means "inside the .app bundle". `productsDirectory` puts
+          # it beside the app, which builds fine and then fails at runtime with
+          # "Extension not found in App bundle".
+          destination: wrapper
+          subpath: Contents/Library/SystemExtensions
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.uplink.app
+        PRODUCT_NAME: UpLink
+        INFOPLIST_FILE: Sources/UpLinkMac/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/UpLinkMac/UpLinkMac.entitlements
+        # Off deliberately — a sandboxed app cannot install a system extension.
+        # See UpLinkMac.entitlements.
+        ENABLE_APP_SANDBOX: NO
+        # BOTH configurations sign with Developer ID and an explicit profile.
+        # The entitlements request the -systemextension provider values, which
+        # only Developer ID profiles carry — so leaving Debug on automatic
+        # signing produces "provisioning profile doesn't match" in Xcode even
+        # though Release builds fine. Each target needs its OWN profile: a
+        # project-wide setting matches the app's bundle ID and fails on the
+        # extension.
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Developer ID Application"
+        PROVISIONING_PROFILE_SPECIFIER: "UpTime app"
+
+  UpLinkProxyExtension:
+    type: system-extension
+    platform: macOS
+    sources:
+      - path: Sources/UpLinkProxyExtension
+    dependencies:
+      - package: UpLinkKit
+        product: UpLinkKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.uplink.app.proxy
+        # The bundle FILENAME must equal the bundle identifier for a system
+        # extension. macOS matches on the filename when enumerating
+        # Contents/Library/SystemExtensions, and reports a mismatch as
+        # OSSystemExtensionError.extensionNotFound (code 4) — which reads as
+        # "the file is missing" when the file is right there.
+        # Verified against Tailscale, whose extension is named
+        # io.tailscale.ipn.macsys.network-extension.systemextension.
+        PRODUCT_NAME: com.uplink.app.proxy
+        # Keep the Swift module name stable so NEProviderClasses in Info.plist
+        # still resolves; PRODUCT_NAME would otherwise mangle it.
+        PRODUCT_MODULE_NAME: UpLinkProxyExtension
+        INFOPLIST_FILE: Sources/UpLinkProxyExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/UpLinkProxyExtension/UpLinkProxyExtension.entitlements
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Developer ID Application"
+        PROVISIONING_PROFILE_SPECIFIER: "UpTime Proxy"
+
+  # ── iOS ──────────────────────────────────────────────────────────────────
+  # The phone drives the session. The tunnel extension exists so the bridge
+  # survives screen lock and app switching, which a plain app cannot do.
+
+  UpLinkiOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/UpLinkiOS
+    dependencies:
+      - package: UpLinkKit
+        product: UpLinkKit
+      - target: UpLinkTunnelExtension
+        embed: true
+        codeSign: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.uplink.app
+        PRODUCT_NAME: UpLink
+        INFOPLIST_FILE: Sources/UpLinkiOS/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/UpLinkiOS/UpLinkiOS.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+
+  UpLinkTunnelExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Sources/UpLinkTunnelExtension
+    dependencies:
+      - package: UpLinkKit
+        product: UpLinkKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.uplink.app.tunnel
+        PRODUCT_NAME: UpLinkTunnelExtension
+        INFOPLIST_FILE: Sources/UpLinkTunnelExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/UpLinkTunnelExtension/UpLinkTunnelExtension.entitlements
+
+schemes:
+  UpLinkMac:
+    build:
+      targets:
+        UpLinkMac: all
+    run:
+      config: Debug
+  UpLinkiOS:
+    build:
+      targets:
+        UpLinkiOS: all
+    run:
+      config: Debug

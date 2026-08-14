@@ -1,1 +1,8 @@
 .DS_Store
+UpLink.xcodeproj/
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+spike/*/.build/
+build/

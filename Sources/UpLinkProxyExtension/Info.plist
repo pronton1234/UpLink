@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AppIdentifierPrefix</key>
+	<string>$(AppIdentifierPrefix)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleDisplayName</key>
+	<string>UpLink Network Extension</string>
+	<!-- Shown to the user when macOS asks them to approve this extension.
+	     Its absence is why activation failed with the misleading
+	     OSSystemExtensionError.extensionNotFound: the system rejects an
+	     extension it cannot describe to the user, and reports it as missing. -->
+	<key>NSSystemExtensionUsageDescription</key>
+	<string>UpLink routes this Mac's network traffic through your iPhone's cellular connection.</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>SYSX</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>UpLink connects to your iPhone on the local network to bridge this Mac's traffic.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_uplink._tcp</string>
+	</array>
+	<key>NetworkExtension</key>
+	<dict>
+		<!-- Must be prefixed with an App Group from the entitlements, NOT the
+		     bare team identifier. NetworkExtension rejects the latter with
+		     "invalid NEMachServiceName key in its Info.plist". -->
+		<key>NEMachServiceName</key>
+		<string>$(TeamIdentifierPrefix)group.com.uplink.app</string>
+		<key>NEProviderClasses</key>
+		<dict>
+			<key>com.apple.networkextension.app-proxy</key>
+			<string>$(PRODUCT_MODULE_NAME).TransparentProxyProvider</string>
+		</dict>
+	</dict>
+</dict>
+</plist>
