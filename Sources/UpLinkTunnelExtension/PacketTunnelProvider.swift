@@ -76,7 +76,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         let discovery = PeerDiscovery(profile: config.profile)
         await discovery.start(on: queue)
 
-        var policy = ReconnectPolicy()
+        // Half a second, capped at five — NOT the 1s/30s default.
+        //
+        // The default is tuned for a service that is one of many: back off hard,
+        // do not hammer. This link is the Mac's ONLY network, so the trade runs
+        // the other way. Retrying costs a Bonjour browse and a TCP connect on a
+        // local radio link; NOT retrying costs the user their entire internet.
+        //
+        // Measured 2026-08-14: an AWDL session dropped at 15:05:29 and the phone
+        // did not get back in until 15:07:12 — 100 seconds, most of it sitting
+        // in a 30-second backoff while the Mac had no network at all and the
+        // user watched browser tabs fail.
+        var policy = ReconnectPolicy(baseDelay: 0.5, maxDelay: 5)
 
         while !Task.isCancelled {
             do {
@@ -130,7 +141,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
 
     /// How long to wait for the paired Mac to appear before giving up and
     /// letting the reconnect loop back off and try again.
-    private static let discoveryTimeout: TimeInterval = 15
+    /// Six seconds, not fifteen.
+    ///
+    /// This is spent on EVERY reconnect attempt before the backoff even starts,
+    /// so a fifteen-second wait plus a thirty-second backoff is three quarters
+    /// of a minute per try — while the Mac, whose only network this is, has
+    /// none. A Bonjour browse over AWDL that has not produced the Mac in six
+    /// seconds is not going to; failing fast and browsing again is cheaper than
+    /// waiting, because a fresh browse re-issues the query.
+    private static let discoveryTimeout: TimeInterval = 6
 
     /// Waits for the paired Mac to appear, rather than failing on the first
     /// empty browse result — discovery takes a moment to populate.
