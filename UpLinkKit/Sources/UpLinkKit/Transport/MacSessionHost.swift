@@ -103,8 +103,17 @@ public actor MacSessionHost {
         sessionTask = nil
         listener?.cancel()
         listener = nil
-        initiator = nil
-        peerDescription = nil
+        // Emit the end rather than clearing state silently. Tearing the host
+        // down without `.sessionEnded` leaves every consumer — the proxy's
+        // `hasSession`, the menu bar, the route tunnel — believing a session is
+        // still live, which is the same class of lie this whole change exists
+        // to remove.
+        if let fingerprint = activeFingerprint {
+            Task { await sessionFinished(fingerprint: fingerprint, channel: nil) }
+        } else {
+            initiator = nil
+            peerDescription = nil
+        }
     }
 
     /// Puts a code on the air, or takes it off again.
@@ -262,6 +271,10 @@ public actor MacSessionHost {
         await channel.close()
     }
 
+    /// Fingerprint of the session currently believed live, so teardown can
+    /// report which one ended and can be made idempotent.
+    private var activeFingerprint: String?
+
     private func handleSession(
         _ hello: Frame,
         on channel: FrameChannel,
@@ -283,6 +296,7 @@ public actor MacSessionHost {
         // paired with this Mac.
         let fingerprint = Self.identity(inHello: hello) ?? "unknown"
 
+        activeFingerprint = fingerprint
         emit(.sessionStarted(fingerprint: fingerprint, peerDescription: description))
 
         let token = await initiator.onEgressChange { [weak self] interface in
@@ -296,13 +310,25 @@ public actor MacSessionHost {
                 await self?.emit(.failed(String(describing: error)))
             }
             await initiator.removeEgressObserver(token)
-            await self?.sessionFinished(fingerprint: fingerprint)
+            await self?.sessionFinished(fingerprint: fingerprint, channel: channel)
         }
     }
 
-    private func sessionFinished(fingerprint: String) {
+    /// Ends a session and releases the connection behind it.
+    ///
+    /// Closing the channel is not tidiness. A live session's `NWConnection` was
+    /// never cancelled — `close()` is called on the accept-error and pairing
+    /// paths only — so a session that ended left the socket open. Cancelling it
+    /// is also what makes the PHONE notice: its `ReconnectPolicy` loop in
+    /// `PacketTunnelProvider.runSession` turns on `connectOnce` returning, which
+    /// happens when its own receive completes. Without this the phone can sit
+    /// believing it is still bridging for a Mac that has moved on.
+    private func sessionFinished(fingerprint: String, channel: FrameChannel?) async {
+        guard activeFingerprint != nil else { return }   // already ended
+        activeFingerprint = nil
         initiator = nil
         peerDescription = nil
+        await channel?.close()
         emit(.sessionEnded(fingerprint: fingerprint))
     }
 

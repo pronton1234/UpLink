@@ -295,6 +295,17 @@ public actor NWConnectionChannel: FrameChannel {
     /// handshake — which Network.framework reports as `.waiting`, not
     /// `.failed` — left this awaiting forever. Pairing did not fail; it hung,
     /// which is a far harder thing to diagnose from a phone.
+    /// Whether a send error means the connection itself is finished.
+    ///
+    /// These are the errors where retrying on the same socket cannot help, so
+    /// the honest response is to end the session and let the phone redial —
+    /// rather than let every subsequent flow rediscover the same corpse.
+    static func isTerminal(_ error: NWError) -> Bool {
+        guard case let .posix(code) = error else { return false }
+        return code == .EPIPE || code == .ECONNRESET || code == .ENOTCONN
+            || code == .ENETDOWN || code == .EHOSTUNREACH || code == .ENETUNREACH
+    }
+
     public func start(on queue: DispatchQueue) async throws {
         guard !isStarted else { return }
         isStarted = true
@@ -311,14 +322,40 @@ public actor NWConnectionChannel: FrameChannel {
                 ))
             }
 
-            connection.stateUpdateHandler = { state in
+            // NOT torn down after `.ready`, and that is the whole point.
+            //
+            // `OneShot` resumes at most once, so this handler used to become
+            // inert the moment the connection came up: every later state,
+            // INCLUDING `.failed` and `.cancelled`, was silently discarded. The
+            // channel's only remaining liveness sensor was an outstanding
+            // `connection.receive` callback, so a connection that died while no
+            // read was armed became a zombie — `isClosed == false`, `receive()`
+            // suspended on a continuation nobody would ever resume, and
+            // `MacSessionHost.sessionFinished` never called.
+            //
+            // Measured 2026-08-14: the pipe broke 13 seconds into a session and
+            // nothing noticed. `hasSession` stayed true, so `handleNewFlow`
+            // kept claiming every flow on the machine and every one died in the
+            // write — 31,034 `Broken pipe` against 30 successful opens, with
+            // **zero** `session ENDED`. Every browser tab failed while both ends
+            // reported a healthy bridge.
+            //
+            // Resuming the OneShot still reports the *connect* result exactly as
+            // before; what is new is that the handler keeps running afterwards
+            // and turns a terminal state into `receive() -> nil`, which the
+            // existing plumbing already converts into `.sessionEnded`.
+            connection.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
                     once.resume(returning: ())
                 case let .failed(error):
                     once.resume(throwing: error)
+                    Logger(subsystem: UpLinkIdentifiers.logSubsystem, category: "channel")
+                        .error("connection failed: \(String(describing: error), privacy: .public) — ending the session")
+                    Task { await self?.finish() }
                 case .cancelled:
                     once.resume(throwing: ChannelError.peerClosed)
+                    Task { await self?.finish() }
                 case let .waiting(error):
                     Logger(subsystem: UpLinkIdentifiers.logSubsystem, category: "channel")
                         .error("connection waiting: \(String(describing: error), privacy: .public)")
@@ -416,9 +453,23 @@ public actor NWConnectionChannel: FrameChannel {
                 ))
             }
 
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error { once.resume(throwing: error) }
-                else { once.resume(returning: ()) }
+            connection.send(content: data, completion: .contentProcessed { [weak self] error in
+                if let error {
+                    // A hard error is a property of the CONNECTION, not of this
+                    // write, and rediscovering it per flow is how one dead pipe
+                    // produced 31,034 identical failures while the session went
+                    // on claiming every flow on the machine.
+                    //
+                    // Deliberately narrow. The `sendTimeout` above and any
+                    // transient error keep today's behaviour — failing one write
+                    // — because tearing a session down over a single slow write
+                    // would be its own outage, and `stalledPeerFailsTheWrite`
+                    // exists to keep that path honest.
+                    if Self.isTerminal(error) { Task { await self?.finish() } }
+                    once.resume(throwing: error)
+                } else {
+                    once.resume(returning: ())
+                }
             })
         }
     }
