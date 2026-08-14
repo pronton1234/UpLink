@@ -324,6 +324,61 @@ with the extension keeping only the `NEAppProxyUDPFlow` conformance.
 it, it will only ever be debugged in production.** Where the code lives is a
 testability decision, not just an organisational one.
 
+## A globally-scoped address can still be on your own LAN
+
+Found on hardware 2026-08-14, by logging *which app* was claiming each flow.
+
+`CapturePolicy` excluded local addresses by prefix — RFC 1918 and RFC 4193.
+That works for IPv4 and cannot work for IPv6: a home network is delegated a
+globally routable /64, so this Mac at `2001:db8:1:2:a113:…` and the phone
+sitting next to it at `2001:db8:1:2:23:…` both hold addresses
+indistinguishable from a server in another country.
+
+So every IPv6 neighbour on the user's own network was handed to a phone on a
+cellular link that cannot reach it. The sharpest case was
+`com.apple.CoreDevice.remotepairingd`, the Mac↔iPhone developer channel: the
+Mac captured its own control connection to the phone and routed it *through*
+the phone.
+
+```
+08:32:48  claim tcp 2001:db8:1:2:23:f710:2dae:d09d:49152
+            by com.apple.CoreDevice.remotepairingd
+08:32:49  tcp FAIL … handshakeFailed("write not acknowledged within 10s")
+08:32:51  session ENDED
+```
+
+1217 claims in seconds, and the session died within three of starting, every
+time. Note this is the self-capture loop again in a different costume — the
+peer-endpoint guard checks the address the *session* is on, and remotepairingd
+reaches the same phone by another one.
+
+| Test | Guards against |
+| --- | --- |
+| `The phone's globally-scoped address on the home LAN is not bridged` | the defect itself |
+| `Address prefixes alone cannot recognise it` | someone "simplifying" this back into a prefix rule |
+| `A real internet host in a different /64 is still bridged` | over-excluding |
+| `A public IPv4 network this Mac is on is excluded` | the v4 half |
+| `A prefix broad enough to swallow the internet is refused` | one bad netmask excluding everything |
+| `The real interface list never excludes the internet` | the same, against this machine's actual interfaces |
+| `A scoped link-local address still parses` | `inet_pton` rejecting `fe80::1%en0` and skipping every link-local interface in silence |
+
+Two things worth keeping from how this was tested:
+
+- The IPv4 test originally used `169.254.4.183/16`, which **rule 3 already
+  catches**. It passed with the new rule deleted — coverage that pinned
+  nothing. A regression test has to fail for the reason you think it does, not
+  merely fail to pass. It now uses a public /24.
+- `LocalNetworks` was written in the extension and moved to the kit before it
+  ever ran, per the section below. The test that matters most reads *this
+  machine's real interfaces* and asserts they never exclude the internet — no
+  unit test of the matching logic in isolation can make that assertion, and it
+  is the entire safety argument for reading netmasks off a live system.
+
+**The lesson worth keeping: this is the third time an address that looked
+global turned out to be local** — the router as resolver, the resolver at
+`2001:db8:1:2::1`, and now every neighbour on the LAN. Ask the system;
+never infer locality from the bits.
+
 ## Rules of thumb these encode
 
 Three of the failures above share a shape worth naming: **the bridge must never

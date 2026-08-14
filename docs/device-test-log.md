@@ -100,6 +100,24 @@ log stream --predicate 'subsystem == "com.uplink.app"' | grep '^.*claim '
 A UDP flow is claimed before any destination is known, so this is the **only**
 exclusion that works for UDP. Naming a host does not help.
 
+Keep the list to the tools actually driving the run. In particular
+`com.apple.CoreDevice.remotepairingd` — the Mac↔iPhone developer channel —
+**used** to need to be on it, because it reaches the phone at the phone's
+*global* IPv6 address on the home LAN and the capture policy could not tell that
+from a real internet host. Left unexcluded it produced 1217 claims in seconds
+and ended the session within three. That is fixed properly now: the policy reads
+this Mac's own interface prefixes at session start and refuses to bridge any
+network it is attached to. If you find yourself adding a system service to the
+never-bridge list, that is a bug in the policy, not a configuration step.
+
+Check what the extension actually received — an empty list is logged too, since
+a misconfigured hatch otherwise looks identical to a build without it:
+
+```
+never bridging: [com.anthropic.claude-code]
+capture policy: peer=… resolvers=… on-link=[v6/64,v4/24,v6/64,v4/16]
+```
+
 `./scripts/emergency-off.sh` is still the backstop, but it is a recovery tool,
 not a safety mechanism: it runs after the Mac has already gone dark, and by then
 the session you were measuring is gone.
@@ -275,3 +293,32 @@ working bridge look broken:
 
 All three share a shape: **treating the absence of a recent log line as
 evidence about the present state.**
+
+### 2026-08-14, later — IPv6 on-link fix, device verification OUTSTANDING
+
+The run above was only possible because `com.apple.CoreDevice.remotepairingd`
+was put on the never-bridge list by hand. That was papering over a real defect:
+the capture policy could not recognise a globally-scoped IPv6 address on this
+Mac's own LAN as local, so it bridged every IPv6 neighbour — including the
+Mac's own control channel to the phone, which ended the session in three
+seconds.
+
+Fixed by reading this Mac's interface prefixes (`LocalNetworks` /
+`OnLinkNetwork`) and refusing to bridge any network it is attached to. Verified
+off-device: 248 tests, both halves confirmed red before the fix, and a test that
+reads this machine's real interfaces and asserts they never exclude the
+internet. Confirmed the prefix actually read on this Mac is
+`2001:db8:1:2::/64` — exactly the one containing the phone.
+
+**Not yet confirmed on hardware.** The intended proof is to trim the
+never-bridge list back to just the driving tool and see the session hold on the
+strength of the policy alone. The Mac was redeployed and logged
+`never bridging: [com.anthropic.claude-code]`, but the phone locked and then
+went unavailable before the run could start. To finish it:
+
+```bash
+./scripts/prove-bridge.sh          # phone unlocked and connected
+```
+
+Pass condition: the session stays up, and `claim tcp … by
+com.apple.CoreDevice.remotepairingd` does **not** appear in the Mac's log.
