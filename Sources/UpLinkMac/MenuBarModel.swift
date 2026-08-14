@@ -76,9 +76,6 @@ final class MenuBarModel {
     /// process serves both.
     private var routeManager: NETunnelProviderManager?
 
-    /// Edge-trigger for the tunnel. `refreshStatus` runs once a second; without
-    /// this it would ask NetworkExtension to start or stop on every tick.
-    private var isRouteTunnelRunning = false
     private var pollTask: Task<Void, Never>?
     private var extensionDelegate: SystemExtensionDelegate?
     private let extensionBundleID = UpLinkIdentifiers.macProxyExtension
@@ -377,11 +374,11 @@ final class MenuBarModel {
             let new = MacBridgeStatus.connected(peer: name, egress: egress)
             if new != status { status = new; notifyObservers() }
             setBridgeInterface(peer)
-            await setRouteTunnel(running: true)
+            await reconcileRouteTunnel(sessionLive: true)
         case .disconnected:
             if status != .waiting { status = .waiting; notifyObservers() }
             setBridgeInterface(nil)
-            await setRouteTunnel(running: false)
+            await reconcileRouteTunnel(sessionLive: false)
         case .unintelligible:
             // Ask again rather than act on noise — and in particular do NOT
             // tear the tunnel down over one unparsed reply.
@@ -395,28 +392,61 @@ final class MenuBarModel {
     /// interface that discards everything, so it is only ever correct while
     /// something is carrying the traffic. Started from `enableProxyConfiguration`
     /// it was up from the moment the app configured the extension until the
-    /// moment the app quit — measured:
+    /// moment the app quit — which is why quitting both apps used to be the only
+    /// way to get Wi-Fi back.
     ///
-    ///     11:27:21  route: startTunnel      ← up, with no session at all
-    ///     11:36:51  session started         ← nine minutes later
-    ///     11:42:37  route: stopTunnel       ← only when the app quit
+    /// **A reconciler, not an edge trigger, and that distinction is the whole
+    /// bug it replaced.** The first version fired once on each transition and
+    /// tracked its own belief in a `Bool`. Then a session flapped:
     ///
-    /// For those nine minutes the Mac had a default route into a black hole and
-    /// no bridge behind it. That is why quitting both apps was the only way to
-    /// get Wi-Fi back: disconnecting the phone ended the session and left the
-    /// route, and the route outlives the app that made it.
+    ///     13:56:36.119  session ENDED
+    ///     13:56:36.663  route: session gone — dropping the tunnel
+    ///     13:56:36.992  route: stopTunnel
+    ///     13:56:37.068  session started            ← 0.9s later
+    ///     13:56:37.731  route: tunnel configuration started
+    ///                   …and no "route: startTunnel" ever followed
     ///
-    /// Driven from the status poll because that is the Mac's only authority on
-    /// whether a session exists — the extension's own log, not a UI guess.
-    private func setRouteTunnel(running shouldRun: Bool) async {
-        guard shouldRun != isRouteTunnelRunning else { return }
-        isRouteTunnelRunning = shouldRun
+    /// `startVPNTunnel()` while the previous session is still tearing down is a
+    /// no-op, so the start was swallowed — and the flag said "running", so
+    /// nothing ever tried again. The Mac was left with a live bridge, no route,
+    /// and no way back.
+    ///
+    /// Comparing desired state against what NetworkExtension actually reports,
+    /// once a second, makes every silent failure self-correcting: a swallowed
+    /// start, a tunnel the system tore down on its own, a race with teardown.
+    /// The cost of getting it wrong is the user's whole network, so it is worth
+    /// re-deciding every tick rather than trusting a remembered edge.
+    private func reconcileRouteTunnel(sessionLive: Bool) async {
+        let status = routeManager?.connection.status
 
-        if shouldRun {
-            await enableRouteConfiguration()
-        } else {
+        guard sessionLive else {
+            // Down, unless it already is. Unconditional on purpose: leaving it
+            // up with no bridge behind it converts "the bridge stopped" into
+            // "this Mac has no network at all", and that outlives the app.
+            guard let routeManager, status != .disconnected, status != .invalid else { return }
             log.error("route: session gone — dropping the tunnel so normal networking returns")
-            routeManager?.connection.stopVPNTunnel()
+            routeManager.connection.stopVPNTunnel()
+            return
+        }
+
+        switch status {
+        case .connected, .connecting, .reasserting:
+            return  // already where we want to be
+        case nil, .invalid:
+            // Never configured, or the configuration was removed.
+            await enableRouteConfiguration()
+        case .disconnected, .disconnecting:
+            // Includes the case that broke: a start swallowed because teardown
+            // was still in flight. Trying again next tick is the fix.
+            guard let routeManager else { return }
+            do {
+                try routeManager.connection.startVPNTunnel()
+                log.error("route: (re)starting the tunnel — session is live but the tunnel was not")
+            } catch {
+                log.error("route: start failed, will retry: \(error.localizedDescription, privacy: .public)")
+            }
+        @unknown default:
+            return
         }
     }
 
