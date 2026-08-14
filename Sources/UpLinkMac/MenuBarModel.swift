@@ -76,6 +76,16 @@ final class MenuBarModel {
     /// process serves both.
     private var routeManager: NETunnelProviderManager?
 
+    /// Consecutive polls with no session. Teardown waits for a few, so a
+    /// reconnecting phone does not blink the user's default route.
+    private var quietTicks = 0
+    private static let quietTicksBeforeDroppingTunnel = 3
+
+    /// Consecutive reconcile passes that wanted the tunnel up and found it down.
+    /// Non-zero for long is the signal that NE will not run a packet tunnel in
+    /// this configuration at all.
+    private var failedStarts = 0
+
     private var pollTask: Task<Void, Never>?
     private var extensionDelegate: SystemExtensionDelegate?
     private let extensionBundleID = UpLinkIdentifiers.macProxyExtension
@@ -420,17 +430,30 @@ final class MenuBarModel {
         let status = routeManager?.connection.status
 
         guard sessionLive else {
-            // Down, unless it already is. Unconditional on purpose: leaving it
-            // up with no bridge behind it converts "the bridge stopped" into
-            // "this Mac has no network at all", and that outlives the app.
+            // Hysteresis before tearing down, and it is not politeness. A
+            // session can flap — observed ENDED at 13:56:36.119 and started
+            // again at 13:56:37.068, 0.9s later — and dropping the default
+            // route on the first quiet tick means the user's network blinks out
+            // every time the phone reconnects. Three consecutive ticks is ~3s:
+            // long enough that a reconnect rides through it, short enough that a
+            // genuinely dead bridge does not strand the Mac.
+            //
+            // The teardown itself stays unconditional once confirmed: leaving
+            // the tunnel up with no bridge behind it converts "the bridge
+            // stopped" into "this Mac has no network at all", and that outlives
+            // the app.
+            quietTicks += 1
+            guard quietTicks >= Self.quietTicksBeforeDroppingTunnel else { return }
             guard let routeManager, status != .disconnected, status != .invalid else { return }
-            log.error("route: session gone — dropping the tunnel so normal networking returns")
+            log.error("route: no session for \(self.quietTicks, privacy: .public) ticks — dropping the tunnel so normal networking returns")
             routeManager.connection.stopVPNTunnel()
             return
         }
+        quietTicks = 0
 
         switch status {
         case .connected, .connecting, .reasserting:
+            failedStarts = 0
             return  // already where we want to be
         case nil, .invalid:
             // Never configured, or the configuration was removed.
@@ -439,11 +462,24 @@ final class MenuBarModel {
             // Includes the case that broke: a start swallowed because teardown
             // was still in flight. Trying again next tick is the fix.
             guard let routeManager else { return }
+            failedStarts += 1
             do {
                 try routeManager.connection.startVPNTunnel()
-                log.error("route: (re)starting the tunnel — session is live but the tunnel was not")
+                // Rate-limited, because this runs at 1Hz and the interesting
+                // signal is "still not up after N attempts", not each attempt.
+                if failedStarts == 1 || failedStarts % 10 == 0 {
+                    log.error("route: session is live but the tunnel is not — (re)starting, attempt \(self.failedStarts, privacy: .public)")
+                }
             } catch {
-                log.error("route: start failed, will retry: \(error.localizedDescription, privacy: .public)")
+                log.error("route: start threw: \(error.localizedDescription, privacy: .public)")
+            }
+            // The question this whole design rests on, made answerable in one
+            // test run: does NetworkExtension keep a packet tunnel alive when
+            // the Mac has NO network service of its own? If it does not, this
+            // line is what says so, unambiguously, instead of the user seeing
+            // "it just does not work".
+            if failedStarts == 20 {
+                log.error("route: THE TUNNEL WILL NOT START — 20 attempts with a live session. NetworkExtension is refusing to run a packet tunnel with no underlying network, which is the architecture's load-bearing assumption. Route and DNS must come from somewhere else.")
             }
         @unknown default:
             return
