@@ -79,7 +79,42 @@ final class MenuBarModel {
     /// Consecutive polls with no session. Teardown waits for a few, so a
     /// reconnecting phone does not blink the user's default route.
     private var quietTicks = 0
-    private static let quietTicksBeforeDroppingTunnel = 3
+    /// Ten seconds of genuine silence, not three. The teardown is irreversible
+    /// without another network, so it must never fire on a reconnect.
+    private static let quietTicksBeforeDroppingTunnel = 10
+
+    /// Is there a network besides our own tunnel?
+    ///
+    /// Decides whether handing the network back is safe. A real interface with a
+    /// routable address means dropping the tunnel restores normal networking;
+    /// nothing but tunnels and link-local means dropping it strands the Mac with
+    /// no way to rebuild what it just threw away.
+    static func hasAlternativeNetwork() -> Bool {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return false }
+        defer { freeifaddrs(head) }
+
+        for interface in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let flags = Int32(interface.pointee.ifa_flags)
+            guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0 else { continue }
+            guard let address = interface.pointee.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_INET) else { continue }
+
+            let name = String(cString: interface.pointee.ifa_name)
+            // Our own tunnel, and anybody else's, prove nothing.
+            guard !name.hasPrefix("utun"), !name.hasPrefix("ipsec") else { continue }
+
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(address, socklen_t(address.pointee.sa_len),
+                              &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0
+            else { continue }
+            let text = String(cString: host)
+            // Self-assigned link-local means the interface is up and has no
+            // network behind it — which is the state this whole design is for.
+            if !text.hasPrefix("169.254.") { return true }
+        }
+        return false
+    }
 
     /// Consecutive reconcile passes that wanted the tunnel up and found it down.
     /// Non-zero for long is the signal that NE will not run a packet tunnel in
@@ -445,7 +480,33 @@ final class MenuBarModel {
             quietTicks += 1
             guard quietTicks >= Self.quietTicksBeforeDroppingTunnel else { return }
             guard let routeManager, status != .disconnected, status != .invalid else { return }
-            log.error("route: no session for \(self.quietTicks, privacy: .public) ticks — dropping the tunnel so normal networking returns")
+
+            // THE ASYMMETRY THAT MATTERS. Dropping this tunnel is cheap to do
+            // and, in the configuration it exists for, IMPOSSIBLE TO UNDO:
+            // NetworkExtension will not start a packet tunnel while the Mac has
+            // no underlying network, so once it is down with Wi-Fi gone it stays
+            // down. Measured, cable-free over AWDL:
+            //
+            //   14:57:20  session started (peer=…%awdl0)
+            //   14:57:21  route: up                      <- working
+            //   14:57:31  session ENDED                  <- a 3.5s blip
+            //   14:57:34  dropping the tunnel            <- this line
+            //   14:57:35  session started                <- back already
+            //   14:57:55  THE TUNNEL WILL NOT START
+            //
+            // A working state was destroyed by a blip and could not be rebuilt.
+            // So: only hand the network back when there is a network to hand it
+            // back TO. With an alternative present, dropping is safe and
+            // reversible; without one it strands the Mac, and keeping a stale
+            // tunnel is strictly better than that.
+            guard Self.hasAlternativeNetwork() else {
+                if quietTicks % 30 == 0 {
+                    log.error("route: no session for \(self.quietTicks, privacy: .public) ticks, but this Mac has no other network — keeping the tunnel, because it could not be restarted")
+                }
+                return
+            }
+
+            log.error("route: no session for \(self.quietTicks, privacy: .public) ticks and another network is available — dropping the tunnel")
             routeManager.connection.stopVPNTunnel()
             return
         }
