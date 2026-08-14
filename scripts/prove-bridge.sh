@@ -26,9 +26,19 @@ red()   { printf '\033[0;31m%s\033[0m\n' "$1"; }
 blue()  { printf '\033[0;34m%s\033[0m\n' "$1"; }
 
 blue "==> 0. Baseline: what this Mac looks like WITHOUT the bridge"
+#
+# This is the ONLY honest moment to take a baseline: the bridge is not up yet.
+# coverage-test.sh cannot take its own — it refuses to run without a live
+# session, so anything it measures is already going through the phone. Both
+# families, because IPv6 is a separate leak path and a v4-only baseline scores
+# a leaked v6 result as "bridged".
 BASE_IP=$(curl -s --max-time 15 -4 https://api.ipify.org 2>/dev/null)
+BASE_IP6=$(curl -s --max-time 15 -6 https://api64.ipify.org 2>/dev/null)
 BASE_ORG=$(curl -s --max-time 15 -4 "https://ipinfo.io/${BASE_IP}/org" 2>/dev/null)
-echo "    ${BASE_IP}  ${BASE_ORG}"
+echo "    IPv4  ${BASE_IP:-none}  ${BASE_ORG}"
+echo "    IPv6  ${BASE_IP6:-none}"
+export UPLINK_BASELINE_V4="$BASE_IP"
+export UPLINK_BASELINE_V6="$BASE_IP6"
 
 blue "==> 1. Waiting for the phone to be unlocked (up to 10 min)"
 LAUNCHED=0

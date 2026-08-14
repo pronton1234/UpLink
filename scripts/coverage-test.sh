@@ -63,18 +63,57 @@ fi
 green "    Session is live."; echo
 echo
 
+# ── Baseline ──────────────────────────────────────────────────────────────
+#
+# This script CANNOT measure its own baseline, and trying to inverted the whole
+# matrix for as long as it has existed.
+#
+# It refuses to run without a live session — correctly, since probing a dead
+# bridge reports "no connectivity" whether or not the product works. But that
+# means by the time it gets here the transparent proxy is already in front of
+# every flow on the machine, and a proxy claims flows regardless of which
+# interface the socket bound to, so `--interface en0` does not escape it. The
+# "baseline" came back as the CARRIER's address, and classify() then scored
+# every genuinely bridged row DIRECT for matching it.
+#
+# The measured proof, from one run on 2026-08-13:
+#
+#     prove-bridge step 4:  216.77.46.31  CHANGED from the baseline —
+#                                         traffic is leaving via the phone
+#     coverage row 1:       DIRECT ✗ 216.77.46.31      ← the same address
+#
+# Two conclusions from one number, in the same run, eight lines apart. Hours
+# were spent chasing a TCP path that was working.
+#
+# So the baseline is taken BEFORE the bridge comes up, by prove-bridge.sh, and
+# passed in. Run standalone with none supplied, this says so rather than
+# guessing — a harness that can silently measure the wrong thing is worse than
+# no harness.
 blue "==> Establishing baseline"
 MAC_IF=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
-DIRECT_V4=$(curl -s --max-time 8 -4 --interface "${MAC_IF:-en0}" --noproxy '*' "$ECHO_A" 2>/dev/null || echo "")
-DIRECT_V6=$(curl -s --max-time 8 -6 --noproxy '*' "$ECHO_A6" 2>/dev/null || echo "")
-echo "    Mac interface   : ${MAC_IF:-unknown}"
-echo "    Mac IPv4        : ${DIRECT_V4:-none}"
-echo "    Mac IPv6        : ${DIRECT_V6:-none}"
+DIRECT_V4="${UPLINK_BASELINE_V4:-}"
+DIRECT_V6="${UPLINK_BASELINE_V6:-}"
 
 if [[ -z "$DIRECT_V4" && -z "$DIRECT_V6" ]]; then
-  amber "    (could not determine this Mac's own address; results are not definitive)"
+  red "    No pre-bridge baseline supplied."; echo
+  echo "    UPLINK_BASELINE_V4 / UPLINK_BASELINE_V6 must be measured BEFORE the"
+  echo "    bridge is up. Measuring now would go through the bridge and report"
+  echo "    the carrier's address as this Mac's own, which scores every bridged"
+  echo "    row as a leak."
   echo
+  echo "    Run ./scripts/prove-bridge.sh, which takes the baseline at step 0"
+  echo "    and passes it in. To run this alone, disconnect the bridge, then:"
+  echo
+  echo "      export UPLINK_BASELINE_V4=\$(curl -s -4 https://api.ipify.org)"
+  echo "      export UPLINK_BASELINE_V6=\$(curl -s -6 https://api64.ipify.org)"
+  echo
+  exit 2
 fi
+
+echo "    Mac interface   : ${MAC_IF:-unknown}"
+echo "    Mac IPv4        : ${DIRECT_V4:-none}   (measured before the bridge)"
+echo "    Mac IPv6        : ${DIRECT_V6:-none}   (measured before the bridge)"
+
 if [[ -n "$DIRECT_V6" ]]; then
   echo "    IPv6 is live here, so it is a real leak path and is probed separately."
 fi
