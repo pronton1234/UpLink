@@ -6,9 +6,14 @@
 	     install a system extension. The extension itself IS sandboxed, which is
 	     where the untrusted network data is handled. Verified against how
 	     Tailscale ships. -->
+	<!-- The containing app must claim every provider type it manages, not just
+	     the ones the extension implements: it is the app that creates and saves
+	     the NEManager configurations. Both values are already in the "UpTime
+	     app" Developer ID profile. -->
 	<key>com.apple.developer.networking.networkextension</key>
 	<array>
 		<string>app-proxy-provider-systemextension</string>
+		<string>packet-tunnel-provider-systemextension</string>
 	</array>
 	<key>com.apple.developer.system-extension.install</key>
 	<true/>

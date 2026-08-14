@@ -41,10 +41,25 @@
 		     "invalid NEMachServiceName key in its Info.plist". -->
 		<key>NEMachServiceName</key>
 		<string>$(TeamIdentifierPrefix)group.com.uplink.app</string>
+		<!-- TWO providers in one extension, deliberately.
+		     `startSystemExtensionMode()` instantiates whatever is listed here,
+		     so both live in a single process and can share `ProxyState` and its
+		     `BridgeInitiator`. A separate tunnel target would have needed the
+		     established TLS session handed across an XPC boundary, which it
+		     cannot be — and would also have cost a fifth target, a third
+		     provisioning profile, and the two-target assumptions baked into
+		     scripts/release-mac.sh.
+
+		     They do different jobs. The proxy carries the traffic. The tunnel
+		     carries nothing: it exists so the Mac has a primary network service,
+		     and therefore a default route and a resolver, without which
+		     `connect()` fails before the proxy is ever consulted. -->
 		<key>NEProviderClasses</key>
 		<dict>
 			<key>com.apple.networkextension.app-proxy</key>
 			<string>$(PRODUCT_MODULE_NAME).TransparentProxyProvider</string>
+			<key>com.apple.networkextension.packet-tunnel</key>
+			<string>$(PRODUCT_MODULE_NAME).RouteProvider</string>
 		</dict>
 	</dict>
 </dict>

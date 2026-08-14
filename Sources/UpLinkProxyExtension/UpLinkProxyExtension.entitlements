@@ -14,6 +14,14 @@
 	<key>com.apple.developer.networking.networkextension</key>
 	<array>
 		<string>app-proxy-provider-systemextension</string>
+		<!-- The packet tunnel supplies the Mac with a route and a resolver; it
+		     carries no traffic. Without a primary network service `connect()`
+		     fails at route lookup, so the proxy above is never consulted —
+		     measured: 0 flows claimed with Wi-Fi disconnected.
+
+		     Already present in the "UpTime Proxy" Developer ID profile
+		     alongside the app-proxy value, so this needs no portal work. -->
+		<string>packet-tunnel-provider-systemextension</string>
 	</array>
 	<!-- Required by NetworkExtension, not by us: NEMachServiceName must be
 	     prefixed with an App Group from this entitlement, or the extension is

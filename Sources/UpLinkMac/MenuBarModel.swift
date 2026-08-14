@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Network
 import NetworkExtension
@@ -70,6 +71,10 @@ final class MenuBarModel {
     // product exists to avoid.
 
     private var manager: NETransparentProxyManager?
+    /// The packet tunnel that supplies the route and resolver. Held separately
+    /// because it is a separate NE configuration, though the same extension
+    /// process serves both.
+    private var routeManager: NETunnelProviderManager?
     private var pollTask: Task<Void, Never>?
     private var extensionDelegate: SystemExtensionDelegate?
     private let extensionBundleID = UpLinkIdentifiers.macProxyExtension
@@ -119,6 +124,19 @@ final class MenuBarModel {
         // bridge at all.
         manager?.connection.stopVPNTunnel()
         disableProxyConfiguration()
+
+        // The route tunnel MUST go down too, and this is not tidiness. It owns
+        // the Mac's default route and points it at an interface that discards
+        // everything, so leaving it up with no proxy behind it converts "the
+        // bridge stopped" into "this Mac has no network at all" — and because
+        // the extension outlives the app, that survives quitting.
+        routeManager?.connection.stopVPNTunnel()
+        if let routeManager {
+            routeManager.isEnabled = false
+            let done = DispatchSemaphore(value: 0)
+            routeManager.saveToPreferences { _ in done.signal() }
+            _ = done.wait(timeout: .now() + 3)
+        }
     }
 
     /// Disables the saved configuration so the extension is not restarted.
@@ -202,8 +220,14 @@ final class MenuBarModel {
 
     private func enableProxyConfiguration() async {
         do {
+            // `managers.first` was safe while there was one configuration and is
+            // not any more. `NETransparentProxyManager` is a SUBCLASS of
+            // `NETunnelProviderManager`, so each type's `loadAllFromPreferences`
+            // can return the other's configuration, and picking the first would
+            // silently reconfigure the wrong one.
             let managers = try await NETransparentProxyManager.loadAllFromPreferences()
-            let manager = managers.first ?? NETransparentProxyManager()
+            let manager = managers.first { $0 is NETransparentProxyManager }
+                ?? NETransparentProxyManager()
 
             let proto = NETunnelProviderProtocol()
             proto.providerBundleIdentifier = extensionBundleID
@@ -240,9 +264,56 @@ final class MenuBarModel {
             status = .waiting
             notifyObservers()
             startPolling()
+
+            await enableRouteConfiguration(identity: identity)
         } catch {
             status = .failed(error.localizedDescription)
             notifyObservers()
+        }
+    }
+
+    /// Brings up the packet tunnel that gives this Mac a route and a resolver.
+    ///
+    /// Separate from the proxy configuration because they are separate
+    /// NetworkExtension configurations, even though both are served by the same
+    /// extension process. The proxy carries the traffic; this carries nothing
+    /// and exists so the traffic can be originated at all — with no network
+    /// service there is no default route, so `connect()` fails before the proxy
+    /// is ever consulted, and no resolver, so names cannot be looked up.
+    ///
+    /// Failure here is deliberately not fatal to the session. Without it the
+    /// bridge still works whenever the Mac has a network of its own, which is
+    /// how it behaved before this existed.
+    private func enableRouteConfiguration(identity: Curve25519.KeyAgreement.PrivateKey) async {
+        do {
+            // Filter, and exclude the transparent proxy explicitly: it is a
+            // subclass, so it comes back from this call too and `first` would
+            // hand back the proxy configuration and reconfigure it as a tunnel.
+            let managers = try await NETunnelProviderManager.loadAllFromPreferences()
+            let manager = managers.first { !($0 is NETransparentProxyManager) }
+                ?? NETunnelProviderManager()
+
+            let proto = NETunnelProviderProtocol()
+            proto.providerBundleIdentifier = extensionBundleID
+            proto.serverAddress = "UpLink"
+            // The route provider needs none of the session material — it never
+            // talks to the phone — but the key must be present for the shared
+            // extension's startup path.
+            proto.providerConfiguration = ["identity": identity.rawRepresentation]
+
+            manager.protocolConfiguration = proto
+            manager.localizedDescription = "UpLink Route"
+            manager.isEnabled = true
+
+            try await manager.saveToPreferences()
+            try await manager.loadFromPreferences()
+            self.routeManager = manager
+            try manager.connection.startVPNTunnel()
+            log.error("route: tunnel configuration started")
+        } catch {
+            // Logged, not surfaced. The user's mental model is "the bridge is
+            // connected"; this is plumbing beneath that.
+            log.error("route: could not start the tunnel: \(error.localizedDescription, privacy: .public)")
         }
     }
 
