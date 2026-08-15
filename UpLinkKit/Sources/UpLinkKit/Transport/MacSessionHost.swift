@@ -493,6 +493,28 @@ public actor MacSessionHost {
         // paired with this Mac.
         let fingerprint = Self.identity(inHello: hello) ?? "unknown"
 
+        // The claim has to correspond to a key this Mac actually holds.
+        //
+        // Nothing checked it at all. The value is taken straight from the HELLO
+        // payload and is what `peerUnpaired` later acts on, so a peer could
+        // announce any string it liked and have this Mac treat the session — and
+        // any revocation sent over it — as belonging to that identity.
+        //
+        // HONEST LIMIT: this rejects a fingerprint we hold no key for, which
+        // closes the unknown-claimant case. It does NOT bind the claim to the
+        // PSK identity actually negotiated, so one PAIRED phone can still
+        // announce another paired phone's fingerprint. Closing that needs
+        // `sec_protocol_options_set_pre_shared_key_selection_block` on the
+        // listener so the offered identity can be observed; `applyPSK` installs
+        // no such block today, which is also why a wrong pairing code and a
+        // revoked device are indistinguishable in the log.
+        let holdsKey = ((try? store.pairedDevices()) ?? []).contains { $0.fingerprint == fingerprint }
+        guard holdsKey || tombstones.isRevoked(fingerprint) else {
+            log.error("session REFUSED: peer claims fp=\(fingerprint, privacy: .public), which this Mac holds no key for")
+            await channel.close()
+            return
+        }
+
         // A tombstone's ONE job, and it must happen before anything else: this
         // device was unpaired while it was not connected, so it has never been
         // told. Tell it now and close. Deliberately ahead of
