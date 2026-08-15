@@ -208,8 +208,26 @@ apply_standalone() {
   # to be routable so the socket layer hands the flow to the proxy.
   if ! has_default_route; then
     say "SystemConfiguration installed no route (Wi-Fi has no link) — adding one directly"
-    route -n add -net default "$SELF_ROUTER" >/dev/null 2>&1 \
-      || route -n add -net default -interface "$IFACE" >/dev/null 2>&1
+    local added
+    added=$(route -n add -net default "$SELF_ROUTER" 2>&1) \
+      || added=$(route -n add -net default -interface "$IFACE" 2>&1)
+    [[ -n "$added" ]] && say "route: $added"
+
+    # Do NOT judge it on the next instruction. The routing table is updated
+    # asynchronously, and checking immediately reported failure for a route that
+    # was in place moments later:
+    #
+    #   21:25:04 SystemConfiguration installed no route — adding one directly
+    #   21:25:04 STILL no default route — nothing will work
+    #
+    # while `netstat` a few minutes on showed `default 169.254.99.1 en0`
+    # present and 164 flows bridged through it. A fallback that cries failure
+    # after succeeding is worse than one that stays quiet: it sent a whole
+    # debugging round looking for a missing route that was never missing.
+    for _ in $(seq 1 5); do
+      has_default_route && break
+      sleep 1
+    done
   fi
 
   local route_now
