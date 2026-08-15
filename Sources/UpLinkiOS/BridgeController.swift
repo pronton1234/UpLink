@@ -359,9 +359,27 @@ final class BridgeController {
             // what made the two devices disagree about whether they were
             // connected.
             await forgetPeerAfterRemoteUnpair()
+        case .refused:
+            // The Mac is there and will not have us — almost always a pairing it
+            // no longer has. Retrying at a five-second ceiling forever cannot
+            // fix that, and "Connecting…" with no timeout gave the user nothing
+            // to act on.
+            disconnect()
+            state = .failed("\(peer) no longer recognises this iPhone. Pair again to reconnect.")
         case .unintelligible:
             break  // ask again rather than act on noise
         }
+    }
+
+    /// Re-reads durable storage.
+    ///
+    /// The store is read once at process launch, and keychain items use
+    /// `kSecAttrAccessibleAfterFirstUnlock` — so a launch before the first
+    /// unlock returns nothing, `(try? …) ?? []` turns that into "no paired
+    /// Macs", and nothing ever looked again. The phone then treated a Mac it
+    /// was genuinely paired with as a stranger and offered to pair afresh.
+    func refreshFromStore() {
+        reloadPairedDevices()
     }
 
     /// Drops our half of a pairing the Mac has already dropped.

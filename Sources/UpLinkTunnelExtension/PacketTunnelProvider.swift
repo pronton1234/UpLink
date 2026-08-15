@@ -120,7 +120,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
                 // phone never dialled" and "the phone dialled and was refused"
                 // look identical from there. They have completely different
                 // causes.
-                diagnostics.write("attempt \(policy.attempt) FAILED: \(error); retrying in \(delay)s")
+                // A refusal and an unreachable Mac need different answers: one
+                // is worth retrying forever, the other never will be.
+                if Self.isRefusal(error) {
+                    await state.noteRefused()
+                    diagnostics.write("attempt \(policy.attempt) REFUSED by the Mac: \(error)")
+                } else {
+                    await state.noteReachable()
+                    diagnostics.write("attempt \(policy.attempt) FAILED: \(error); retrying in \(delay)s")
+                }
                 try? await Task.sleep(for: .seconds(delay))
                 // A FRESH browse, not another look at the same one. The browser
                 // is scoped to an interface, and the interface is exactly what
@@ -209,6 +217,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     /// waiting, because a fresh browse re-issues the query.
     private static let discoveryTimeout: TimeInterval = 6
 
+    /// Did the Mac actively refuse this phone's key, rather than simply not be
+    /// there? A PSK rejection surfaces as a TLS failure during `channel.start`.
+    private static func isRefusal(_ error: Error) -> Bool {
+        if case ChannelError.handshakeFailed = error { return true }
+        return false
+    }
+
     /// Waits for the paired Mac to appear, rather than failing on the first
     /// empty browse result — discovery takes a moment to populate.
     ///
@@ -294,6 +309,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
                 // chance to deliver it.
                 if await state.wasUnpairedByPeer {
                     reply.value?(Data("unpaired".utf8))
+                    return
+                }
+                // The Mac is there and will not have us. Saying so beats
+                // "Connecting…" forever with no way to tell the difference.
+                if await state.pairingLooksRejected {
+                    reply.value?(Data("refused".utf8))
                     return
                 }
                 guard await state.isConnected else {

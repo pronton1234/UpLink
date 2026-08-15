@@ -50,6 +50,27 @@ public actor PhoneSessionState {
     /// deleting one Mac could revoke another.
     public private(set) var peerFingerprint: String?
 
+    /// Consecutive times the Mac REFUSED this phone's key, as distinct from
+    /// being unreachable.
+    ///
+    /// A TLS-PSK rejection is not a transient network condition: it means the
+    /// Mac does not accept this pairing, and retrying at a five-second ceiling
+    /// forever cannot change that. Without this the phone sat on "Connecting…"
+    /// indefinitely with no timeout, no failure state, and no hint to re-pair —
+    /// the Mac having simply forgotten it was indistinguishable from the Mac
+    /// being asleep.
+    public private(set) var consecutiveRefusals = 0
+
+    /// Enough to ride out a Mac restarting its extension, which briefly refuses
+    /// while it re-seeds, but short enough that a genuinely stale pairing is
+    /// reported in well under a minute at the 5s ceiling.
+    public static let refusalsBeforeGivingUp = 8
+
+    public var pairingLooksRejected: Bool { consecutiveRefusals >= Self.refusalsBeforeGivingUp }
+
+    public func noteRefused() { consecutiveRefusals += 1 }
+    public func noteReachable() { consecutiveRefusals = 0 }
+
     public init() {}
 
     public func setPeerFingerprint(_ fingerprint: String?) { peerFingerprint = fingerprint }
@@ -92,6 +113,7 @@ public actor PhoneSessionState {
         // the one thing this type has already been burned by is a caller having
         // to remember an invariant.
         wasUnpairedByPeer = false
+        consecutiveRefusals = 0
         self.channel = channel
         self.responder = responder
         defer {

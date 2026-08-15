@@ -513,6 +513,11 @@ final class MenuBarModel {
             if status != .waiting { status = .waiting; notifyObservers() }
             setBridgeInterface(nil)
             await reconcileRouteTunnel(sessionLive: false)
+        case .refused:
+            // The Mac's own extension does not send this — it is the phone's
+            // vocabulary, for a Mac that refuses its key. Handled so the switch
+            // stays exhaustive and a future sender is not silently ignored.
+            if status != .waiting { status = .waiting; notifyObservers() }
         case .unintelligible:
             // Ask again rather than act on noise — and in particular do NOT
             // tear the tunnel down over one unparsed reply.

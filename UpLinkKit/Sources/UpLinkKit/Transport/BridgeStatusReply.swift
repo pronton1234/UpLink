@@ -19,6 +19,9 @@ public enum BridgeStatusReply: Equatable, Sendable {
     /// retrying is pointless and the user has to pair again — a state that
     /// previously presented as an endless run of ordinary connection failures.
     case unpaired(fingerprint: String?)
+    /// The peer is reachable and refuses this device's key. Distinct from
+    /// `disconnected`, which means "keep trying".
+    case refused
     /// The reply could not be understood. Deliberately distinct from
     /// `disconnected`: garbage means "ask again", not "tear the UI down".
     case unintelligible
@@ -33,6 +36,7 @@ public enum BridgeStatusReply: Equatable, Sendable {
 
         let parts = reply.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
         guard let head = parts.first else { return .unintelligible }
+        if head == "refused" { return .refused }
         if head == "unpaired" {
             // The fingerprint is optional so the phone, which knows which Mac it
             // was talking to, can keep sending a bare "unpaired".

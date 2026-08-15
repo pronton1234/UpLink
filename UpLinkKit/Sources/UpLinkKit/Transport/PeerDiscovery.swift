@@ -11,8 +11,22 @@ public struct DiscoveredPeer: Sendable, Equatable, Identifiable {
     /// Which transport this peer was found over.
     public let profile: TransportProfile
 
-    /// Whether this peer has already been paired with.
-    public var isKnown: Bool { fingerprint != nil }
+    /// Whether this Mac publishes an identity at all.
+    ///
+    /// NOT "this device has paired with it" — that was the old name and the old
+    /// meaning of `isKnown`, and it was wrong in the one place it was used. The
+    /// iOS list drew a green "Paired" seal from this, so EVERY UpLink Mac looked
+    /// paired, including ones this phone had never seen, and including the exact
+    /// case where a stale pairing was failing. Ask ``isPaired(with:)`` instead.
+    public var publishesIdentity: Bool { fingerprint != nil }
+
+    /// Whether this phone actually holds a pairing with this Mac.
+    ///
+    /// The only honest source is the local store, so it has to be passed in.
+    public func isPaired(with paired: [PairedDevice]) -> Bool {
+        guard let fingerprint else { return false }
+        return paired.contains { $0.fingerprint == fingerprint }
+    }
 
     /// Normally these come only from ``PeerDiscovery``. This is public so a
     /// test or probe can aim the real client at a known endpoint and exercise

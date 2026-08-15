@@ -21,6 +21,8 @@ struct UpLinkApp: App {
 /// where its purpose is obvious — rather than on a cold splash screen.
 struct ContentView: View {
 
+    @Environment(\.scenePhase) private var scenePhase
+
     @Bindable var controller: BridgeController
 
     var body: some View {
@@ -66,6 +68,11 @@ struct ContentView: View {
             controller.startDiscovery()
             // No-op unless the harness set UPLINK_AUTOCONNECT=1.
             await controller.autoConnectIfRequested()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // See `refreshFromStore`: a launch before the device's first unlock
+            // reads an empty keychain and nothing looked again.
+            if phase == .active { controller.refreshFromStore() }
         }
         .sheet(item: $controller.pendingPairingPeer) { peer in
             PairingSheet(peer: peer, controller: controller)
@@ -127,7 +134,7 @@ struct ContentView: View {
                             Image(systemName: "laptopcomputer")
                             Text(peer.name)
                             Spacer()
-                            if peer.isKnown {
+                            if peer.isPaired(with: controller.pairedDevices) {
                                 Image(systemName: "checkmark.seal.fill")
                                     .foregroundStyle(.green)
                                     .accessibilityLabel("Paired")
