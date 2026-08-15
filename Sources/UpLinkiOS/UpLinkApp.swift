@@ -67,6 +67,7 @@ struct ContentView: View {
             await controller.prepare()
             controller.startDiscovery()
             // No-op unless the harness set UPLINK_AUTOCONNECT=1.
+            await controller.runPairingHarnessIfRequested()
             await controller.autoConnectIfRequested()
         }
         .onChange(of: scenePhase) { _, phase in

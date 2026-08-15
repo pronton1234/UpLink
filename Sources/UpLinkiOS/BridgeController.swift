@@ -128,6 +128,57 @@ final class BridgeController {
     ///
     /// Only ever connects to an already-paired Mac; it cannot initiate pairing,
     /// which still requires a person and a code.
+    /// Drives pairing and unpairing from the environment, for automated tests.
+    ///
+    /// Sibling of ``autoConnectIfRequested()``, and it exists for the same
+    /// reason: the pairing lifecycle — pair, remove on both devices, pair again
+    /// — is the flow that has actually been broken, and until now the only way
+    /// to exercise it was a person holding a phone and reading a code off a Mac
+    /// screen. That made every check a one-off, which is exactly how a
+    /// half-removed pairing kept poisoning later measurements.
+    ///
+    /// `UPLINK_AUTOPAIR=<six digits>` pairs with the first Mac discovered.
+    /// `UPLINK_AUTOUNPAIR=1` forgets every paired Mac.
+    ///
+    /// Neither can run without someone having put a code on the Mac's screen,
+    /// so this is not a way to pair without consent — it is a way to type the
+    /// code without a human thumb.
+    func runPairingHarnessIfRequested() async {
+        let environment = ProcessInfo.processInfo.environment
+
+        if environment["UPLINK_AUTOUNPAIR"] == "1" {
+            log.error("harness: unpairing \(self.pairedDevices.count, privacy: .public) device(s)")
+            for device in pairedDevices { unpair(device) }
+            // `unpair` hops through a Task to message the extension first.
+            try? await Task.sleep(for: .seconds(2))
+            reloadPairedDevices()
+            log.error("harness: \(self.pairedDevices.count, privacy: .public) device(s) remain")
+        }
+
+        guard let digits = environment["UPLINK_AUTOPAIR"] else { return }
+        log.error("harness: pairing with code \(digits, privacy: .public)")
+
+        // Discovery needs a moment before there is anything to pair with.
+        var target: DiscoveredPeer?
+        for _ in 0 ..< 60 {
+            if let found = peers.first(where: { $0.publishesIdentity }) {
+                target = found
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        guard let target else {
+            log.error("harness: FAILED — no Mac discovered")
+            return
+        }
+
+        if let message = await completePairing(peer: target, code: digits) {
+            log.error("harness: PAIRING FAILED — \(message, privacy: .public)")
+        } else {
+            log.error("harness: PAIRED with \(target.name, privacy: .public); now \(self.pairedDevices.count, privacy: .public) device(s)")
+        }
+    }
+
     func autoConnectIfRequested() async {
         let request = ProcessInfo.processInfo.environment["UPLINK_AUTOCONNECT"]
 
