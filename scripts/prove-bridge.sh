@@ -17,7 +17,17 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-DEVICE=00008120-000000000000001E
+# Discovered, not hardcoded. The UDID used to be baked in, which meant the
+# script silently measured nothing on any other Mac or after a device swap.
+# Now that the cable is the transport there is always exactly one right answer
+# and the system already knows it.
+DEVICE="${UPLINK_DEVICE:-$(xcrun devicectl list devices 2>/dev/null \
+    | awk '/connected/ && /iPhone/ {print $(NF-1); exit}')}"
+if [[ -z "$DEVICE" ]]; then
+    echo "No connected iPhone found. Plug one in, or set UPLINK_DEVICE=<udid>." >&2
+    exit 1
+fi
+echo "Using device $DEVICE"
 BUNDLE=com.uplink.app
 OUT=${SCRATCH:-/tmp}/prove-bridge.$$
 

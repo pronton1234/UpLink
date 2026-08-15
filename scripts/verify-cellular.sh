@@ -144,13 +144,38 @@ else
     fail "no live session (last event: ${SESSION:-none})"
 fi
 
+# THIS CHECK IS INVERTED FROM WHAT IT USED TO BE, deliberately.
+#
+# It used to fail on `%en*` with "peer link is over a CABLE — unplug it, this is
+# not the test", and require `%awdl0`. The transport is now the cable and only
+# the cable: `usbmuxd` needs no network interface, which is the whole point,
+# because AWDL could not be made to hold with the Mac's Wi-Fi associated to
+# nothing. So the cable is now the pass condition and AWDL is the failure.
+USB=$(/usr/bin/log show --last 5m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
+      | grep -E "usb: relaying|usb: attached" | tail -1)
+if [[ -n "$USB" ]]; then
+    green "    the cable is carrying the link (${USB##*usb: })"
+else
+    fail "no usbmux relay in the log — the Mac never reached the phone over the cable"
+fi
+
+# Any AWDL at all now means the old path has come back from the dead, which
+# would make every measurement below meaningless in the usual way: it would
+# work, and it would not be proving what it claims to prove.
+if /usr/bin/log show --last 5m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
+   | grep -q "awdl"; then
+    fail "AWDL appears in the log — the wired path is not the one being used"
+else
+    green "    no AWDL anywhere in the log"
+fi
+
 PEER=$(/usr/bin/log show --last 5m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
        | grep "accept: inbound" | tail -1)
 case "$PEER" in
-    *%awdl0*) green "    peer link is AWDL (cable-free)" ;;
-    *%en*)    fail "peer link is over a CABLE (${PEER##*from }) — unplug it, this is not the test" ;;
-    *169.254*) fail "peer link is IPv4 link-local — the kernel does not count that as an AWDL socket" ;;
-    *)        warn "    could not identify the peer link: ${PEER:-none}" ;;
+    *127.0.0.1*|*loopback*) green "    session arrived over the loopback relay, as it must" ;;
+    *%awdl0*)  fail "session arrived over AWDL, not the cable" ;;
+    "")        warn "    no accept line in the Mac log (the phone logs this side now)" ;;
+    *)         warn "    unexpected peer endpoint: ${PEER##*from }" ;;
 esac
 
 blue "==> 3. Make a real request, and prove the bridge carried it"
