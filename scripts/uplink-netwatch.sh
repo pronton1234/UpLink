@@ -166,7 +166,34 @@ app_running() {
 # is not us?" — and it cannot be fooled by our own gateway, which is chosen
 # precisely because nothing answers at it.
 wifi_associated() {
-  ipconfig getsummary en0 2>/dev/null | grep -qE 'RouterARPVerified *: *TRUE'
+  # IPv4: a router answered ARP.
+  if ipconfig getsummary "$IFACE" 2>/dev/null | grep -qE 'RouterARPVerified *: *TRUE'; then
+    return 0
+  fi
+
+  # IPv6, AND THIS HALF WAS MISSING. `RouterARPVerified` is an IPv4 question.
+  # Measured 2026-08-14: en0 held NO IPv4 lease — self-assigned 169.254 — while
+  # carrying a global SLAAC address, 2001:db8:1:2:9d:bb50:c2bd:2ad0, with
+  # a default route via fe80::2a25:5fff:fe22:4821%en0. The Wi-Fi network was
+  # providing perfectly good IPv6 internet and this function called it
+  # unassociated.
+  #
+  # So the daemon applied a dead IPv4 gateway and overrode DNS on a Mac that had
+  # working connectivity, producing an incoherent half-state: IPv4 over the
+  # bridge, IPv6 straight out of the Wi-Fi. Every dual-stack site then worked
+  # WITHOUT the bridge, which made the bridge look healthy when it was not being
+  # asked to carry anything that mattered. It cost a round of debugging and a
+  # confident, wrong conclusion.
+  #
+  # A global (non-link-local, non-unique-local) address on the interface plus a
+  # default route through it is a real network, whatever ARP says.
+  if ifconfig "$IFACE" 2>/dev/null | grep -qE 'inet6 [23][0-9a-f]{3}:'; then
+    if netstat -rn -f inet6 2>/dev/null | awk '$1=="default"{print $NF}' | grep -qx "$IFACE"; then
+      return 0
+    fi
+  fi
+
+  return 1
 }
 
 standalone_applied() {
