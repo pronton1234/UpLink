@@ -30,9 +30,18 @@ public actor PhoneSessionState {
 
     /// Set when the Mac says it has forgotten this phone.
     ///
-    /// Sticky across the session ending, because that is exactly when the app
+    /// Sticky across the session *ending*, because that is exactly when the app
     /// next asks: the notice arrives, the session tears down, and a flag that
     /// cleared with the session would never be seen.
+    ///
+    /// Cleared when a session *begins* — see ``runningSession``. Both halves are
+    /// required and only the first was implemented, which left
+    /// `clearUnpairedByPeer()` with no call sites at all. Since the flag is
+    /// checked ahead of `isConnected` on every status poll, once set it answered
+    /// "unpaired" for the life of the extension process: re-pair, and the first
+    /// poll told the app to delete the pairing it had just made. That is an
+    /// unbreakable re-pair loop, and it is what "re-pairing fails and I have to
+    /// retry several times" actually was.
     public private(set) var wasUnpairedByPeer = false
 
     public init() {}
@@ -69,6 +78,12 @@ public actor PhoneSessionState {
         responder: BridgeResponder,
         body: () async throws -> Result
     ) async throws -> Result {
+        // Establishing a session at all means the Mac accepted this phone's PSK,
+        // which means the two are paired — so any earlier revocation is stale by
+        // construction. Clearing here rather than at a call site is deliberate:
+        // the one thing this type has already been burned by is a caller having
+        // to remember an invariant.
+        wasUnpairedByPeer = false
         self.channel = channel
         self.responder = responder
         defer {

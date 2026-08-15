@@ -39,6 +39,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         log.error("startTunnel")
         diagnostics.write("=== startTunnel (diagnostic log available: \(PhoneDiagnosticLog.shared.isAvailable)) ===")
 
+        // A fresh configuration carries fresh pairing material, so no revocation
+        // observed under the previous one can still apply.
+        //
+        // `runningSession` also clears this, but not soon enough on its own: the
+        // app polls `status` from the moment it starts the tunnel, and discovery
+        // plus a handshake takes seconds. In that window a stale flag answers
+        // "unpaired" and the app deletes the pairing the user has just created.
+        Task { await self.state.clearUnpairedByPeer() }
+
         // Route-less settings. The tunnel is a process host, not a capture
         // mechanism — we are proxying the *Mac's* traffic, not this phone's.
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
