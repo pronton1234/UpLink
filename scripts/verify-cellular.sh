@@ -31,7 +31,76 @@ blue()  { printf '\033[0;34m%s\033[0m\n' "$1"; }
 warn()  { printf '\033[0;33m%s\033[0m\n' "$1"; }
 
 IFACE="${UPLINK_WIFI_IFACE:-en0}"
+REPORT="${UPLINK_REPORT:-/tmp/uplink-cellular-report.txt}"
 FAILED=0
+
+# --watch: wait for the bridge, then verify, then write a report to disk.
+#
+# THE OPERATOR PROBLEM. This test requires the Mac's Wi-Fi radio to be OFF,
+# which is also the only path anyone driving the Mac remotely has. So the test
+# cannot be watched while it runs: the moment the conditions are right, whoever
+# started it is gone. Every previous attempt has been reconstructed afterwards
+# from logs, badly.
+#
+# So: start this BEFORE turning the radio off. It waits for a session, runs the
+# checks, and writes the answer somewhere that survives the outage. Turn Wi-Fi
+# back on afterwards and read the file.
+# --full: the whole test, hands-off, and it CANNOT strand you.
+#
+# Waits for a session, turns the Wi-Fi radio off itself, verifies, and turns the
+# radio back on again — through a trap, so it is restored even if the script is
+# killed or something throws. The operator's own connection goes down with the
+# radio, which is why this has to be one unattended command rather than a
+# sequence someone runs while watching.
+if [[ "${1:-}" == "--full" ]]; then
+    : > "$REPORT"
+    exec > >(tee -a "$REPORT") 2>&1
+
+    restore_radio() {
+        networksetup -setairportpower "$IFACE" on 2>/dev/null
+        echo "    Wi-Fi radio restored at $(date '+%H:%M:%S')"
+    }
+    trap restore_radio EXIT INT TERM
+
+    blue "==> waiting for a bridge session (up to 10 minutes)"
+    echo "    started $(date '+%H:%M:%S') — connect from the phone now"
+    found=0
+    for _ in $(seq 1 600); do
+        last=$(/usr/bin/log show --last 1m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
+               | grep -E "session started|session ENDED" | tail -1)
+        if [[ "$last" == *"session started"* ]]; then found=1; break; fi
+        sleep 1
+    done
+    if [[ $found -eq 0 ]]; then
+        red "    no session appeared; nothing to test"
+        exit 1
+    fi
+    green "    session at $(date '+%H:%M:%S')"
+
+    blue "==> turning the Wi-Fi radio off"
+    networksetup -setairportpower "$IFACE" off
+    # The bridge needs a moment to become the only path: AWDL re-derives, the
+    # route fallback lands, and DNS re-points.
+    sleep 25
+fi
+
+if [[ "${1:-}" == "--watch" ]]; then
+    : > "$REPORT"
+    exec > >(tee -a "$REPORT") 2>&1
+    blue "==> waiting for a bridge session (up to 10 minutes)"
+    echo "    started $(date '+%H:%M:%S'); radio can go off now"
+    for _ in $(seq 1 600); do
+        last=$(/usr/bin/log show --last 1m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
+               | grep -E "session started|session ENDED" | tail -1)
+        if [[ "$last" == *"session started"* ]]; then
+            green "    session detected at $(date '+%H:%M:%S')"
+            # Let discovery, the route fallback and DNS settle before judging.
+            sleep 20
+            break
+        fi
+        sleep 1
+    done
+fi
 fail() { red "    FAIL: $1"; FAILED=1; }
 
 blue "==> 1. Is there any way out other than the bridge?"
