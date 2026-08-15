@@ -128,6 +128,17 @@ actor ProxyState {
         )
         self.host = host
 
+        // Tombstones must outlive this process, because an extension restart is
+        // exactly when a revoked device would otherwise come back to life — the
+        // directory is in memory and rebuilt from this same snapshot. Restored
+        // BEFORE `start()`, so the first listener already carries the keys those
+        // revoked devices need in order to be told.
+        if let data = configuration?["revokedDevices"] as? Data,
+           let restored = try? JSONDecoder().decode(RevocationTombstones.self, from: data) {
+            await host.restoreTombstones(restored)
+            log.error("restored \(restored.all.count, privacy: .public) revocation tombstone(s)")
+        }
+
         let events = await host.events()
         eventTask = Task { [weak self] in
             for await event in events {
@@ -298,15 +309,29 @@ actor ProxyState {
         if message.hasPrefix("unpair:") {
             let fingerprint = String(message.dropFirst("unpair:".count))
             log?.error("ipc: unpair \(fingerprint, privacy: .public)")
+
+            // Captured before the removal: the tombstone needs the public key,
+            // which is the only way the phone can still reach us to be told.
+            let removed = (try? store.pairedDevices())?.first { $0.fingerprint == fingerprint }
             try? store.remove(fingerprint: fingerprint)
-            if let initiator {
+
+            if let initiator, await host.activeFingerprint == fingerprint {
+                // Connected right now: say it directly, no tombstone needed.
                 await initiator.announceUnpaired()
+                await host.endSession()
+            } else if let removed {
+                // Not connected, so there is no session to carry the notice.
+                // Without a tombstone the phone never finds out and re-dials
+                // forever holding a pairing this Mac has forgotten.
+                await host.revoke(removed)
             }
-            await host.stop()
-            // Rebuild so the listener stops offering the revoked key. Without
-            // it the Mac keeps advertising a PSK the user has just removed.
-            try? await host.start()
-            return "ok"
+            return "ok|\(await host.currentTombstones.all.count)"
+        }
+
+        // Handed back so the app can persist them into the next seed.
+        if message == "tombstones" {
+            guard let json = try? JSONEncoder().encode(await host.currentTombstones) else { return "" }
+            return json.base64EncodedString()
         }
 
         if message == "devices" {

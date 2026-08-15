@@ -465,6 +465,13 @@ final class MenuBarModel {
 
         do {
             configuration["pairedDevices"] = try JSONEncoder().encode(pairedDevices)
+            // Carried across so a revoked device is still told after an
+            // extension restart, which is precisely when it would otherwise
+            // come back to life.
+            if let tombstones = await sendToExtension("tombstones"),
+               let data = Data(base64Encoded: tombstones), !data.isEmpty {
+                configuration["revokedDevices"] = data
+            }
             proto.providerConfiguration = configuration
             manager.protocolConfiguration = proto
             try await manager.saveToPreferences()

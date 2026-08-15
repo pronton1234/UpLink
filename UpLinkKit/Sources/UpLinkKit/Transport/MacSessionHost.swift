@@ -63,6 +63,10 @@ public actor MacSessionHost {
     /// for the measurement behind this.
     private lazy var presence = AWDLPresence(queue: queue)
 
+    /// Devices unpaired while they were not connected, kept reachable only long
+    /// enough to be told. See ``RevocationTombstones``.
+    private var tombstones = RevocationTombstones()
+
     private var pathMonitor: NWPathMonitor?
     private var lastPathSignature: PathSignature?
     private var pathDebounceTask: Task<Void, Never>?
@@ -202,16 +206,28 @@ public actor MacSessionHost {
 
         let paired = (try? store.pairedDevices()) ?? []
 
+        // Revoked devices keep a PSK so they can connect ONCE and be told. They
+        // are refused a session in `handleSession`; without the key they could
+        // not reach us at all, and the notice could never be delivered.
+        tombstones.expire()
+        let reachable = paired + tombstones.devicesToKeepOnAir()
+
         // One PSK per paired phone, keyed by that phone's own fingerprint so
         // the client's offered identity picks the right one.
-        let sessionKeys: [(identity: String, key: SymmetricKey)] = paired.compactMap { device in
+        let sessionKeys: [(identity: String, key: SymmetricKey)] = reachable.compactMap { device in
             guard let remote = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: device.publicKey),
                   let key = try? KeySchedule.sessionKey(
                       localPrivate: identity,
                       remotePublic: remote,
                       context: Data(device.fingerprint.utf8)
                   )
-            else { return nil }
+            else {
+                // Was `compactMap` with no else: a device whose stored public
+                // key will not parse became a phone that can never connect,
+                // with nothing in the log to say why.
+                log.error("paired device \(device.name, privacy: .public) fp=\(device.fingerprint, privacy: .public) has an unusable public key — it cannot connect")
+                return nil
+            }
             return (device.fingerprint, key)
         }
 
@@ -434,6 +450,9 @@ public actor MacSessionHost {
         try await responder.confirm(on: channel, localIdentity: identity)
 
         pairingSession = session
+        // A device that has just paired is not revoked, whatever its history.
+        // Without this it would be told "unpaired" the moment it connects.
+        tombstones.reinstated(device.fingerprint)
         log.error("paired with \(device.name, privacy: .public) fp=\(device.fingerprint, privacy: .public)")
 
         // Consume the code and rebuild the listener so the new phone's session
@@ -446,7 +465,12 @@ public actor MacSessionHost {
 
     /// Fingerprint of the session currently believed live, so teardown can
     /// report which one ended and can be made idempotent.
-    private var activeFingerprint: String?
+    /// Which phone the live session is with, or nil.
+    ///
+    /// Readable so a caller can tell "unpair the device I am bridging with"
+    /// from "unpair one that is not here" — they need different handling, and
+    /// getting it wrong is how a revocation goes undelivered.
+    public private(set) var activeFingerprint: String?
 
     private func handleSession(
         _ hello: Frame,
@@ -468,6 +492,22 @@ public actor MacSessionHost {
         // rather than guessed from the paired list — several phones may be
         // paired with this Mac.
         let fingerprint = Self.identity(inHello: hello) ?? "unknown"
+
+        // A tombstone's ONE job, and it must happen before anything else: this
+        // device was unpaired while it was not connected, so it has never been
+        // told. Tell it now and close. Deliberately ahead of
+        // `emit(.sessionStarted)` and of every piece of session state — a
+        // tombstone that could carry traffic would be a revoked device still
+        // bridging, which is the opposite of what revoking it meant.
+        if tombstones.isRevoked(fingerprint) {
+            log.error("revoked device \(fingerprint, privacy: .public) connected — delivering the unpair notice and closing")
+            try? await channel.send(FrameEncoder.encode(Multiplexer.unpairedFrame()))
+            tombstones.delivered(fingerprint)
+            await channel.close()
+            try? restartListener()
+            await awaitListening()
+            return
+        }
 
         activeFingerprint = fingerprint
         // The session's own socket now keeps AWDL scheduled; ours would be
@@ -524,6 +564,38 @@ public actor MacSessionHost {
         }
         emit(.sessionEnded(fingerprint: fingerprint))
     }
+
+    /// Ends the live session without taking the Mac off the air.
+    ///
+    /// `stop()` cancels the listener and the path monitor, so using it to end a
+    /// session left the Mac unable to re-advertise — and re-pairing then needed
+    /// an app restart.
+    public func endSession() async {
+        guard let fingerprint = activeFingerprint else { return }
+        await sessionFinished(fingerprint: fingerprint, channel: nil)
+    }
+
+    /// Records a device unpaired while it was not connected, so it is told the
+    /// next time it appears.
+    public func revoke(_ device: PairedDevice) async {
+        tombstones.revoke(device)
+        log.error("tombstoned \(device.name, privacy: .public) — will tell it when it next connects")
+        try? restartListener()
+        await awaitListening()
+    }
+
+    /// A device that has paired again is no longer revoked.
+    public func reinstate(_ fingerprint: String) {
+        tombstones.reinstated(fingerprint)
+    }
+
+    /// Seeds tombstones recorded before this process started.
+    public func restoreTombstones(_ restored: RevocationTombstones) {
+        tombstones = restored
+        tombstones.expire()
+    }
+
+    public var currentTombstones: RevocationTombstones { tombstones }
 
     /// The phone has removed this Mac. Drop our half of the pairing.
     private func peerUnpaired(fingerprint: String) async {
