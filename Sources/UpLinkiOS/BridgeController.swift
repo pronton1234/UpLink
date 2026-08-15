@@ -352,9 +352,28 @@ final class BridgeController {
             if state != updated { state = updated }
         case .disconnected:
             if state.isConnected { state = .connecting(peer) }
+        case .unpaired:
+            // The Mac has removed this phone. Retrying is pointless — its
+            // listener no longer holds our key — and without acting on it the
+            // phone dials forever into a refused handshake, which is exactly
+            // what made the two devices disagree about whether they were
+            // connected.
+            await forgetPeerAfterRemoteUnpair()
         case .unintelligible:
             break  // ask again rather than act on noise
         }
+    }
+
+    /// Drops our half of a pairing the Mac has already dropped.
+    private func forgetPeerAfterRemoteUnpair() async {
+        guard let fingerprint = activePeerFingerprint else {
+            disconnect()
+            return
+        }
+        try? store.remove(fingerprint: fingerprint)
+        reloadPairedDevices()
+        disconnect()
+        state = .failed("This Mac removed this iPhone. Pair again to reconnect.")
     }
 
     // MARK: Pairing
@@ -405,13 +424,37 @@ final class BridgeController {
     /// user had just revoked, and the UI kept saying "connected" — so the state
     /// on screen no longer described anything real.
     func unpair(_ device: PairedDevice) {
-        // Stop first, forget second. The other order leaves a tunnel running
-        // on keys that no longer exist.
-        if activePeerFingerprint == device.fingerprint || state.isConnected {
-            disconnect()
+        // Tell the Mac FIRST, while a session still exists to carry the notice.
+        // Stopping first — which is what this used to do — guarantees it is
+        // never delivered, so the Mac keeps the phone in its paired list and
+        // keeps advertising a key the user has just revoked.
+        Task { [weak self] in
+            if self?.activePeerFingerprint == device.fingerprint || self?.state.isConnected == true {
+                _ = await self?.sendProviderMessage("unpair")
+            }
+            await MainActor.run {
+                guard let self else { return }
+                if self.activePeerFingerprint == device.fingerprint || self.state.isConnected {
+                    self.disconnect()
+                }
+                try? self.store.remove(fingerprint: device.fingerprint)
+                self.reloadPairedDevices()
+            }
         }
-        try? store.remove(fingerprint: device.fingerprint)
-        reloadPairedDevices()
+    }
+
+    /// One-shot provider message, for verbs whose reply is only an ack.
+    private func sendProviderMessage(_ message: String) async -> String? {
+        guard let session = manager?.connection as? NETunnelProviderSession else { return nil }
+        return await withCheckedContinuation { continuation in
+            do {
+                try session.sendProviderMessage(Data(message.utf8)) { data in
+                    continuation.resume(returning: data.flatMap { String(data: $0, encoding: .utf8) })
+                }
+            } catch {
+                continuation.resume(returning: nil)
+            }
+        }
     }
 
     private func reloadPairedDevices() {

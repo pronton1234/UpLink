@@ -15,6 +15,10 @@ public enum BridgeStatusReply: Equatable, Sendable {
     case connected(peer: String, egress: EgressInterface)
     /// The extension is running but has no session.
     case disconnected
+    /// The peer has removed this pairing. Distinct from `disconnected`, because
+    /// retrying is pointless and the user has to pair again — a state that
+    /// previously presented as an endless run of ordinary connection failures.
+    case unpaired
     /// The reply could not be understood. Deliberately distinct from
     /// `disconnected`: garbage means "ask again", not "tear the UI down".
     case unintelligible
@@ -29,6 +33,7 @@ public enum BridgeStatusReply: Equatable, Sendable {
 
         let parts = reply.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
         guard let head = parts.first else { return .unintelligible }
+        if head == "unpaired" { return .unpaired }
 
         switch head {
         case "connected":

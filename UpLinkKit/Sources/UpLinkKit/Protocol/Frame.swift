@@ -45,6 +45,19 @@ public struct Frame: Sendable, Equatable {
         /// chunk at any boundary, which is correct for TCP and destroys UDP.
         /// A `datagram` frame is always exactly one datagram.
         case datagram = 0x0C
+        /// Either side: "I have forgotten you; stop trying."
+        ///
+        /// Unpairing was purely local on both sides. The remover dropped the
+        /// key and tore down its own session; the other end kept the pairing,
+        /// kept dialling, and kept failing the TLS-PSK handshake against an
+        /// identity that no longer existed — forever, with no way for a user to
+        /// tell that from any other connection failure. Removing a device on
+        /// the Mac left the phone retrying into a listener advertising
+        /// `sessionKeys=0`.
+        ///
+        /// Sent before the session is torn down, so the peer learns why rather
+        /// than inferring it from a refused handshake.
+        case unpaired = 0x0D
     }
 
     /// 1 byte kind + 4 bytes streamID + 4 bytes payload length.

@@ -8,6 +8,8 @@ public enum SessionHostEvent: Sendable {
     case sessionStarted(fingerprint: String, peerDescription: String)
     case sessionEnded(fingerprint: String)
     case egressObserved(EgressInterface)
+    /// The phone removed this pairing from its side.
+    case peerUnpaired(fingerprint: String)
     case failed(String)
 }
 
@@ -446,6 +448,13 @@ public actor MacSessionHost {
             Task { await self?.emit(.egressObserved(interface)) }
         }
 
+        // The phone forgetting this Mac has to be acted on, not just noticed.
+        // Keeping the record would leave the Mac advertising a PSK for a device
+        // that has revoked it, and showing a paired phone the user removed.
+        _ = await initiator.onUnpairedByPeer { [weak self] in
+            Task { await self?.peerUnpaired(fingerprint: fingerprint) }
+        }
+
         sessionTask = Task { [weak self] in
             do {
                 try await initiator.run(resuming: hello, decoder: decoder)
@@ -483,6 +492,19 @@ public actor MacSessionHost {
             await presence.hold(peerDescription: lastPeer)
         }
         emit(.sessionEnded(fingerprint: fingerprint))
+    }
+
+    /// The phone has removed this Mac. Drop our half of the pairing.
+    private func peerUnpaired(fingerprint: String) async {
+        log.error("peer \(fingerprint, privacy: .public) unpaired us — forgetting it")
+        try? store.remove(fingerprint: fingerprint)
+        emit(.peerUnpaired(fingerprint: fingerprint))
+        // Rebuild so the listener stops offering the revoked key, and do not
+        // hold AWDL open for a device that has gone.
+        await presence.release()
+        await sessionFinished(fingerprint: fingerprint, channel: nil)
+        try? restartListener()
+        await awaitListening()
     }
 
     /// Pulls the sender's fingerprint out of a HELLO payload.

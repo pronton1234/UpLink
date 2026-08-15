@@ -203,6 +203,16 @@ actor ProxyState {
         case let .egressObserved(interface):
             log?.error("egress: \(interface.displayName, privacy: .public)")
 
+        case let .peerUnpaired(fingerprint):
+            // The app owns durable storage — this process cannot reach the
+            // keychain — so it has to be told, or the pairing comes straight
+            // back the next time the app re-seeds the extension.
+            log?.error("peer unpaired us: \(fingerprint, privacy: .public)")
+            hasSession = false
+            initiator = nil
+            currentPolicy = CapturePolicy()
+            flowCounts.removeAll()
+
         case let .failed(message):
             log?.error("host FAILED: \(message, privacy: .public)")
         }
@@ -257,6 +267,31 @@ actor ProxyState {
                 log?.error("ipc: pairing code FAILED \(String(describing: error), privacy: .public)")
                 return "error|\(error)"
             }
+        }
+
+        // Forgetting a phone must reach the phone.
+        //
+        // The app removes the device from its own store and rebuilds the
+        // listener with `sessionKeys=0`. Without this, the phone still holds
+        // the pairing and keeps dialling, failing the TLS-PSK handshake against
+        // an identity that no longer exists — on every retry, with nothing to
+        // distinguish it from any other failure. The user sees a Mac that will
+        // not accept a phone that is plainly trying.
+        //
+        // Announce first, tear down second: the notice travels on the session
+        // being ended, so the other order guarantees it is never delivered.
+        if message.hasPrefix("unpair:") {
+            let fingerprint = String(message.dropFirst("unpair:".count))
+            log?.error("ipc: unpair \(fingerprint, privacy: .public)")
+            try? store.remove(fingerprint: fingerprint)
+            if let initiator {
+                await initiator.announceUnpaired()
+            }
+            await host.stop()
+            // Rebuild so the listener stops offering the revoked key. Without
+            // it the Mac keeps advertising a PSK the user has just removed.
+            try? await host.start()
+            return "ok"
         }
 
         if message == "devices" {

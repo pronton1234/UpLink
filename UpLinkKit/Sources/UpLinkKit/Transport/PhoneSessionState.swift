@@ -28,7 +28,17 @@ public actor PhoneSessionState {
     private var task: Task<Void, Never>?
     private var responder: BridgeResponder?
 
+    /// Set when the Mac says it has forgotten this phone.
+    ///
+    /// Sticky across the session ending, because that is exactly when the app
+    /// next asks: the notice arrives, the session tears down, and a flag that
+    /// cleared with the session would never be seen.
+    public private(set) var wasUnpairedByPeer = false
+
     public init() {}
+
+    public func noteUnpairedByPeer() { wasUnpairedByPeer = true }
+    public func clearUnpairedByPeer() { wasUnpairedByPeer = false }
 
     /// Whether a session is actually live.
     ///
@@ -75,6 +85,12 @@ public actor PhoneSessionState {
     /// reported to the UI as a session.
     public func setPendingChannel(_ channel: NWConnectionChannel?) {
         self.channel = channel
+    }
+
+    /// Best effort: tells the Mac this phone has forgotten it, if a session is
+    /// still up to carry the notice.
+    public func announceUnpaired() async {
+        await responder?.announceUnpaired()
     }
 
     public func teardown() async {

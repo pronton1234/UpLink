@@ -36,6 +36,8 @@ public enum MuxEvent: Equatable, Sendable {
     case egressReported(EgressInterface)
     case helloReceived(version: UInt16, identity: String)
     case helloAcknowledged(version: UInt16)
+    /// The peer has forgotten this pairing. Not a failure — an instruction.
+    case unpairedByPeer
 }
 
 /// Carries many logical streams over one connection.
@@ -251,6 +253,15 @@ public struct Multiplexer: Sendable {
         Frame(kind: .egressReport, streamID: Self.controlStreamID, payload: Data([interface.rawValue]))
     }
 
+    /// "I have forgotten you; stop trying."
+    ///
+    /// Sent before tearing down, so the peer learns why instead of inferring it
+    /// from a TLS-PSK handshake that now refuses an identity which no longer
+    /// exists — indistinguishable, from the other end, from any other failure.
+    public static func unpairedFrame() -> Frame {
+        Frame(kind: .unpaired, streamID: controlStreamID, payload: Data())
+    }
+
     // MARK: - Inbound
 
     public mutating func receive(_ frame: Frame) throws -> [MuxEvent] {
@@ -261,7 +272,7 @@ public struct Multiplexer: Sendable {
             // silently ignore.
             throw MuxError.malformedControlPayload(frame.kind)
 
-        case .hello, .helloAck, .ping, .pong, .egressReport:
+        case .hello, .helloAck, .ping, .pong, .egressReport, .unpaired:
             guard frame.streamID == Self.controlStreamID else {
                 throw MuxError.controlFrameOnDataStream(frame.kind, frame.streamID)
             }
@@ -311,6 +322,12 @@ public struct Multiplexer: Sendable {
                 throw MuxError.malformedControlPayload(frame.kind)
             }
             return [.egressReported(interface)]
+        case .unpaired:
+            // Deliberately carries no payload to validate. It is the last thing
+            // a peer says before going away, and a strict parse here would turn
+            // "you have been unpaired" into "malformed frame" — leaving the
+            // user with a device that keeps retrying and no explanation.
+            return [.unpairedByPeer]
         default:
             return []
         }

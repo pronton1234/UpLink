@@ -172,6 +172,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         // path. The previous shape cleared the responder in a `defer` and left
         // the channel set forever, which is what made the phone claim a session
         // the Mac had never heard of.
+        // The Mac forgetting this phone must be acted on here, where the
+        // session is. Previously it was only visible as a TLS-PSK handshake
+        // that started failing, which is indistinguishable from every other
+        // connection failure — so the phone retried forever against a listener
+        // advertising `sessionKeys=0`.
+        _ = await responder.onUnpairedByPeer { [weak self] in
+            Task { await self?.state.noteUnpairedByPeer() }
+        }
+
         try await state.runningSession(channel: channel, responder: responder) {
             try await responder.run()
         }
@@ -226,6 +235,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
             return
         }
         switch request {
+        case "unpair":
+            // Announce over the live session, then stop. The other order
+            // guarantees the notice is never delivered, since it travels on the
+            // connection being torn down.
+            let state = self.state
+            let reply = UncheckedSendableBox(completionHandler)
+            Task {
+                await state.announceUnpaired()
+                await state.teardown()
+                reply.value?(Data("ok".utf8))
+            }
+
         case "diagnostics":
             // Answered synchronously: it is a file read, and the point is to be
             // able to get it out even when the session machinery is wedged.
@@ -246,6 +267,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
             let state = self.state
             let reply = UncheckedSendableBox(completionHandler)
             Task {
+                // Checked before `isConnected`, because the notice arrives as
+                // the session is ending and the app's next poll is the only
+                // chance to deliver it.
+                if await state.wasUnpairedByPeer {
+                    reply.value?(Data("unpaired".utf8))
+                    return
+                }
                 guard await state.isConnected else {
                     reply.value?(Data("disconnected".utf8))
                     return

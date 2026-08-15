@@ -107,6 +107,9 @@ public actor BridgeInitiator {
     public private(set) var peerFingerprint: String?
 
     private var egressObservers: [UUID: @Sendable (EgressInterface) -> Void] = [:]
+    /// Told when the peer says it has forgotten this pairing, so the owner can
+    /// drop its own half rather than keep a device the other end has removed.
+    private var unpairObservers: [UUID: @Sendable () -> Void] = [:]
 
     /// Tasks blocked waiting for the phone to grant more window credit.
     ///
@@ -123,6 +126,12 @@ public actor BridgeInitiator {
     public func onEgressChange(_ handler: @escaping @Sendable (EgressInterface) -> Void) -> UUID {
         let token = UUID()
         egressObservers[token] = handler
+        return token
+    }
+
+    public func onUnpairedByPeer(_ handler: @escaping @Sendable () -> Void) -> UUID {
+        let token = UUID()
+        unpairObservers[token] = handler
         return token
     }
 
@@ -260,6 +269,17 @@ public actor BridgeInitiator {
         for waiter in waiters { waiter.resume() }
     }
 
+    /// Tells the peer this pairing is gone, best effort.
+    ///
+    /// Mac → phone: this Mac has forgotten the phone. Failure is ignored on purpose: this is
+    /// called while tearing the session down, and a peer that cannot be told
+    /// is a peer that is already gone. The point is to give the common case —
+    /// both devices up, user taps Remove — an answer better than a silently
+    /// refused handshake.
+    public func announceUnpaired() async {
+        try? await write(Multiplexer.unpairedFrame())
+    }
+
     private func handle(_ frame: Frame) async throws {
         for event in try mux.receive(frame) {
             switch event {
@@ -288,6 +308,13 @@ public actor BridgeInitiator {
             case let .egressReported(interface):
                 observedEgress = interface
                 for (_, observer) in egressObservers { observer(interface) }
+
+            case .unpairedByPeer:
+                // The phone has removed this Mac. Announce it and let the
+                // session end: continuing would mean bridging for a device the
+                // user just revoked, which is exactly what made the Mac keep
+                // showing a phone that was trying to pair afresh.
+                for (_, observer) in unpairObservers { observer() }
 
             case .pingReceived:
                 try await write(Frame(kind: .pong, streamID: Multiplexer.controlStreamID))

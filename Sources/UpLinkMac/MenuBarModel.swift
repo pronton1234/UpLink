@@ -437,6 +437,14 @@ final class MenuBarModel {
             if status != .waiting { status = .waiting; notifyObservers() }
             setBridgeInterface(nil)
             await reconcileRouteTunnel(sessionLive: false)
+        case .unpaired:
+            // The phone removed this Mac. Reload rather than assume: the
+            // extension has already dropped its copy and told us, and the
+            // paired list on screen is otherwise still showing the device.
+            reloadPairedDevices()
+            if status != .waiting { status = .waiting; notifyObservers() }
+            setBridgeInterface(nil)
+            await reconcileRouteTunnel(sessionLive: false)
         case .unintelligible:
             // Ask again rather than act on noise — and in particular do NOT
             // tear the tunnel down over one unparsed reply.
@@ -613,7 +621,15 @@ final class MenuBarModel {
         // worthless, which is worse than the stale pairing itself.
         try? store.remove(fingerprint: device.fingerprint)
         reloadPairedDevices()
-        disconnect()
+        // AND it has to reach the phone. The extension owns the session and the
+        // listener, so it is the only side that can say so before tearing down.
+        // Without this the phone keeps the pairing, keeps dialling, and keeps
+        // being refused by a listener advertising `sessionKeys=0` — which looks
+        // from here like a phone that will not connect.
+        Task { [weak self] in
+            _ = await self?.sendToExtension("unpair:\(device.fingerprint)")
+            await MainActor.run { self?.reloadPairedDevices() }
+        }
     }
 
     private func reloadPairedDevices() {

@@ -69,6 +69,9 @@ public actor BridgeResponder {
     private var mux = Multiplexer(role: .responder)
     private var decoder = FrameDecoder()
 
+    private var unpairObservers: [UUID: @Sendable () -> Void] = [:]
+
+
     private var connections: [UInt32: DestinationConnection] = [:]
     /// UDP sessions: one connection per distinct destination on a stream.
     ///
@@ -150,9 +153,33 @@ public actor BridgeResponder {
         await reportEgressIfChanged(for: connection)
     }
 
+    /// Told when the peer says it has forgotten this pairing.
+    public func onUnpairedByPeer(_ handler: @escaping @Sendable () -> Void) -> UUID {
+        let token = UUID()
+        unpairObservers[token] = handler
+        return token
+    }
+
+    public func removeUnpairObserver(_ token: UUID) {
+        unpairObservers.removeValue(forKey: token)
+    }
+
+    /// Tells the peer this pairing is gone, best effort.
+    ///
+    /// Phone → Mac: this phone has forgotten the Mac. Failure is ignored on purpose: this is
+    /// called while tearing the session down, and a peer that cannot be told
+    /// is a peer that is already gone. The point is to give the common case —
+    /// both devices up, user taps Remove — an answer better than a silently
+    /// refused handshake.
+    public func announceUnpaired() async {
+        try? await write(Multiplexer.unpairedFrame())
+    }
+
     private func handle(_ frame: Frame) async throws {
         for event in try mux.receive(frame) {
             switch event {
+            case .unpairedByPeer:
+                for (_, observer) in unpairObservers { observer() }
             case let .openRequested(streamID, destination):
                 // A UDP OPEN registers a *session*, it does not name a
                 // destination. `NEAppProxyUDPFlow` carries datagrams to many
