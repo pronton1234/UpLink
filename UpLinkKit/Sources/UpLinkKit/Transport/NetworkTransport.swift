@@ -310,6 +310,15 @@ public actor NWConnectionChannel: FrameChannel {
     private var pendingBytes = 0
     private var isPaused = false
     private var isClosed = false
+
+    /// Whether this channel has been closed, from outside.
+    ///
+    /// Exposed so a caller holding a channel can tell a live one from a spent
+    /// one. `PhoneSessionState` needs exactly this: "do I have a channel" is not
+    /// the same question as "am I connected", and answering the first while
+    /// meaning the second is what made the phone claim a session that had
+    /// already ended.
+    public var isFinished: Bool { isClosed }
     private var isStarted = false
 
     /// How many undelivered bytes may pile up before this stops reading the

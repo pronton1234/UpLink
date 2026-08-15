@@ -20,7 +20,7 @@ import UpLinkKit
 /// cellular data without being asked.
 /// `@unchecked Sendable` because NetworkExtension calls provider methods from
 /// its own serial context and this class holds no mutable state of its own —
-/// everything that changes lives in ``SessionState``, an actor. The unchecked
+/// everything that changes lives in ``PhoneSessionState``, an actor. The unchecked
 /// conformance is what lets `self` be captured for `cancelTunnelWithError`.
 final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
 
@@ -30,7 +30,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     /// and the cable changes the peer link being tested.
     private let diagnostics = PhoneDiagnosticLog.shared
     private let queue = DispatchQueue(label: "com.uplink.app.tunnel")
-    private let state = SessionState()
+    private let state = PhoneSessionState()
 
     // Completion-handler form rather than the async override: the async
     // variant receives a non-Sendable `[String: NSObject]?` across an isolation
@@ -100,6 +100,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
                 policy.recordSuccess()
                 log.error("session ended cleanly (peer closed the link); will look for the Mac again")
                 diagnostics.write("session ended cleanly; looking for the Mac again")
+                await state.setPendingChannel(nil)
             } catch {
                 let delay = policy.recordFailure()
                 log.error(
@@ -140,8 +141,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         )
         let connection = NWConnection(to: peer.endpoint, using: parameters)
         let channel = NWConnectionChannel(connection: connection)
-        await state.setChannel(channel)
-        try await channel.start(on: queue)
+        // Pending, not connected: recorded so `teardown` can cancel a dial that
+        // never completes, but never reported to the UI as a session.
+        await state.setPendingChannel(channel)
+        do {
+            try await channel.start(on: queue)
+        } catch {
+            // Otherwise a handshake that fails leaves the channel behind and
+            // the phone claims a session it never had.
+            await state.setPendingChannel(nil)
+            await channel.close()
+            throw error
+        }
 
         log.error("connected to \(peer.name, privacy: .public) via \(peer.profile.rawValue, privacy: .public) at \(String(describing: peer.endpoint), privacy: .public)")
 
@@ -156,9 +167,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
         // Retained so `handleAppMessage` can report the observed egress. The
         // app cannot see this for itself — the sockets live in this process —
         // and without it the phone's UI has nothing but a placeholder to show.
-        await state.setResponder(responder)
-        defer { Task { await state.setResponder(nil) } }
-        try await responder.run()
+        //
+        // `runningSession` owns the whole lifetime and clears both on every exit
+        // path. The previous shape cleared the responder in a `defer` and left
+        // the channel set forever, which is what made the phone claim a session
+        // the Mac had never heard of.
+        try await state.runningSession(channel: channel, responder: responder) {
+            try await responder.run()
+        }
+        await channel.close()
     }
 
     /// How long to wait for the paired Mac to appear before giving up and
@@ -254,36 +271,12 @@ struct UncheckedSendableBox<Value>: @unchecked Sendable {
     init(_ value: Value) { self.value = value }
 }
 
-/// Owns everything mutable about a live session.
+/// The session state lives in ``PhoneSessionState`` in the kit.
 ///
-/// Keeping this in an actor rather than in stored properties on the provider
-/// means the provider itself has no mutable state to race on, which is what
-/// makes its `@unchecked Sendable` conformance honest rather than a shortcut.
-private actor SessionState {
-
-    private var channel: NWConnectionChannel?
-    private var task: Task<Void, Never>?
-    private var responder: BridgeResponder?
-
-    var isConnected: Bool { channel != nil }
-
-    /// What the phone last observed about how traffic is actually leaving.
-    var observedEgress: EgressInterface? {
-        get async { await responder?.observedEgress }
-    }
-
-    func setChannel(_ channel: NWConnectionChannel?) { self.channel = channel }
-    func setTask(_ task: Task<Void, Never>?) { self.task = task }
-    func setResponder(_ responder: BridgeResponder?) { self.responder = responder }
-
-    func teardown() async {
-        task?.cancel()
-        task = nil
-        responder = nil
-        await channel?.close()
-        channel = nil
-    }
-}
+/// It was a `private actor` here, where nothing could test it, and it carried a
+/// bug that survived every on-device round: the channel was set on connect and
+/// never cleared, so the phone reported itself connected for the life of the
+/// tunnel. See that type for the full account.
 
 enum BridgeStartupError: Error {
     case notConfigured
