@@ -258,6 +258,11 @@ public struct Multiplexer: Sendable {
     /// Sent before tearing down, so the peer learns why instead of inferring it
     /// from a TLS-PSK handshake that now refuses an identity which no longer
     /// exists — indistinguishable, from the other end, from any other failure.
+    /// Tells the dialling side why its pairing attempt was refused.
+    public static func pairFailureFrame(_ error: PairingError) -> Frame {
+        Frame(kind: .pairFailure, streamID: controlStreamID, payload: Data([error.wireCode]))
+    }
+
     public static func unpairedFrame() -> Frame {
         Frame(kind: .unpaired, streamID: controlStreamID, payload: Data())
     }
@@ -266,7 +271,7 @@ public struct Multiplexer: Sendable {
 
     public mutating func receive(_ frame: Frame) throws -> [MuxEvent] {
         switch frame.kind {
-        case .pairRequest, .pairResponse:
+        case .pairRequest, .pairResponse, .pairFailure:
             // Pairing happens before a multiplexer exists. Seeing one here
             // means the peer is confused or replaying, so refuse rather than
             // silently ignore.

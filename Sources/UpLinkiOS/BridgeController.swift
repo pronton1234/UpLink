@@ -379,7 +379,16 @@ final class BridgeController {
     // MARK: Pairing
 
     /// Completes pairing with the code the user typed.
-    func completePairing(peer: DiscoveredPeer, code: String) async {
+    /// Returns nil on success, or the message to show IN the sheet.
+    ///
+    /// It used to return nothing and set `state = .failed(...)`, while
+    /// `pendingPairingPeer` was cleared only on the success path — so the sheet
+    /// stayed presented on top of the message it had just written. The user
+    /// typed a code, the spinner stopped, and nothing appeared to happen. The
+    /// only rational response is to try again, which is exactly what was
+    /// reported: "re-pairing fails and I have to retry several times."
+    @discardableResult
+    func completePairing(peer: DiscoveredPeer, code: String) async -> String? {
         do {
             let parsed = try PairingCode(digits: code)
             let identity = try store.loadOrCreateIdentity()
@@ -398,8 +407,11 @@ final class BridgeController {
             pendingPairingPeer = nil
 
             await connect(to: peer)
+            return nil
         } catch {
-            state = .failed(pairingMessage(for: error))
+            // Deliberately NOT `state = .failed(...)`: the sheet is still up and
+            // would hide it. The caller shows this where the user is looking.
+            return pairingMessage(for: error)
         }
     }
 

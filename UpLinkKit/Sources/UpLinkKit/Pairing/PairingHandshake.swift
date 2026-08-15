@@ -97,8 +97,18 @@ public struct PairingClient: Sendable {
         let channel = NWConnectionChannel(connection: connection)
 
         // A wrong code fails here, in the TLS handshake, before any key
-        // material is exchanged.
-        try await channel.start(on: queue)
+        // material is exchanged — so this is the ONLY place a code mismatch can
+        // be detected, and it arrives as an opaque transport error.
+        //
+        // Reporting it as such made `pairingMessage(for:)`'s `.codeMismatch`
+        // arm unreachable: it says exactly the right thing and nothing could
+        // ever throw the value it matches on. A PSK rejection during pairing
+        // has one meaning, and this is it.
+        do {
+            try await channel.start(on: queue)
+        } catch {
+            throw PairingError.codeMismatch
+        }
         defer { Task { await channel.close() } }
 
         let hello = PairingHello(
@@ -122,6 +132,10 @@ public struct PairingClient: Sendable {
             }
             decoder.append(bytes)
             reply = try? decoder.next()
+        }
+        // The Mac's account of a refusal, when it is the only side that knows.
+        if let reply, reply.kind == .pairFailure, let code = reply.payload.first {
+            throw PairingError(wireCode: code)
         }
         guard let reply, reply.kind == .pairResponse else {
             throw PairingError.handshakeFailed
@@ -151,15 +165,30 @@ public struct PairingResponder: Sendable {
     /// The caller reads the first frame in order to tell a pairing connection
     /// from a session connection, so the request arrives here already decoded
     /// rather than being read a second time.
-    public func respond(
-        to request: Frame,
-        on channel: FrameChannel,
-        localIdentity: Curve25519.KeyAgreement.PrivateKey
-    ) async throws -> PairedDevice {
-
+    /// Reads the request and works out who the peer is, WITHOUT answering.
+    ///
+    /// Split from ``confirm(to:on:localIdentity:)`` so the caller can commit its
+    /// own side of the pairing before telling the peer it is paired. Answering
+    /// first — which is what this used to do — means a failure in the caller's
+    /// own storage leaves the phone believing it is paired with a Mac that has
+    /// no record of it. That one-sided state then has to be cleaned up by hand
+    /// on both devices, and is a large part of why re-pairing was painful.
+    public func identify(_ request: Frame) throws -> PairedDevice {
         guard request.kind == .pairRequest else { throw PairingError.handshakeFailed }
         let theirs = try PairingHello(decoding: request.payload)
+        return PairedDevice(
+            fingerprint: PairedDevice.fingerprint(of: theirs.publicKey),
+            name: theirs.deviceName,
+            publicKey: theirs.publicKey,
+            pairedAt: Date()
+        )
+    }
 
+    /// Tells the peer it is paired. Call only once our own side is committed.
+    public func confirm(
+        on channel: FrameChannel,
+        localIdentity: Curve25519.KeyAgreement.PrivateKey
+    ) async throws {
         let ours = PairingHello(
             publicKey: localIdentity.publicKey.rawRepresentation,
             deviceName: deviceName
@@ -169,12 +198,16 @@ public struct PairingResponder: Sendable {
                 Frame(kind: .pairResponse, streamID: Multiplexer.controlStreamID, payload: ours.encoded())
             )
         )
+    }
 
-        return PairedDevice(
-            fingerprint: PairedDevice.fingerprint(of: theirs.publicKey),
-            name: theirs.deviceName,
-            publicKey: theirs.publicKey,
-            pairedAt: Date()
-        )
+    /// Convenience for callers with nothing to commit — tests and probes.
+    public func respond(
+        to request: Frame,
+        on channel: FrameChannel,
+        localIdentity: Curve25519.KeyAgreement.PrivateKey
+    ) async throws -> PairedDevice {
+        let device = try identify(request)
+        try await confirm(on: channel, localIdentity: localIdentity)
+        return device
     }
 }

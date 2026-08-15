@@ -381,9 +381,24 @@ public actor MacSessionHost {
                 throw ChannelError.handshakeFailed("unexpected first frame \(first.kind)")
             }
         } catch {
-            // A wrong code fails in the TLS handshake, so this is where a bad
-            // pairing lands — and the error is generic, hence the explicit note.
-            log.error("accept: REJECTED \(String(describing: error), privacy: .public) (a TLS failure here usually means the code did not match)")
+            // Tell the peer WHY, when we are the only side that can know.
+            //
+            // A wrong code fails earlier, inside TLS, and never reaches here. So
+            // a `PairingError` at this point means the code was right and the
+            // session refused it — expired, exhausted, or already used. Closing
+            // silently, which is all this used to do, left the phone reporting a
+            // generic `handshakeFailed`; `.expired`, `.tooManyAttempts` and
+            // `.alreadyConsumed` were values nothing could produce, with good
+            // messages that could never be shown.
+            //
+            // Best effort, and deliberately before the close: if the write
+            // fails the peer is already gone.
+            if let refusal = error as? PairingError {
+                try? await channel.send(FrameEncoder.encode(Multiplexer.pairFailureFrame(refusal)))
+                log.error("accept: pairing REFUSED — \(String(describing: refusal), privacy: .public)")
+            } else {
+                log.error("accept: REJECTED \(String(describing: error), privacy: .public)")
+            }
             await channel.close()
         }
     }
@@ -396,13 +411,29 @@ public actor MacSessionHost {
             log.error("pairing: no active code on this Mac — was 'Show Pairing Code' used?")
             throw PairingError.expired
         }
-        try session.verify(code, at: Date())
-        pairingSession = session
+        // On refusal, persist the attempt so the three-guess lockout actually
+        // counts. On success, do NOT persist yet — see below.
+        do {
+            try session.verify(code, at: Date())
+        } catch {
+            pairingSession = session
+            throw error
+        }
 
+        // Commit our own side BEFORE telling the phone it is paired, and burn
+        // the code only once both have happened.
+        //
+        // The old order — verify, persist the consumption, answer, then save —
+        // failed in two ways at once when the save went wrong: the phone had
+        // already been told it was paired and stored the Mac, while the Mac
+        // stored nothing; and the code was spent, so the user was sent for a
+        // fresh one to fix a one-sided pairing they could not see.
         let responder = PairingResponder(deviceName: deviceName)
-        let device = try await responder.respond(to: request, on: channel, localIdentity: identity)
-
+        let device = try responder.identify(request)
         try store.save(device)
+        try await responder.confirm(on: channel, localIdentity: identity)
+
+        pairingSession = session
         log.error("paired with \(device.name, privacy: .public) fp=\(device.fingerprint, privacy: .public)")
 
         // Consume the code and rebuild the listener so the new phone's session

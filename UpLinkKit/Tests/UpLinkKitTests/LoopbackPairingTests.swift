@@ -40,7 +40,7 @@ struct LoopbackPairingTests {
 
     /// Spins up a real `MacSessionHost` and returns it with a peer that points
     /// straight at its port, skipping Bonjour.
-    private func makeHost(
+    fileprivate func makeHost(
         deviceName: String = "Test Mac"
     ) async throws -> (host: MacSessionHost, identity: Curve25519.KeyAgreement.PrivateKey, store: InMemoryDeviceDirectory) {
         let identity = Curve25519.KeyAgreement.PrivateKey()
@@ -57,7 +57,7 @@ struct LoopbackPairingTests {
         return (host, identity, store)
     }
 
-    private func peer(for host: MacSessionHost, name: String = "Test Mac") async throws -> DiscoveredPeer {
+    fileprivate func peer(for host: MacSessionHost, name: String = "Test Mac") async throws -> DiscoveredPeer {
         // NWListener binds asynchronously, so the port is nil for a beat after
         // start(). Dialing port 0 would stall in .waiting forever rather than
         // fail, so wait for a real one.
@@ -215,6 +215,153 @@ struct LoopbackPairingTests {
                 try await PairingClient(queue: DispatchQueue(label: "test.client2"))
                     .pair(with: second, code: code, localIdentity: .init())
             }
+        }
+    }
+}
+
+// SYMPTOM: "re-pairing is such a pain for some reason" — you type a code, the
+// spinner stops, and nothing else happens.
+//
+// Two separate reasons a pairing failure was mute, and they need different
+// fixes because they fail at different layers:
+//
+//   1. A WRONG CODE fails inside the TLS-PSK handshake, before any frame can be
+//      exchanged. The phone gets an opaque `NWError` from `channel.start`, and
+//      `pairingMessage(for:)`'s `.codeMismatch` arm — which says exactly the
+//      right thing — is never reached, because that error is never thrown.
+//
+//   2. A code that is RIGHT but expired, exhausted, or already used gets past
+//      TLS, because the PSK is still on the air. The Mac's `PairingSession`
+//      then refuses it — and `accept()` catches the throw and merely closes the
+//      channel. The Mac never sends a failure, so the phone's `receive()`
+//      returns nil and it reports the generic `handshakeFailed`.
+//
+// So `.expired`, `.tooManyAttempts` and `.alreadyConsumed` were unreachable on
+// the phone: the values existed, the human-readable strings existed, and no
+// path could ever produce them.
+
+@Suite("Regression: a failed pairing must say which failure it was")
+struct PairingFailureReportingTests {
+
+    @Test("A wrong code reports a code mismatch, not an opaque transport error")
+    func wrongCodeIsReportedAsMismatch() async throws {
+        let harness = LoopbackPairingTests()
+        let (host, _, _) = try await harness.makeHost()
+        defer { Task { await host.stop() } }
+
+        try await host.setPairingCode(try PairingCode(digits: "123456"))
+        let target = try await harness.peer(for: host)
+
+        await #expect(throws: PairingError.codeMismatch) {
+            try await withTimeout(10, "wrong-code pairing") {
+                try await PairingClient(queue: DispatchQueue(label: "test.client"))
+                    .pair(
+                        with: target,
+                        code: try PairingCode(digits: "654321"),
+                        localIdentity: Curve25519.KeyAgreement.PrivateKey()
+                    )
+            }
+        }
+    }
+
+    // The post-TLS refusal, and the one that actually happens in the field.
+    //
+    // The pairing PSK stays in the listener until someone calls
+    // `setPairingCode(nil)`, and the only thing that does so on a timer is an
+    // app-side `Task.sleep`. If the app quits or that IPC is lost, the code is
+    // still ON THE AIR while its `PairingSession` has expired. TLS then
+    // succeeds and the Mac refuses afterwards — the one case where the Mac is
+    // the only side that knows why, and so the only case a failure frame can
+    // possibly help.
+    @Test("An expired session reports expiry, not a generic handshake failure")
+    func expiredSessionIsReportedSpecifically() async throws {
+        let harness = LoopbackPairingTests()
+        let (host, _, store) = try await harness.makeHost()
+        defer { Task { await host.stop() } }
+
+        // Issued two minutes ago: past `PairingSession.validity` (60s), but the
+        // PSK is on the air, so the handshake still succeeds.
+        let code = try PairingCode(digits: "424242")
+        try await host.setPairingCode(code, now: Date().addingTimeInterval(-120))
+        let target = try await harness.peer(for: host)
+
+        await #expect(throws: PairingError.expired) {
+            try await withTimeout(10, "expired pairing") {
+                try await PairingClient(queue: DispatchQueue(label: "test.client.exp"))
+                    .pair(with: target, code: code, localIdentity: Curve25519.KeyAgreement.PrivateKey())
+            }
+        }
+        #expect((try store.pairedDevices()).isEmpty, "an expired code paired anyway")
+    }
+}
+
+/// A directory whose `save` always fails, standing in for the real ways the
+/// step after verification can go wrong: a keychain write refused before first
+/// unlock, a channel that dies mid-response.
+private final class FailingDeviceDirectory: DeviceDirectory, @unchecked Sendable {
+    struct Refused: Error {}
+    func pairedDevices() throws -> [PairedDevice] { [] }
+    func save(_ device: PairedDevice) throws { throw Refused() }
+    func remove(fingerprint: String) throws {}
+}
+
+@Suite("Regression: a failure after verification must not burn the code")
+struct PairingCodeConsumptionTests {
+
+    // `verify` marks the code consumed and `handlePairing` persisted that
+    // immediately, BEFORE writing the response and saving the device. So any
+    // failure after that point cost a whole new code — while the phone may
+    // already have saved the Mac, leaving a one-sided pairing that then has to
+    // be cleaned up by hand. Exactly the "re-pairing is a pain" shape.
+    @Test("A code survives a failure that happens after it was verified")
+    func codeSurvivesLateFailure() async throws {
+        let store = FailingDeviceDirectory()
+        let host = MacSessionHost(
+            identity: Curve25519.KeyAgreement.PrivateKey(),
+            deviceName: "Test Mac",
+            store: store,
+            queue: DispatchQueue(label: "test.consumption"),
+            profile: .localLink,
+            monitorsPath: false
+        )
+        try await host.start()
+        defer { Task { await host.stop() } }
+
+        let code = try PairingCode(digits: "515151")
+        try await host.setPairingCode(code)
+
+        let harness = LoopbackPairingTests()
+        // The Mac must not confirm a pairing it could not record: the phone
+        // fails too, rather than storing a Mac that has no record of it.
+        let first = try await harness.peer(for: host)
+        await #expect(throws: (any Error).self) {
+            try await withTimeout(10, "first attempt") {
+                try await PairingClient(queue: DispatchQueue(label: "test.c1"))
+                    .pair(with: first, code: code, localIdentity: Curve25519.KeyAgreement.PrivateKey())
+            }
+        }
+
+        // The same code again. If the first attempt burned it, this comes back
+        // as `.alreadyConsumed` — a user who did nothing wrong being told to go
+        // and fetch a new code. Any OTHER error is fine: the point is that the
+        // code itself survived.
+        // Asserted by NAME, not merely "some error". `(any Error).self` would
+        // accept `.alreadyConsumed` — the exact failure under test — and the
+        // test would pass for the wrong reason.
+        let second = try await harness.peer(for: host)
+        do {
+            _ = try await withTimeout(10, "second attempt") {
+                try await PairingClient(queue: DispatchQueue(label: "test.c2"))
+                    .pair(with: second, code: code, localIdentity: Curve25519.KeyAgreement.PrivateKey())
+            }
+            Issue.record("the second attempt should still have failed on the store")
+        } catch let error as PairingError {
+            #expect(
+                error != .alreadyConsumed,
+                "a failure the user did not cause burned the code — they are sent for a fresh one to fix a one-sided pairing they cannot see"
+            )
+        } catch {
+            // The store refusal, surfacing as a transport error. Expected.
         }
     }
 }

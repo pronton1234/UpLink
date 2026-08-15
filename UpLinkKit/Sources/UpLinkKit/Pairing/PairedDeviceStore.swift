@@ -28,7 +28,7 @@ public struct PairedDevice: Sendable, Equatable, Identifiable, Codable {
     }
 }
 
-public enum KeychainError: Error, Equatable, Sendable {
+public enum KeychainError: Error, Equatable, Sendable, LocalizedError {
     case unexpectedStatus(OSStatus)
     case malformedData
 
@@ -226,4 +226,14 @@ public struct PairedDeviceStore: Sendable {
             throw KeychainError.unexpectedStatus(status)
         }
     }
+}
+
+extension KeychainError {
+    /// Routes to ``diagnosis``, which already explains both failures well.
+    ///
+    /// Without this conformance, the one place these surface to a user —
+    /// `.failed(error.localizedDescription)` on the phone — showed the generic
+    /// Cocoa string ("The operation couldn't be completed"), so the good text
+    /// was written, kept, and never once displayed.
+    public var errorDescription: String? { diagnosis }
 }

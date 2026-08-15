@@ -12,6 +12,37 @@ public enum PairingError: Error, Equatable, Sendable {
     case handshakeFailed
 }
 
+extension PairingError {
+
+    /// A stable byte for the wire, deliberately not the enum's declaration
+    /// order: reordering the cases must not silently change what a peer is
+    /// told, and an older build must not misread a newer one's refusal.
+    public var wireCode: UInt8 {
+        switch self {
+        case .invalidCodeFormat: 1
+        case .expired: 2
+        case .tooManyAttempts: 3
+        case .codeMismatch: 4
+        case .alreadyConsumed: 5
+        case .handshakeFailed: 6
+        }
+    }
+
+    /// Unknown codes become `handshakeFailed` rather than nil: a peer that
+    /// refuses for a reason this build has never heard of has still refused,
+    /// and saying so beats reporting nothing.
+    public init(wireCode: UInt8) {
+        switch wireCode {
+        case 1: self = .invalidCodeFormat
+        case 2: self = .expired
+        case 3: self = .tooManyAttempts
+        case 4: self = .codeMismatch
+        case 5: self = .alreadyConsumed
+        default: self = .handshakeFailed
+        }
+    }
+}
+
 /// The six-digit number the Mac shows and the user types on the phone.
 ///
 /// Six digits is ~20 bits — far too weak to be a long-term secret, and it is

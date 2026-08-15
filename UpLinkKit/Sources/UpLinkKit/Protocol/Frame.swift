@@ -58,6 +58,16 @@ public struct Frame: Sendable, Equatable {
         /// Sent before the session is torn down, so the peer learns why rather
         /// than inferring it from a refused handshake.
         case unpaired = 0x0D
+        /// Mac → phone: why a pairing attempt was refused.
+        ///
+        /// Only the Mac knows. A code that is right but expired, exhausted or
+        /// already used gets PAST the TLS handshake, because the PSK is still on
+        /// the air — and `accept()` used to catch the refusal and merely close
+        /// the channel. The phone saw `receive()` return nil and reported a
+        /// generic `handshakeFailed`, so `.expired`, `.tooManyAttempts` and
+        /// `.alreadyConsumed` were values no code path could produce, with
+        /// human-readable strings that could never be shown.
+        case pairFailure = 0x0E
     }
 
     /// 1 byte kind + 4 bytes streamID + 4 bytes payload length.

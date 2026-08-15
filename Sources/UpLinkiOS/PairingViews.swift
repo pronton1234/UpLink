@@ -12,6 +12,7 @@ struct PairingSheet: View {
 
     @State private var code = ""
     @State private var isSubmitting = false
+    @State private var failure: String?
     @Environment(\.dismiss) private var dismiss
 
     private var isValid: Bool { code.count == PairingCode.length }
@@ -42,22 +43,36 @@ struct PairingSheet: View {
                     .padding(.vertical, 12)
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 14))
                     .onChange(of: code) { _, new in
+                        if failure != nil { withAnimation { failure = nil } }
                         // Keep it to six digits without making the field feel
                         // like it is fighting the user.
                         code = String(new.filter(\.isNumber).prefix(PairingCode.length))
                     }
 
-                Text("The code is good for one minute and can only be used once.")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                if let failure {
+                    Text(failure)
+                        .font(.subheadline)
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                        .transition(.opacity)
+                } else {
+                    Text("The code is good for one minute and can only be used once.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
 
                 Spacer()
 
                 Button {
                     isSubmitting = true
+                    failure = nil
                     Task {
-                        await controller.completePairing(peer: peer, code: code)
+                        let message = await controller.completePairing(peer: peer, code: code)
                         isSubmitting = false
+                        withAnimation { failure = message }
+                        // Only the digits, so a mistyped one costs a retype
+                        // rather than a walk back to the Mac for a new code.
+                        if message != nil { code = "" }
                     }
                 } label: {
                     if isSubmitting {
