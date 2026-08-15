@@ -447,16 +447,33 @@ public actor MacSessionHost {
         let responder = PairingResponder(deviceName: deviceName)
         let device = try responder.identify(request)
         try store.save(device)
+
+        // A device that has just paired is not revoked, whatever its history.
+        // Without this it would be told "unpaired" the moment it connects, and
+        // a re-pair could never stick.
+        tombstones.reinstated(device.fingerprint)
+
+        // Confirm BEFORE rebuilding, and the order is not free to change.
+        //
+        // Rebuilding first looks better — the Mac would be listening with the
+        // new session key before the phone is told it is paired, closing the
+        // window where the phone dials a port that is going away. It deadlocks:
+        // `restartListener` cancels the listener this connection was accepted
+        // from, and the confirmation can then never be written. Measured as a
+        // test that hung rather than failed.
+        //
+        // So the phone is told first and must re-discover, which is what it
+        // does in practice: the rebuild changes the bound port, because
+        // `NWListener` will not rebind one it just released, and Bonjour
+        // republishes.
         try await responder.confirm(on: channel, localIdentity: identity)
 
+        // The code is spent only now that both sides are committed.
         pairingSession = session
-        // A device that has just paired is not revoked, whatever its history.
-        // Without this it would be told "unpaired" the moment it connects.
-        tombstones.reinstated(device.fingerprint)
         log.error("paired with \(device.name, privacy: .public) fp=\(device.fingerprint, privacy: .public)")
 
-        // Consume the code and rebuild the listener so the new phone's session
-        // PSK is live and the pairing PSK is gone.
+        // Rebuild so the new phone's session PSK is live and the pairing PSK is
+        // gone.
         try await setPairingCode(nil)
         emit(.paired(device))
 
