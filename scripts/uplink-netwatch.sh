@@ -44,6 +44,9 @@ SERVICE="${UPLINK_WIFI_SERVICE:-Wi-Fi}"
 SELF_IP="169.254.99.2"
 SELF_MASK="255.255.0.0"
 SELF_ROUTER="169.254.99.1"
+# The BSD interface name behind the service. `networksetup` speaks service
+# names, `route` speaks interface names, and this fallback needs both.
+IFACE="${UPLINK_WIFI_IFACE:-en0}"
 # One second, not five. The gap between Wi-Fi dropping and this landing is a
 # window in which the Mac has no route and nothing works — and a user who tests
 # during it concludes, correctly from where they are standing, that the product
@@ -175,15 +178,55 @@ apply_standalone() {
   networksetup -setmanual "$SERVICE" "$SELF_IP" "$SELF_MASK" "$SELF_ROUTER"
   networksetup -setdnsservers "$SERVICE" 1.1.1.1 1.0.0.1
   note_change
-  for _ in $(seq 1 30); do
-    [[ "$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $2; exit}')" == "$SELF_ROUTER" ]] && break
+
+  # Ten seconds, not thirty. SystemConfiguration either installs the route
+  # promptly or it is never going to, and thirty seconds of a Mac with no route
+  # is thirty seconds of the user concluding the product is broken.
+  for _ in $(seq 1 10); do
+    has_default_route && break
     sleep 1
   done
-  say "default route is now $(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $2; exit}')"
+
+  # THE FALLBACK'S OWN FALLBACK, and it is the one that matters.
+  #
+  # `networksetup -setmanual` does NOT produce a default route when Wi-Fi has
+  # joined nothing. SystemConfiguration only installs routes for a service whose
+  # interface has link, and an unassociated Wi-Fi interface has none — so the
+  # address lands and the route never does. Measured three times:
+  #
+  #   14:58:11 default route is now            (empty)
+  #   20:53:32 default route is now            (empty)
+  #
+  # and in that state the Mac cannot originate anything at all. A transparent
+  # proxy only ever sees flows the system was already going to route, so
+  # `connect()` fails before the bridge is consulted: a live session, a healthy
+  # AWDL link, and zero flows.
+  #
+  # `route add` talks to the routing table directly and does not care what
+  # SystemConfiguration thinks of the service. The gateway is deliberately one
+  # nothing answers at — the packets are never meant to arrive, they only have
+  # to be routable so the socket layer hands the flow to the proxy.
+  if ! has_default_route; then
+    say "SystemConfiguration installed no route (Wi-Fi has no link) — adding one directly"
+    route -n add -net default "$SELF_ROUTER" >/dev/null 2>&1 \
+      || route -n add -net default -interface "$IFACE" >/dev/null 2>&1
+  fi
+
+  local route_now
+  route_now=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $2; exit}')
+  if [[ -n "$route_now" ]]; then
+    say "default route is now $route_now"
+  else
+    say "STILL no default route — the Mac cannot originate connections; nothing will work"
+  fi
 }
 
 revert_dhcp() {
   say "reverting to DHCP"
+  # Ours if we added it; harmless if SystemConfiguration owns it, since it
+  # reinstalls its own on the DHCP lease.
+  route -n delete -net default "$SELF_ROUTER" >/dev/null 2>&1 || true
+  route -n delete -net default -interface "$IFACE" >/dev/null 2>&1 || true
   networksetup -setdhcp "$SERVICE"
   networksetup -setdnsservers "$SERVICE" 1.1.1.1 1.0.0.1
   note_change
