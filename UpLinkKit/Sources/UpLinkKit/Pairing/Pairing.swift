@@ -187,3 +187,68 @@ public enum KeySchedule {
         )
     }
 }
+
+/// Proves that the device announcing a fingerprint in `HELLO` is the device
+/// that fingerprint belongs to.
+///
+/// **The gap this closes.** The listener holds one TLS-PSK per paired peer and
+/// TLS selects among them by the identity the client offers. A peer that is
+/// paired can therefore complete the handshake honestly with *its own* key and
+/// then announce *someone else's* fingerprint in `HELLO` — nothing cross-checked
+/// the application-layer claim against the key actually used. On the phone that
+/// claim decides which Mac is shown as connected and, worse, which pairing an
+/// `unpair` over that session applies to.
+///
+/// **Why not the TLS layer.** The obvious fix, and the one this codebase
+/// previously recorded as the plan, was
+/// `sec_protocol_options_set_pre_shared_key_selection_block` on the listener.
+/// Reading the SDK header shows that block is invoked *"when the client must
+/// choose a PSK identity given a hint from its peer"* — it is a client-side
+/// selection hook receiving the server's identity **hint**, not a server-side
+/// observer of the client's identity. It cannot answer the question.
+///
+/// So the binding is done here instead, where it is one HMAC and can be proven
+/// without a device. Only the holder of the private key behind `fingerprint`
+/// can derive the session key, so only that device can produce this tag.
+///
+/// **Honest limit.** The tag is deterministic rather than nonce-bound, so it
+/// costs no extra round trip on a link where the Mac must speak first. That
+/// makes it replayable *in principle* — but only by someone who has seen it,
+/// and it travels inside a TLS session whose key is the very secret being
+/// proven. A different paired peer never observes it. A nonce would close even
+/// that, at the price of a round trip and a fourth handshake frame.
+public enum HelloProof {
+
+    private static let context = Data("uplink.hello.bind.v2".utf8)
+
+    /// The tag `dialer` sends, bound to both identities so it cannot be
+    /// replayed at a different listener.
+    public static func tag(
+        sessionKey: SymmetricKey,
+        dialerFingerprint: String,
+        listenerFingerprint: String
+    ) -> Data {
+        var message = context
+        message.append(Data(dialerFingerprint.utf8))
+        message.append(0x00)
+        message.append(Data(listenerFingerprint.utf8))
+        return Data(HMAC<SHA256>.authenticationCode(for: message, using: sessionKey))
+    }
+
+    /// Constant-time check. `HMAC.isValidAuthenticationCode` does the
+    /// comparison without leaking where two tags first differ.
+    public static func verify(
+        _ candidate: Data,
+        sessionKey: SymmetricKey,
+        dialerFingerprint: String,
+        listenerFingerprint: String
+    ) -> Bool {
+        var message = context
+        message.append(Data(dialerFingerprint.utf8))
+        message.append(0x00)
+        message.append(Data(listenerFingerprint.utf8))
+        return HMAC<SHA256>.isValidAuthenticationCode(
+            candidate, authenticating: message, using: sessionKey
+        )
+    }
+}

@@ -23,6 +23,28 @@ public actor CellularDialer: DestinationDialer {
     }
 
     public func connect(to destination: StreamOpen) async throws -> DestinationConnection {
+        let parameters = Self.parameters(for: destination, requiredInterface: requiredInterface)
+
+        let endpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host(destination.host),
+            port: NWEndpoint.Port(rawValue: destination.port) ?? .https
+        )
+
+        let connection = NWConnection(to: endpoint, using: parameters)
+        let wrapper = NWDestinationConnection(connection: connection)
+        try await wrapper.start(on: queue)
+        return wrapper
+    }
+
+    /// How a proxied connection leaves the phone.
+    ///
+    /// Split out from ``connect(to:)`` so the egress pinning — which is the
+    /// product's entire claim — can be asserted directly. A test that rebuilt
+    /// these parameters itself would prove nothing about what ships.
+    static func parameters(
+        for destination: StreamOpen,
+        requiredInterface: NWInterface.InterfaceType?
+    ) -> NWParameters {
         let parameters: NWParameters
         switch destination.proto {
         case .tcp:
@@ -39,20 +61,37 @@ public actor CellularDialer: DestinationDialer {
             parameters.requiredInterfaceType = requiredInterface
         }
 
+        // NEW HAZARD WITH THE CABLE, and it points the wrong way down the very
+        // link that carries the bridge.
+        //
+        // Plugging the phone into the Mac gives the phone a wired Ethernet
+        // interface. If the Mac ever has a route to share — Personal Hotspot in
+        // the other direction, an old `standalone-mode` address left behind,
+        // internet sharing switched on — the phone can egress back up the cable
+        // instead of over cellular. The bridge would then carry traffic from
+        // the Mac to the phone and straight back to the Mac: the user is not
+        // bypassing anything, and the egress report would say `.wiredEthernet`
+        // rather than `.cellular` only *after* the fact.
+        //
+        // `requiredInterfaceType` alone does not cover this. It is documented
+        // as a preference that Network.framework may fall back from, which is
+        // precisely how a Wi-Fi fallback was observed being reported as a
+        // successful cellular dial. Prohibiting the interface outright is the
+        // half that cannot be negotiated away.
+        //
+        // Wired only. Loopback is deliberately NOT prohibited: a destination on
+        // the phone's own loopback is not a way around the bridge, and banning
+        // it breaks every integration test that points "the internet" at a
+        // local server — which is how the datagram and refused-destination
+        // suites are able to run without a network at all.
+        parameters.prohibitedInterfaceTypes = [.wiredEthernet]
+
         // Never route a proxied connection through a proxy configured on the
         // phone — that would silently re-route the user's traffic somewhere
         // they did not ask for.
         parameters.preferNoProxies = true
 
-        let endpoint = NWEndpoint.hostPort(
-            host: NWEndpoint.Host(destination.host),
-            port: NWEndpoint.Port(rawValue: destination.port) ?? .https
-        )
-
-        let connection = NWConnection(to: endpoint, using: parameters)
-        let wrapper = NWDestinationConnection(connection: connection)
-        try await wrapper.start(on: queue)
-        return wrapper
+        return parameters
     }
 }
 
