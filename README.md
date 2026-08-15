@@ -56,7 +56,7 @@ what forces egress through the cellular radio.
 | macOS menu bar app + transparent proxy extension | **Builds**, universal TCP/UDP capture |
 | TCP over the bridge | **Verified on hardware** — carrier IP, cellular egress, 98 Mbps |
 | UDP / DNS over the bridge | **Fixed off-device, not yet proven on hardware** |
-| QUIC over the bridge | **Untested** — UDP 443 has never been exercised |
+| QUIC over the bridge | **Verified on hardware 2026-08-15** — 150 MB sustained at 88 Mbps, radio off; matches the no-bridge control, so the bridge is not the bottleneck |
 | Running with no network of the Mac's own | **Works, with a setup step** — see below |
 | Coverage harness | **Done** — measures leaks rather than assuming |
 | Reconnect (keyed on identity, backoff) | **Done**, tested |
@@ -97,14 +97,15 @@ been observed working end to end on hardware with no hotspot. Still unproven:
   destination killed by its own first reply, a stream closed when the client
   stopped sending, and a UDP session OPEN whose placeholder destination was
   dialled and closed the stream. All three are pinned by tests against real
-  sockets. None has been confirmed on a phone.
-- **QUIC.** UDP 443 is the bulk-UDP case and is a different shape from DNS:
-  long-lived, high-rate, many datagrams per destination.
+  sockets, and UDP has now been confirmed on a phone — DNS and QUIC both crossed
+  the bridge in the 2026-08-15 run.
+- ~~**QUIC.**~~ **Done, 2026-08-15.** UDP 443 is the bulk-UDP case and a
+  different shape from DNS — long-lived, high-rate, many datagrams per
+  destination — and it carries: 150 MB sustained at 88 Mbps with the radio off,
+  matching the no-bridge control.
 
 - ~~**The whole wired transport, on hardware.**~~ **Done, 2026-08-15** — see
   `docs/device-test-log.md`. Re-run any time with `./scripts/verify-wired.sh`.
-- **QUIC / HTTP-3 at bulk rates.** UDP 443 is still unmeasured; the `curl` here
-  has no HTTP/3.
 - **The phone locked, under sustained load.** The extension port answering says
   it should hold, but it has not been left locked with traffic running. Every part of it is proven off
   device against a fake `usbmuxd` — framing, the byte-swapped `PortNumber`,

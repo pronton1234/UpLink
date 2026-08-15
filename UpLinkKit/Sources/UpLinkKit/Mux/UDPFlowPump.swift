@@ -97,16 +97,40 @@ public func pumpDatagramFlow(
         await withTaskGroup(of: Void.self) { group in
             // App → phone → destinations
             group.addTask {
+                // Declared INSIDE the task, not outside it: only this
+                // direction writes it, and sharing a `var` across a task group
+                // is a data race the compiler rejects outright.
+                var seenDestinations = Set<String>()
                 while true {
                     guard let batch = try? await flow.read(), !batch.isEmpty else { break }
                     for (datagram, endpoint) in batch {
                         guard case let .hostPort(host, port) = endpoint else { continue }
 
                         if policy.shouldCapture(remoteEndpoint: "\(host):\(port)") {
-                            // Debug, not error: this fires per datagram, and
-                            // QUIC sends thousands. The routing decision is
-                            // still visible at error level from the phone's
-                            // "udp dial ok" for each destination.
+                            // ONE error-level line per destination, then debug
+                            // for the rest.
+                            //
+                            // Per-datagram at error level is not an option —
+                            // QUIC sends thousands, and a 150 MB HTTP/3
+                            // transfer would bury every other line in the log.
+                            // But debug-only was the opposite mistake: debug
+                            // lives in the memory ring buffer and is the first
+                            // thing evicted, so `log show` never surfaces it.
+                            //
+                            // That left UDP unable to answer the question this
+                            // codebase insists on asking — "confirm a flow
+                            // actually traversed the bridge, by grepping the
+                            // proxy log for that exact destination IP". TCP
+                            // could answer it; UDP could not, which is exactly
+                            // the traffic class where a silent leak matters
+                            // most, because QUIC and DNS are what bypass a
+                            // proxy when something is wrong.
+                            //
+                            // First-sighting is the whole fix: one greppable
+                            // line per destination, no volume.
+                            if seenDestinations.insert("\(host):\(port.rawValue)").inserted {
+                                log.error("udp open  \("\(host)", privacy: .public):\(port.rawValue)")
+                            }
                             log.debug("udp -> bridge \("\(host)", privacy: .public):\(port.rawValue) \(datagram.count)B")
                             _ = try? await stream.sendDatagram(
                                 datagram, to: "\(host)", port: port.rawValue

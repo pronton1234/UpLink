@@ -37,7 +37,7 @@ PASS — no other way out, and the proxy carried the request.
 | 2 | TCP, ignores proxy | bridged ✓ 216.77.46.31 |
 | 3 | TCP, raw socket | bridged ✓ 216.77.46.31 |
 | 4 | UDP (DNS) | bridged ✓ 216.77.49.33 |
-| 5 | QUIC / HTTP-3 | n/a — curl has no HTTP/3 |
+| 5 | QUIC / HTTP-3 | **bridged ✓** — see below |
 | 6 | **IPv6** | **bridged ✓ 2600:387:15:6712::7** |
 | 7 | ICMP | blocked ✓ (cannot leak) |
 
@@ -94,14 +94,72 @@ rounds of review. Written up in REGRESSIONS.md.
 ~6 seconds, unattended. Before the fixes this state was permanent until the
 cable was physically unplugged.
 
+### QUIC / HTTP-3 — VERIFIED, 2026-08-15
+
+System `curl` has no HTTP/3; Homebrew's does (`/opt/homebrew/opt/curl/bin/curl`).
+`--http3-only` is what makes the test mean anything — plain `--http3` falls back
+to TCP and would prove nothing.
+
+Radio off, no IPv4 default via en0:
+
+```
+cloudflare-quic.com -> proto=3 code=200 ip=2606:4700::6812:1a0e  t=0.22s
+www.google.com      -> proto=3 code=200 ip=2001:4860:4828:7700:: t=0.22s
+```
+
+Both over IPv6, and the proxy claimed the flow at that instant:
+
+```
+claim udp by curl-5555494…
+udp claim
+udp opened-flow
+udp stream open
+```
+
+Bulk and sustained, against a 272 MB object on `dl.google.com` (which does serve
+HTTP/3), with the Wi-Fi control run immediately after:
+
+| Transfer | Bridge, radio off | Wi-Fi, no bridge |
+| --- | --- | --- |
+| QUIC 50 MB | **86.3 Mbps** | 80.6 Mbps |
+| TCP 50 MB | **264.7 Mbps** | 235.9 Mbps |
+| QUIC 150 MB | **88.2 Mbps**, 13.6s, all 150,000,000 bytes | 86.4 Mbps, 13.9s |
+
+**QUIC is ~3x slower than TCP here, and the bridge is not the reason.** The same
+gap appears with the bridge out of the path entirely — it is curl's userspace
+QUIC stack. Every bridge number is marginally *higher* than its Wi-Fi control.
+
+**The control is the whole point of this section.** The first bulk attempt used
+`speed.cloudflare.com` and failed with 0 bytes while TCP to the same host got
+212 Mbps, which reads exactly like "the bridge breaks bulk QUIC". It does not:
+that endpoint refuses HTTP/3 over Wi-Fi too. Reporting the first result without
+the control would have invented a bridge defect.
+
 ### Still not exercised
 
-- **QUIC / HTTP-3** — this `curl` has no HTTP/3, so UDP 443 at bulk rates is
-  still unmeasured. It is a different shape from DNS: long-lived, high-rate,
-  many datagrams per destination.
 - **The phone locked**, sustained. The extension port answering means it
   *should* hold; it has not been left locked under load.
 - **Sustained throughput** over tens of minutes, and battery cost.
+### UDP was not provable, and now is
+
+This run exposed a gap in the one discipline this project insists on: *confirm a
+flow traversed the bridge by grepping the proxy log for that exact destination
+IP.* TCP could answer that. UDP could not — the destination was logged at
+`debug`, which lives in the memory ring buffer and never reaches `log show`.
+
+That is the traffic class where it matters most, because QUIC and DNS are what
+bypass a proxy when something is wrong.
+
+Fixed by logging one error-level line per destination on first sighting, debug
+thereafter. Verified on device, radio off:
+
+```
+request: proto=3 code=200 ip=2606:4700::6812:1b0e
+udp open  2606:4700::6812:1b0e:443
+```
+
+Volume check, because the original per-datagram comment was right that error
+level would flood: **1 `udp open` line for a 50 MB QUIC transfer.**
 
 ## Wired transport — the checklist, 2026-08-15
 
