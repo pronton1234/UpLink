@@ -623,7 +623,20 @@ final class MenuBarModel {
         case .unintelligible:
             // Ask again rather than act on noise — and in particular do NOT
             // tear the tunnel down over one unparsed reply.
-            break
+            //
+            // But DO re-announce the relay. "unavailable" lands here, and the
+            // extension answers that whenever it has no client yet — which is
+            // precisely the window in which the relay's one announcement was
+            // dropped. Observed on hardware: the app announced port 54636, the
+            // extension never received it, and nothing retried for twenty
+            // minutes while the phone sat there answering.
+            //
+            // The re-announce is now on every not-connected reply rather than
+            // an enumerated subset, because each time it was gated on a subset
+            // the real failure turned out to be the case left out.
+            if case let .ready(udid, port, _) = relayState, !userDisconnected {
+                _ = await sendToExtension("usbrelay:\(port):\(udid)")
+            }
         }
     }
 

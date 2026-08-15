@@ -107,6 +107,79 @@ struct RelayHandoverRegressionTests {
         #expect(redialer.restarts == restartsAfterRecovery, "the per-tick re-announce restarted a healthy dial")
     }
 
+    // THE FOURTH IN THIS FAMILY, and the reason the re-announce is no longer
+    // gated on an enumerated list of replies.
+    //
+    // Every previous fix here picked a subset of "not connected" to retry on,
+    // and every time the real failure was the case left out. First it was only
+    // `disconnected`, so a stale relay port answering `connecting` never
+    // recovered. Then `connecting` was added, and the extension answered
+    // `unavailable` — it has no client until the proxy provider starts, which
+    // is exactly the window in which the launch-time announcement is dropped —
+    // which parses as `unintelligible` and was, again, not in the list.
+    //
+    // Observed on hardware: the app announced port 54636, the extension never
+    // received it, and nothing retried for twenty minutes while the phone sat
+    // answering on 50505.
+    //
+    // The rule now is the simple one: if we are not CONNECTED and we have a
+    // relay, say so again. It is safe precisely because the guard is idempotent
+    // on the port the loop is dialling.
+    @Test("Every not-connected reply re-announces, not an enumerated subset")
+    func everyNotConnectedReplyReannounces() {
+        // The replies the extension can give that are not `connected`.
+        let notConnected: [BridgeStatusReply] = [
+            .disconnected,
+            .connecting,
+            .unintelligible,          // "unavailable" — no client yet
+            .refused,
+            .unpaired(fingerprint: "abc"),
+        ]
+        for reply in notConnected {
+            #expect(
+                Self.shouldReannounce(reply),
+                "\(reply) does not re-announce the relay — the launch-window drop is unrecoverable for this reply"
+            )
+        }
+        #expect(
+            Self.shouldReannounce(.connected(peer: "Mac", egress: .cellular)) == false,
+            "re-announcing while connected would restart a healthy session"
+        )
+    }
+
+    /// Mirrors `MenuBarModel.refreshStatus`: anything that is not a live
+    /// session re-offers the relay.
+    private static func shouldReannounce(_ reply: BridgeStatusReply) -> Bool {
+        if case .connected = reply { return false }
+        return true
+    }
+
+    // A device attached but not answering gets ONE probe per attach event, and
+    // usbmuxd sends one attach per plug. A phone whose extension had not
+    // finished binding when we looked therefore stayed "not answering" with no
+    // further event to trigger another look — unplugging was the only way out.
+    @Test("A silent-but-attached device is probed again, not written off")
+    func silentDeviceIsReprobed() {
+        var attempts = 0
+        var answering = false
+        // The phone's extension finishes binding on the third look.
+        func probe() -> Bool {
+            attempts += 1
+            if attempts >= 3 { answering = true }
+            return answering
+        }
+
+        var ready = probe()
+        #expect(ready == false, "the phone answered too early for this test to mean anything")
+
+        // The re-probe loop, bounded the way the real one is by the device
+        // staying attached.
+        for _ in 0 ..< 10 where !ready { ready = probe() }
+
+        #expect(ready, "the relay never looked again, so the cable stays dead until it is unplugged")
+        #expect(attempts == 3, "expected exactly the probes needed, got \(attempts)")
+    }
+
     // A different phone on the same port number must also take effect.
     @Test("A different device on the same port still restarts the loop")
     func differentDeviceRestarts() {

@@ -45,6 +45,8 @@ final class USBRelay {
     var onStateChange: ((USBRelayState) -> Void)?
 
     private var watchTask: Task<Void, Never>?
+    /// Retries the port probe while a device stays attached but silent.
+    private var reprobeTask: Task<Void, Never>?
     private var listener: NWListener?
 
     /// Live relay connections, by identity, so teardown can CLOSE them.
@@ -68,6 +70,8 @@ final class USBRelay {
     func stop() {
         watchTask?.cancel()
         watchTask = nil
+        reprobeTask?.cancel()
+        reprobeTask = nil
         // Cleared so an `attached` still suspended mid-probe fails its
         // `isStillCurrent` check and cannot publish `.ready` after teardown.
         device = nil
@@ -129,6 +133,15 @@ final class USBRelay {
             guard isStillCurrent(device) else { return }
             teardown()
             state = .attachedNotAnswering
+            // KEEP TRYING while the cable is in.
+            //
+            // The probe happens once per attach event, and usbmuxd sends one
+            // attach per plug — so a phone whose extension had not finished
+            // binding when we looked stayed "not answering" forever, with no
+            // further event to trigger another look. Unplugging and replugging
+            // was the only way out, which is not something a user should have
+            // to discover.
+            scheduleReprobe(of: device)
             return
         }
         guard isStillCurrent(device) else { return }
@@ -163,6 +176,8 @@ final class USBRelay {
 
     private func detached(_ deviceID: UInt32) {
         guard device?.deviceID == deviceID else { return }
+        reprobeTask?.cancel()
+        reprobeTask = nil
         log.error("usb: detached \(self.device?.udid ?? "?", privacy: .public)")
         device = nil
         answeringPort = nil
@@ -191,6 +206,25 @@ final class USBRelay {
         }
         log.error("usb: \(device.udid, privacy: .public) answered on neither port — is UpLink running on the phone?")
         return nil
+    }
+
+    /// Re-probes a device that is attached but was not answering.
+    ///
+    /// Stops as soon as it answers, the device goes away, or the relay is torn
+    /// down — `attached` re-runs the whole path, so a success installs the
+    /// listener and announces it exactly as a fresh attach would.
+    private func scheduleReprobe(of device: USBDevice) {
+        reprobeTask?.cancel()
+        reprobeTask = Task { [weak self] () -> Void in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled, let self else { return }
+                guard self.isStillCurrent(device) else { return }
+                if case .ready = self.state { return }
+                await self.attached(device)
+                if case .ready = self.state { return }
+            }
+        }
     }
 
     // MARK: - Loopback listener
