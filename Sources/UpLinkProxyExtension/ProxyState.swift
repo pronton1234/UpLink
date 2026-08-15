@@ -272,10 +272,20 @@ actor ProxyState {
         // user's one obvious way to stop bridging was a lie.
         if message == "disconnect" {
             log?.error("ipc: disconnect requested")
-            await host.stop()
-            // `stop()` now routes through `sessionFinished`, which emits
-            // `.sessionEnded` — that is what clears `hasSession`, releases the
-            // claim path, and lets the app drop the route tunnel.
+            // `endSession`, NOT `stop()`.
+            //
+            // `stop()` cancels the listener and the path monitor as well as the
+            // session, and nothing restarted them — so after a Disconnect the
+            // Mac was off the air entirely and an already-paired phone could
+            // never reconnect. The only ways back were "Show Pairing Code",
+            // which rebuilds the listener as a side effect, or relaunching the
+            // app. Disconnecting one session is not a reason to stop being
+            // findable.
+            //
+            // This still emits `.sessionEnded`, which is what clears
+            // `hasSession`, releases the claim path, and lets the app drop the
+            // route tunnel.
+            await host.endSession()
             return "ok"
         }
 

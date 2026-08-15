@@ -504,8 +504,10 @@ public actor MacSessionHost {
             try? await channel.send(FrameEncoder.encode(Multiplexer.unpairedFrame()))
             tombstones.delivered(fingerprint)
             await channel.close()
-            try? restartListener()
-            await awaitListening()
+            // Rebuild so the delivered tombstone's key stops being offered.
+            // Through `rebuildAdvertisement`, not `try?`: a swallowed failure
+            // here leaves the Mac with no listener at all.
+            await rebuildAdvertisement(because: "tombstone delivered to \(fingerprint)")
             return
         }
 
@@ -580,8 +582,7 @@ public actor MacSessionHost {
     public func revoke(_ device: PairedDevice) async {
         tombstones.revoke(device)
         log.error("tombstoned \(device.name, privacy: .public) — will tell it when it next connects")
-        try? restartListener()
-        await awaitListening()
+        await rebuildAdvertisement(because: "revoked \(device.fingerprint)")
     }
 
     /// A device that has paired again is no longer revoked.
@@ -606,8 +607,7 @@ public actor MacSessionHost {
         // hold AWDL open for a device that has gone.
         await presence.release()
         await sessionFinished(fingerprint: fingerprint, channel: nil)
-        try? restartListener()
-        await awaitListening()
+        await rebuildAdvertisement(because: "peer \(fingerprint) unpaired us")
     }
 
     /// Pulls the sender's fingerprint out of a HELLO payload.
