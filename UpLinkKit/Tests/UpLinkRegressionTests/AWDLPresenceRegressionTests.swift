@@ -17,11 +17,36 @@ import Network
 @Suite("Regression: AWDL presence targets the right peer")
 struct AWDLPresenceRegressionTests {
 
+    // THE FORMAT THAT ACTUALLY REACHES THIS. `MacSessionHost.describe` builds
+    // "\(host):\(port)" for a .hostPort endpoint, so the separator is a COLON.
+    // The first version of this suite only tested the dot form — the one
+    // visible in the `accept:` log line — so it was green against an input the
+    // code never receives, while production held towards a host with ":52540"
+    // glued on. Observed in the log as:
+    //   holding AWDL open towards fe80::2063:e4ff:fed6:7ce0%awdl0:52540
+    @Test("The colon-separated form MacSessionHost actually produces")
+    func parsesColonSeparatedAddress() {
+        #expect(
+            AWDLPresence.awdlHost(in: "fe80::2063:e4ff:fed6:7ce0%awdl0:52540")
+                == "fe80::2063:e4ff:fed6:7ce0%awdl0"
+        )
+    }
+
     @Test("A scoped IPv6 peer keeps its scope and loses its port")
     func parsesScopedAddress() {
         #expect(
             AWDLPresence.awdlHost(in: "fe80::2063:e4ff:fed6:7ce0%awdl0.53632")
                 == "fe80::2063:e4ff:fed6:7ce0%awdl0"
+        )
+    }
+
+    // A bare literal has no port, and is full of colons. "Split on the last
+    // colon" would return `fe80:` here, which is why the search starts after
+    // the scope rather than at the end of the string.
+    @Test("A bare scoped literal is not mistaken for having a port")
+    func bareLiteralKeepsItsTail() {
+        #expect(
+            AWDLPresence.awdlHost(in: "fe80::1%awdl0") == "fe80::1%awdl0"
         )
     }
 

@@ -119,17 +119,29 @@ public actor AWDLPresence {
 
     /// The host part of a peer description, but only when it is AWDL.
     ///
-    /// `NWEndpoint`'s description for a scoped IPv6 peer looks like
-    /// `fe80::2063:e4ff:fed6:7ce0%awdl0.53632` — note the port is separated by a
-    /// dot, not a colon, which is why this does not reuse `CapturePolicy.host`.
+    /// TWO formats reach this, and getting it wrong is silent. `MacSessionHost`
+    /// builds `"\(host):\(port)"` for a `.hostPort` endpoint, giving
+    /// `fe80::2063:e4ff:fed6:7ce0%awdl0:52540` — colon-separated. The `accept:`
+    /// log line prints `String(describing:)` instead, giving
+    /// `fe80::…%awdl0.52540` — dot-separated.
+    ///
+    /// The first version handled only the dot form, because that is the one
+    /// visible in the log, and its test pinned that form too. So the test was
+    /// green against an input the code never actually receives, and in
+    /// production the hold was made towards a host with `:52540` glued on.
+    ///
+    /// The separator is located AFTER the `%` scope, which is what makes this
+    /// unambiguous: an IPv6 literal is full of colons, so "split on the last
+    /// colon" would turn a bare `fe80::1` into `fe80:`.
     static func awdlHost(in description: String) -> String? {
-        guard description.contains("%awdl") else { return nil }
-        // Trim a trailing `.<port>` if present. The scope id contains no dots,
-        // and neither does an IPv6 literal, so the last dot is the port
-        // separator when there is one.
-        guard let dot = description.lastIndex(of: ".") else { return description }
-        let port = description[description.index(after: dot)...]
+        guard let scope = description.range(of: "%awdl") else { return nil }
+
+        let afterScope = description[scope.lowerBound...]
+        guard let separator = afterScope.lastIndex(where: { $0 == ":" || $0 == "." }) else {
+            return description
+        }
+        let port = afterScope[afterScope.index(after: separator)...]
         guard !port.isEmpty, port.allSatisfy(\.isNumber) else { return description }
-        return String(description[description.startIndex ..< dot])
+        return String(description[description.startIndex ..< separator])
     }
 }
