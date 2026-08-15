@@ -56,6 +56,11 @@ public actor MacSessionHost {
     // silence that was measured: the phone browses, finds nothing, and the Mac
     // logs no error because from its point of view nothing went wrong.
 
+    /// Holds a unicast socket to the peer between sessions, so the kernel keeps
+    /// scheduling AWDL and Bonjour keeps advertising on it. See ``AWDLPresence``
+    /// for the measurement behind this.
+    private lazy var presence = AWDLPresence(queue: queue)
+
     private var pathMonitor: NWPathMonitor?
     private var lastPathSignature: PathSignature?
     private var pathDebounceTask: Task<Void, Never>?
@@ -134,6 +139,7 @@ public actor MacSessionHost {
     }
 
     public func stop() {
+        Task { [presence] in await presence.release() }
         pathDebounceTask?.cancel()
         pathDebounceTask = nil
         pathMonitor?.cancel()
@@ -431,6 +437,9 @@ public actor MacSessionHost {
         let fingerprint = Self.identity(inHello: hello) ?? "unknown"
 
         activeFingerprint = fingerprint
+        // The session's own socket now keeps AWDL scheduled; ours would be
+        // redundant airtime.
+        await presence.release()
         emit(.sessionStarted(fingerprint: fingerprint, peerDescription: description))
 
         let token = await initiator.onEgressChange { [weak self] interface in
@@ -461,8 +470,18 @@ public actor MacSessionHost {
         guard activeFingerprint != nil else { return }   // already ended
         activeFingerprint = nil
         initiator = nil
+        let lastPeer = peerDescription
         peerDescription = nil
         await channel?.close()
+
+        // Take the hold BEFORE announcing the end, so there is no window in
+        // which nothing is keeping AWDL scheduled. Without it the kernel drops
+        // to Low Power, mDNS stops transmitting on awdl0 — measured silence of
+        // 102 seconds — and the phone cannot find the Mac to dial it, which is
+        // what kept the schedule down in the first place.
+        if let lastPeer {
+            await presence.hold(peerDescription: lastPeer)
+        }
         emit(.sessionEnded(fingerprint: fingerprint))
     }
 
