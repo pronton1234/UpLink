@@ -486,11 +486,265 @@ discovery.
 would have accepted `.alreadyConsumed` — the exact failure under test — and
 passed. It asserts by name now.
 
-### Two gaps left open deliberately
+### Two gaps left open deliberately — one now closed, and not the way it said
 
-- `handleSession` now refuses a fingerprint this Mac holds no key for, but does
+- ~~`handleSession` refuses a fingerprint this side holds no key for, but does
   **not** bind the claim to the PSK identity actually negotiated, so one paired
-  phone can still announce another's fingerprint. That needs
+  peer can still announce another's fingerprint.~~ **Closed**, but the fix
+  named here was wrong. It said to install
   `sec_protocol_options_set_pre_shared_key_selection_block` on the listener.
-- The same missing block is why a wrong pairing code and a revoked device both
-  produce `-9816` with nothing to tell them apart.
+  Reading the SDK header shows that block is invoked *"when the **client** must
+  choose a PSK identity given a hint from its peer"* — a client-side selection
+  hook receiving the server's identity **hint**, not a server-side observer of
+  the client's identity. It cannot answer the question, and building on it
+  would have produced a fix that looked right and checked nothing.
+
+  The binding is now an application-layer HMAC over the session key
+  (``HelloProof``), carried in the `HELLO` frame. Only the holder of the private
+  key behind a fingerprint can derive that key, so only that device can produce
+  the tag. Guarded by `HelloBindingRegressionTests`, which run without a device.
+
+  *Lesson, and it is the same one twice now: a plan recorded in a doc is not a
+  verified plan.* This one sat in the file as though it were settled work
+  awaiting time, when in fact the API named does not do what the note assumed.
+  Check the header before writing down the fix.
+
+- A wrong pairing code and a revoked device both produce `-9816`. Still open in
+  the transport, but no longer the only signal: the listener sends an explicit
+  `pairFailure` frame carrying a `PairingError` wire code, so the *dialer* is
+  told which it was even though the TLS error alone cannot say.
+
+## Wired transport, 2026-08-15 — the cable becomes the only path
+
+AWDL, Bonjour discovery, `TransportProfile` and the Wi-Fi watchdog are gone. The
+Mac reaches the phone through `usbmuxd`, which needs no network interface at
+all — which is the entire point, because the configuration the product exists
+for is a Mac whose Wi-Fi is associated with nothing.
+
+New permanent tests:
+
+| Suite | Guards |
+| --- | --- |
+| `USBMuxProtocolTests` | The framing and the byte-swapped `PortNumber`. An unswapped 50505 asks for 18885, and the daemon then answers "connection refused" for a port nothing was listening on — an error pointing at entirely the wrong thing. |
+| `USBMuxClientTests` | Attach/detach streaming, `Connect` refusal, carried-over coalesced bytes, and above all: **a device usbmuxd reaches over the network is never offered.** Wi-Fi-paired devices differ from cabled ones only by `ConnectionType`, so using one would produce a bridge that appears to work and dies with the Wi-Fi. |
+| `HelloBindingRegressionTests` | The impersonation gap above. |
+| `DevicePinningRegressionTests` | A pairing is pinned to the UDID it was made over, and the legacy-record migration adopts **once** rather than staying a permanent wildcard. |
+| `CellularEgressRegressionTests` | The phone must not egress back up the cable. Plugging in gives the phone a wired interface pointing at the Mac; if the Mac has any route to share, traffic goes Mac → phone → Mac and bypasses nothing while reporting a healthy session. |
+
+Three things worth keeping:
+
+**A blocking `read` outlives the descriptor it was given.** `RawSocket.close()`
+called `shutdown` then `close` while a read was blocked on another thread. The
+number is immediately free for the kernel to hand to the next socket any thread
+opens, so the blocked read resumed against an unrelated connection and the
+following `close` shut down someone else's. It took the whole parallel test
+process down — no failure, no crash report, just a run that stopped. Serial runs
+passed, which is exactly how it hid. The descriptor is now reference-counted:
+`close()` only ever `shutdown`s, and whoever leaves the last syscall closes.
+
+**A closed descriptor left in a list is the same bug one level up.** The fake
+daemon's `ListDevices` and refused-`Connect` paths closed their descriptor but
+left the number in `openFDs`, so `stop()` later `shutdown`s whatever socket has
+since been given that number.
+
+**A tautological test proves nothing.** The first version of the egress test
+built `NWParameters` itself and asserted on what it had just written. It passed
+without touching the shipping code. `CellularDialer.parameters(for:)` is split
+out so the assertion is against what actually ships — and doing that immediately
+found that prohibiting `.loopback` broke every integration test that points "the
+internet" at a local server.
+
+### The review pass on the wired transport — what a fresh reading found
+
+The change above was written, built, and green on 286 tests before anyone read
+it end to end. A review pass then found thirteen defects, none of which any test
+caught, and several of which were the *same shapes this file already records*.
+Worth listing because the repeat offenders are the point.
+
+**Shapes that recurred:**
+
+- **Teardown that does not say which session it is tearing down.** A superseded
+  session's task runs its tail *after* the replacement has installed itself,
+  sees non-nil state, and wipes it. The new session then carries traffic while
+  `status()` reports "disconnected" and `unpair` tombstones a Mac that is
+  bridging right now. Fixed with a generation stamp — the same device
+  `listenerGeneration` already used one level down, applied to sessions.
+- **Cancelling a task that cannot observe cancellation.** `sessionTask?.cancel()`
+  was supposed to enforce "only one Mac bridges at a time". The task is parked
+  in `channel.receive()`, which suspends on a continuation only a network
+  callback resumes, so cancellation is invisible and two Macs proxied at once.
+  Closing the channel is the only thing that ends a session — which this file
+  already says, one side over. The relay had the identical bug with its pumps.
+- **`endSession(channel: nil)`.** Fixed on the Mac earlier in the same change,
+  then written afresh on the phone with the explanatory comment sitting directly
+  above it. The comment was copied; the argument was not.
+- **Wired up to nothing.** `restoreTombstones`/`currentTombstones` had no
+  callers, so revocations died with the extension; meanwhile the Mac still asked
+  *its* extension for tombstones it no longer owns and wrote a `revokedDevices`
+  key nothing read. This is the `clearUnpairedByPeer` shape exactly.
+- **A guard that reads the wrong variable.** `unpair` disconnected when
+  `state.isConnected` — true for *any* live session — so removing Mac B tore
+  down a healthy bridge with Mac A. Two lines above sat the comment explaining
+  that this exact cross-talk had already been fixed once by addressing the
+  message.
+
+**New shapes worth naming:**
+
+- **A one-way door.** Disconnect cancelled the redial loop but left `relayPort`
+  set, so status answered "connecting" forever and the app's re-announcement —
+  which only fires on "disconnected" — could never restart it. The only way back
+  to a working bridge was to physically unplug the cable. *If an action has no
+  inverse in the UI, that is the bug, not a missing feature.*
+- **State published before it was verified.** The HELLO proof was checked inside
+  the frame loop, after `activeFingerprint` and `.sessionStarted` had already
+  been set from the claimed value — and `.sessionStarted` clears a pending
+  "unpaired" notice. A short window, but it made the binding partly ceremonial.
+  The proof arrives in a frame already in hand; there was no reason to defer it.
+- **`Thread.sleep` inside a `@MainActor` type.** Up to three seconds of frozen
+  UI on the attach path, i.e. every replug.
+- **`isCancelled` is not `isFinished`.** A prune written as
+  `removeAll { $0.isCancelled }` never removes a task that completed normally.
+- **Unstructured tasks have no order.** One `Task` per relay state change, each
+  awaiting a provider round trip, can deliver `usbrelay:<stale port>` after
+  `usbgone`. Serialised through a single consumer.
+- **Ordering around a throw.** `restartListener` cancelled the old listener
+  before bumping the generation, so a throwing `NWListener(using:)` left a
+  corpse that failed every rebuild and took the phone off the air permanently,
+  silently.
+
+**The lesson that generalises:** every one of these lives on a path no test
+reaches — supersession, teardown, an error branch, an explicit user action with
+no inverse. The suite is good at the protocol and useless at the lifecycle.
+Reading the diff found in one pass what 286 green tests did not.
+
+### Round two — fixes that were themselves wrong
+
+The thirteen defects above were fixed, and a second reading found that four of
+the fixes were incomplete and three had introduced new bugs. Recording it
+because the failure mode is specific and repeatable: **a fix aimed at one
+caller, applied to one caller.**
+
+- The generation stamp that stopped a dying session clearing its replacement
+  was added to `sessionFinished` — and then `peerUnpaired` passed
+  `sessionGeneration` (always the current one) straight back into it, and
+  `MacSessionClient` never got the stamp at all. Same defect, two sites, one
+  fixed.
+- Making `unpair:` always reach the extension was right, and it walked straight
+  into a `wrong-peer` early return that then swallowed the removal, the
+  tombstone and the rebuild — so removing a Mac while a *different* Mac was
+  bridging did nothing at all. The fix re-created the exact bug it was fixing,
+  through a guard written for the old calling convention.
+- `disconnectedByUser` could never be read, because `disconnect` nilled the very
+  `relayUDID` the guard compared against. Fixing that made **Reconnect** dead
+  instead: with the UDID preserved, a re-announcement for the same cable no
+  longer cleared the flag, and nothing else did — so the menu item existed and
+  silently did nothing. Two states, and the code could only ever be in the wrong
+  one. It needed a verb of its own.
+- The phone read `.unpaired` without binding the fingerprint the wire already
+  carried, removing `activePeerFingerprint` instead — so a notice about Mac A
+  arriving while Mac B was live deleted **B's** pairing and then stopped the
+  whole tunnel, taking the listener off the air for every other paired Mac. The
+  Mac's side had bound it correctly all along; nobody checked the other end.
+
+**A race is closed by structure, not by a test.** The concurrent-accept
+interleaving was fixed by making the install between claiming the session slot
+and setting `sessionTask` contain no `await` whatsoever — the superseded channel
+is closed in a detached task, and the unpair handler is passed to
+`BridgeResponder.init` rather than registered with one. A test was written for
+it, and then the suspension was deliberately reintroduced to see it fail: **it
+passed anyway.** Real handshakes do not line the timing up. The test is kept as
+a consistency check and labelled as exactly that. A test that cannot fail is not
+evidence, and leaving it looking like evidence is worse than having none.
+
+**What did work:** deliberately breaking the code to confirm the test notices.
+The generation-stamp test fails on all three of its assertions with the guard
+disabled; the concurrency test does not. That five-minute check is the only
+thing separating the two, and without it both would have been reported as
+proven.
+
+### A fake built from the same assumptions cannot catch a wrong assumption
+
+`USBMuxCodec.ResultCode.badVersion` was written as **5**. It is **6**. Every
+one of the 23 codec tests passed, because `FakeUSBMuxDaemon` was written from
+the same reading of the protocol as the client — so both sides agreed on a
+number Apple does not use, and the suite confirmed the agreement rather than the
+protocol. The client then rejected the daemon's real answer as "unknown Result
+number 6", turning a precise, actionable error into a parse failure.
+
+Found in about a minute by `spike/usb-probe --selftest`, which talks to the real
+`/var/run/usbmuxd` — **with no device attached.** `ListDevices` and `Listen`
+both answer on an empty Mac, and a wrong header version, message type, or plist
+body fails them. The circularity had been sitting there the whole time behind a
+green suite.
+
+Two changes came out of it:
+
+- The result code is corrected, and pinned by a test that asserts 5 is *not*
+  `badVersion` as well as that 6 is.
+- An unrecognised result number is now **carried** (`.unknownResult(Int)`)
+  rather than thrown. Throwing discarded the one piece of information the daemon
+  was offering, and would do the same for any code a future macOS adds.
+
+**The general rule:** when a test double models a protocol you do not own, the
+double and the code under test share an author and therefore share their
+mistakes. Something outside that loop has to be consulted at least once. Here
+the daemon was available all along and cost nothing to ask.
+
+## The first hardware run, 2026-08-15 — what only a device could show
+
+The wired transport reached a real iPhone 15 Plus for the first time. Three
+things were settled and one bug was found that no amount of off-device work
+could have reached.
+
+**Settled:**
+
+- **`usbmux Connect` reaches a listener inside a Network Extension.** This was
+  the single assumption the whole design hedged against, and it holds:
+  `port 50505 (network extension): ANSWERED`, with the app-port fallback
+  correctly refused. The preferred path works, so the bridge survives the phone
+  being locked.
+- **The pairing survived the transport rewrite.** An existing pairing from the
+  AWDL era completed a session over the cable with no re-pair, which is a real
+  check on the key derivation: both sides still agree on the session key after
+  the roles swapped, because the context is the phone's fingerprint on both
+  ends either way.
+- **The `remotepairingd` hazard does not bite over the cable.** `devicectl`
+  installed an app and launched processes with a session live. The capture
+  policy logged `on-link=[v6/64,v6/64,v4/24,v4/16,v6/64]`, i.e. rule 6 is
+  excluding the on-link destinations that used to be captured.
+
+**The bug: the bridge could not survive an app restart.**
+
+The redial loop's idempotence guard — added in the round-one review fixes to
+stop a repeated relay announcement cancelling the dial it was waiting on —
+compared the announced port against `relayPort`:
+
+```swift
+if let existing = sessionTask, !existing.isCancelled,
+   relayPort == port, relayUDID == udid { return }
+```
+
+The caller assigns `relayPort = port` from that same announcement one line
+earlier, so the comparison is **always true**. The guard therefore returned
+whenever any loop existed, and a genuinely new port could never take effect.
+
+Quitting and relaunching the menu-bar app binds a fresh ephemeral relay port.
+The extension went on dialling the dead one: `connection refused — nothing is
+listening there`, every five seconds, indefinitely, while `lsof` showed a
+healthy listener on the new port. The first session came up perfectly; only the
+restart exposed it.
+
+**Why nothing caught it.** Every test dials one relay port. Catching this needs
+*two successive* ports — the bug lives in the transition, not in either state.
+The guard was also reviewed twice by a fresh reader and passed both times,
+because it reads correctly: the defect is in the caller's assignment order, one
+frame up.
+
+Fixed by tracking what the running loop is actually dialling (`dialingPort` /
+`dialingUDID`) rather than the most recent announcement, and pinned by
+`RelayHandoverRegressionTests`.
+
+**The general lesson, and it is the one this file keeps re-learning:** state
+that answers "what did I last hear?" is not state that answers "what am I doing
+now?", and a guard that consults the wrong one is invisible to review because
+each half looks right on its own.

@@ -13,21 +13,31 @@ so the TTL and DPI signatures that identify tethering never appear.
 ## How it works
 
 ```
-Mac (one ordinary app)                       iPhone
+Mac                                          iPhone
 ┌──────────────────────────────┐            ┌────────────────────────────┐
-│ UpLinkMac                    │            │ UpLinkiOS (SwiftUI)        │
-│  menu bar + Devices window   │            │   user taps Connect / Stop │
-│  SOCKS5 on 127.0.0.1:1080    │◄──TLS 1.3──┤                            │
-│  Bonjour listener            │  mux over  ├────────────────────────────┤
-│  session host                │  Bonjour   │ UpLinkTunnelExtension      │
-│                              │            │  NEPacketTunnelProvider    │
-│  system proxy ──► itself     │            │  dials out per stream      │
-└──────────────────────────────┘            └──────────┬─────────────────┘
-                                                       ▼ cellular = app data
+│ UpLinkMac (menu bar)         │            │ UpLinkiOS (SwiftUI)        │
+│  Devices window + pairing    │            │  user turns the bridge on  │
+│  USBRelay ──► /var/run/      │            │                            │
+│               usbmuxd  ══════╪═ CABLE ════╪══► UpLinkTunnelExtension   │
+├──────────────────────────────┤            │      NEPacketTunnelProvider│
+│ UpLinkProxyExtension (sysex) │            │      listens on 127.0.0.1  │
+│  transparent proxy captures  │◄─TLS-PSK──►│      dials out per stream  │
+│  every flow ──► mux          │  end-to-end└──────────┬─────────────────┘
+└──────────────────────────────┘                       ▼ cellular = app data
 ```
 
-The **phone drives every session**; the Mac is entirely passive, which is what
-lets it work without you opening the lid or clicking anything.
+**The cable is the only transport.** `usbmuxd` — the same channel Xcode uses —
+needs no network interface at all: no Wi-Fi association, no Bonjour, no
+multicast, no Personal Hotspot. That is the point. The Mac's Wi-Fi radio can be
+associated with nothing and the bridge still works, which is the configuration
+this product exists for and the one AWDL could never hold.
+
+`usbmuxd` carries connections in one direction only, so **the Mac dials and the
+phone listens**. The Mac's proxy extension is sandboxed and cannot open
+`/var/run/usbmuxd`, so the unsandboxed menu-bar app pumps the cable onto a
+loopback port — carrying ciphertext it has no key for, since TLS-PSK runs end to
+end between the extension and the phone. One consequence, stated plainly in the
+UI: **quitting the menu-bar app drops the bridge.**
 
 The single most important line in the codebase is
 `parameters.requiredInterfaceType = .cellular` in `CellularDialer` — that is
@@ -37,9 +47,10 @@ what forces egress through the cellular radio.
 
 | Area | State |
 | --- | --- |
-| Wire protocol, multiplexer, flow control | **Done**, 238 tests across the kit |
+| Wire protocol, multiplexer, flow control | **Done**, 277 tests across the kit |
 | Pairing crypto + Keychain storage | **Done**, verified on hardware |
-| Transport / TLS-PSK / discovery / cellular dialer | **Done**, verified on hardware |
+| USB transport (`usbmuxd`) | **VERIFIED ON HARDWARE 2026-08-15** — Wi-Fi radio off, 116–153 Mbps, every traffic class bridged including IPv6, nothing leaked |
+| TLS-PSK / cellular dialer | **Done**, verified on hardware |
 | End-to-end proxying | **Proven** in-process and, for TCP, on hardware |
 | iOS app + tunnel extension | **Builds**, UI complete |
 | macOS menu bar app + transparent proxy extension | **Builds**, universal TCP/UDP capture |
@@ -90,11 +101,21 @@ been observed working end to end on hardware with no hotspot. Still unproven:
 - **QUIC.** UDP 443 is the bulk-UDP case and is a different shape from DNS:
   long-lived, high-rate, many datagrams per destination.
 
-- **AWDL inside a Network Extension** — the Phase 0 question. `spike/` holds the
-  instrument and the procedure; if it fails, drop `.peerToPeer` from
-  `TransportProfile.preferenceOrder` and everything else still works.
-- **Multi-PSK TLS selection.** The Mac's listener offers one pre-shared key per
-  paired phone plus one for an active pairing code, and relies on TLS 1.3
+- ~~**The whole wired transport, on hardware.**~~ **Done, 2026-08-15** — see
+  `docs/device-test-log.md`. Re-run any time with `./scripts/verify-wired.sh`.
+- **QUIC / HTTP-3 at bulk rates.** UDP 443 is still unmeasured; the `curl` here
+  has no HTTP/3.
+- **The phone locked, under sustained load.** The extension port answering says
+  it should hold, but it has not been left locked with traffic running. Every part of it is proven off
+  device against a fake `usbmuxd` — framing, the byte-swapped `PortNumber`,
+  attach/detach, the Wi-Fi-device filter, refusal, and the byte pipe — but the
+  cable itself has not been run since the change.
+- ~~**`usbmux Connect` reaching a listener inside a Network Extension**~~ —
+  **ANSWERED on hardware, 2026-08-15: it does.** The preferred path works, so
+  the bridge survives the phone being locked. The app-port fallback stays as
+  insurance but is not what carries the link.
+- **Multi-PSK TLS selection.** The phone's listener offers one pre-shared key
+  per paired Mac plus one for an armed pairing code, and relies on TLS
   selecting by the identity the client presents. That is what the API is for,
   but it has not been observed working.
 - **Route-less packet tunnel.** iOS may reject empty `includedRoutes`, or reap
@@ -152,8 +173,18 @@ proxy, which is an ordinary app and trivial to run. It only captured
 proxy-aware apps, and could not carry UDP at all — so QUIC and DNS bypassed the
 bridge entirely, and DNS bypassing it defeats much of the point. Universal
 coverage requires `NETransparentProxyProvider`, and that requires notarizing
-every build. The SOCKS server survives as a test fixture in the kit, which is
-what keeps the off-device test loop under a second.
+every build. The SOCKS code has now been deleted: it had no call sites, and the
+README claimed for some time that it "survives as a test fixture", which was
+not true of the shipping tree.
+
+**Why the relay lives in the app.** The proxy extension is sandboxed
+(`com.apple.security.app-sandbox`), and the sandbox does not permit opening
+`/var/run/usbmuxd`. The menu-bar app is deliberately unsandboxed — it has to be,
+to install a system extension at all — so it is the only process that can speak
+to `usbmuxd`. It relays bytes and nothing else: the TLS-PSK session is end to
+end between the phone and the extension, so the app holds no key and can read
+nothing. The cost is that the bridge needs the app running, which the menu bar
+says out loud rather than leaving to be discovered.
 
 **What "universal" does not include.** The transparent proxy intercepts TCP and
 UDP flows. ICMP, raw IP sockets, and traffic from other system extensions are

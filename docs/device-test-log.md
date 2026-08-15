@@ -4,6 +4,201 @@ The Simulator has no cellular radio and no real Network Extension host, so none
 of the checks below can be run by CI or by an agent. Record every pass here with
 a date, so "it worked" is evidence rather than memory.
 
+## VERIFIED — wired transport, 2026-08-15
+
+iPhone 15 Plus `00008120-000000000000001E`, cable only, **Wi-Fi radio off**.
+Mac app build 1786831860.
+
+### The result
+
+```
+1. Is there any way out other than the bridge?
+     no real IPv4 gateway
+     no usable IPv6 path over en0
+     no router answering ARP on en0
+2. Is the bridge actually up?
+     a session is live
+     the cable is carrying the link (relaying 127.0.0.1:54634 → network extension)
+     no AWDL anywhere in the log
+3. Make a real request, and prove the bridge carried it
+     open.spotify.com -> http=200  total=0.326s
+     the proxy opened 10 flow(s) during that request
+4. public IPv4: 216.77.46.31          (carrier; home is 203.0.113.21)
+5. Throughput: 116.7 Mbps
+
+PASS — no other way out, and the proxy carried the request.
+```
+
+### Coverage matrix — nothing leaked
+
+| # | Class | Result |
+| --- | --- | --- |
+| 1 | TCP, proxy-aware | bridged ✓ 216.77.46.31 |
+| 2 | TCP, ignores proxy | bridged ✓ 216.77.46.31 |
+| 3 | TCP, raw socket | bridged ✓ 216.77.46.31 |
+| 4 | UDP (DNS) | bridged ✓ 216.77.49.33 |
+| 5 | QUIC / HTTP-3 | n/a — curl has no HTTP/3 |
+| 6 | **IPv6** | **bridged ✓ 2600:387:15:6712::7** |
+| 7 | ICMP | blocked ✓ (cannot leak) |
+
+Throughput through the bridge **153.5 Mbps** (18.3 MB/s); this Mac direct,
+216.1 Mbps. The cable is not the bottleneck.
+
+**IPv6 matters most in that table.** The standing warning here is that IPv4 can
+be bridged while IPv6 goes straight out, so half the traffic tells one story and
+half tells the other. The bridged v6 address (`2600:387:15:6712::7`) is the
+carrier's, not this Mac's home v6 (`2001:db8:1:2:…`), measured before the
+bridge came up.
+
+**The baseline is what makes any of this evidence.** With the bridge down the
+Mac reports `203.0.113.21`; with it up, `216.77.46.31`. Measured in that order,
+which is the only order that proves anything — measuring the baseline through a
+live bridge reports the carrier's address as the Mac's own and scores every
+bridged row as a leak.
+
+### Answered: usbmux reaches a Network Extension
+
+```
+Device: 00008120-000000000000001E  deviceID=1  via=usb
+  port 50505 (network extension): ANSWERED
+  port 50506 (foreground app): refused
+```
+
+The preferred path works, so the bridge survives the phone being locked. The
+app-port fallback is genuinely a fallback. **`spike/usb-probe` can now be
+deleted** — its question is settled.
+
+### Three bugs found here that nothing else could reach
+
+All three are lifecycle transitions, invisible to 300+ passing tests and to two
+rounds of review. Written up in REGRESSIONS.md.
+
+1. **Stale relay port.** The redial guard compared against a variable the caller
+   had just assigned, so a new port never took effect.
+2. **Orphaned route tunnel.** `routeManager` was only set on the session-live
+   path, so a restart with no session left a default route into a
+   packet-dropping tunnel that nothing could tear down — the Mac lost all
+   networking and only `scutil --nc stop "UpLink Route"` by hand recovered it.
+3. **Dropped announcement.** The relay announces its port once, at launch,
+   before the proxy IPC channel exists. The message was lost and never retried.
+
+### Restart recovery, after the fixes
+
+```
+15:12:42  session ENDED          (app quit)
+15:12:48  usb: relaying …:54634  (new app, new port)
+15:12:48  ipc: relay on …:54634
+15:12:48  session started
+```
+
+~6 seconds, unattended. Before the fixes this state was permanent until the
+cable was physically unplugged.
+
+### Still not exercised
+
+- **QUIC / HTTP-3** — this `curl` has no HTTP/3, so UDP 443 at bulk rates is
+  still unmeasured. It is a different shape from DNS: long-lived, high-rate,
+  many datagrams per destination.
+- **The phone locked**, sustained. The extension port answering means it
+  *should* hold; it has not been left locked under load.
+- **Sustained throughput** over tens of minutes, and battery cost.
+
+## Wired transport — the checklist, 2026-08-15
+
+The transport changed from AWDL to the USB cable and **none of it has been run
+on hardware yet.** Everything below is what a device run has to establish.
+Record results here; do not report a pass that was not observed.
+
+### Before anything
+
+1. **Rebuild BOTH sides.** `release-mac.sh` is Mac-only. The phone needs
+   `xcodebuild -scheme UpLinkiOS` + `devicectl device install app`, and
+   installing does **not** restart an already-running NE extension. Confirm the
+   bundle UUID with `xcrun devicectl device info processes` before drawing any
+   conclusion — a whole round was once spent on a phone running old code.
+2. **Never-bridge list by PATH, not bundle id**, and
+   `com.apple.CoreDevice.remotepairingd` on it. Confirm the extension logs a
+   non-empty `never bridging: [...]`.
+3. **No commercial VPN** (utun7), or the coverage matrix cannot tell UpLink from
+   it.
+4. Phone on cellular only. Mac Wi-Fi radio **OFF, not merely disconnected** — a
+   disconnected radio still holds a global SLAAC address and an IPv6 default
+   route, and every dual-stack site then loads without touching the bridge.
+
+### Already verified WITHOUT a device, 2026-08-15
+
+```sh
+swift run --package-path spike/usb-probe usb-probe --selftest
+```
+
+Talks to the real `/var/run/usbmuxd` with nothing plugged in. `ListDevices` and
+`Listen` both answer on an empty Mac, so the header, the version, the message
+type and the plist body are all exercised against Apple's implementation rather
+than against our own fake.
+
+| Date | Result |
+| --- | --- |
+| 2026-08-15 | **PASS** — and it immediately found `badVersion` was 5, not 6. See REGRESSIONS. |
+
+What this does NOT establish: anything about the cable, the device, or the
+Network Extension. Those are below.
+
+### The one open question
+
+```sh
+swift run --package-path spike/usb-probe usb-probe
+```
+
+**Can `usbmux Connect` reach a listener inside a Network Extension?** Everything
+else about the transport is already proven against a fake daemon; this is the
+one thing a fake cannot answer.
+
+- Extension port (50505) answers → the preferred path works. Record it and
+  delete `spike/usb-probe`.
+- Only the app port (50506) answers → the bridge will drop when the phone locks
+  or the app is backgrounded. The product still works, degraded; this is the
+  finding that would justify moving the listener.
+- Neither → UpLink is probably just not running on the phone. A refused connect
+  does **not** mean the cable or the lockdown pairing is broken.
+
+| Date | Result | Notes |
+| --- | --- | --- |
+| 2026-08-15 | **ANSWERED — the Network Extension is reachable** | iPhone 15 Plus, `00008120-000000000000001E`, via=usb. `port 50505 (network extension): ANSWERED`. The preferred path works, so the bridge survives the phone being locked and the app being backgrounded. The app-port fallback (50506) was correctly refused, i.e. it is genuinely a fallback and not what is carrying the link. |
+
+**So `spike/usb-probe` can be deleted** — its question is settled. Kept for now
+only because `verify-wired.sh` uses it to enumerate the device.
+
+One trap worth recording: the extension takes a few seconds to bind after
+`process launch`, and a probe run too early reports "nothing answered on either
+port", which reads exactly like "UpLink is not running on the phone". Check the
+timestamp in the phone log against the probe before believing that.
+
+### One command, once the cable is in
+
+```sh
+./scripts/verify-wired.sh
+```
+
+Waits for the cable (up to 10 minutes), then runs everything below in the order
+the failures actually happen and prints one verdict. It refuses to summarise a
+pass it did not observe. `verify-cellular.sh --full` inside it turns the Wi-Fi
+radio off itself and restores it via a trap, so a failure cannot strand you.
+
+The table below is what it checks, kept for reading when something fails.
+
+### Then, in order
+
+| # | Check | How | Result |
+| --- | --- | --- | --- |
+| 1 | Cable presence drives the UI | Unplug: menu bar reads **Waiting for USB connection**. Plug in with UpLink off on the phone: **iPhone connected — not answering**. Turn it on unpaired: **iPhone connected — not paired**. | |
+| 2 | Pairing works first time | Mac shows a code, type it on the phone, session comes up without a retry. This is the flow that has actually been broken. | |
+| 3 | Re-pairing works | Remove on the Mac, remove on the phone, pair again. Then remove on the Mac **while the phone is unplugged** and confirm the phone is told on its next session. | |
+| 4 | The cable is genuinely the path | `./scripts/usb-status.sh`, then `./scripts/verify-cellular.sh --full`. **The cable check is inverted from the AWDL era** — it now fails if `awdl` appears anywhere. | |
+| 5 | Egress is cellular, not the cable | The phone must not route back up the cable to the Mac. `verify-cellular.sh` greps the proxy log for the destination IP — the half that cannot be faked. | |
+| 6 | Throughput | `./scripts/throughput-test.sh` against the radio's own bandwidth estimate. USB 2.0 over Lightning is ~25–40 MB/s, well above any cellular link, so the bridge should not be the bottleneck. If it is, `Frame.maxPayloadSize` and `Multiplexer.initialWindow` are the knobs — measure, do not guess. | |
+| 7 | Survives a lock | Lock the phone mid-download. Only meaningful if the **extension** port answered in the probe above. | |
+| 8 | Survives a replug | Pull the cable mid-session: the Mac must return to **Waiting for USB connection** promptly, not keep claiming flows it can no longer carry. Plug back in: it should reconnect without a click. | |
+
 ## One-time setup: the Developer ID certificate
 
 The Mac app contains a **system extension**, and macOS activates one only if it
