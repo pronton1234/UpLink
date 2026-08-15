@@ -109,53 +109,50 @@ struct UnpairPropagationRegressionTests {
     // cleared with the session would never survive to the app's next poll.
     @Test("The phone remembers being unpaired after the session ends")
     func unpairFlagSurvivesTeardown() async {
-        let state = PhoneSessionState()
-        #expect(await state.wasUnpairedByPeer == false)
+        let notice = UnpairNotice()
+        #expect(await notice.isPending == false)
 
-        await state.noteUnpairedByPeer()
-        await state.teardown()
+        await notice.note(fingerprint: "mac-1")
 
         #expect(
-            await state.wasUnpairedByPeer,
+            await notice.isPending,
             "the phone forgot it had been unpaired while tearing down — the app polls after that, so the notice is lost and it retries forever"
         )
+        #expect(await notice.take() == "mac-1")
+        // Consumed by the read: the app is the only side that can act on it,
+        // and delivering it twice would delete a pairing made in between.
+        #expect(await notice.isPending == false)
     }
 
-    // THE OTHER HALF, and the one I got wrong. The test above was the whole
-    // suite, so it pinned stickiness as though stickiness alone were the
-    // requirement — and `clearUnpairedByPeer()` ended up with ZERO call sites.
+    // THE OTHER HALF, and the one that was got wrong. The test above was the
+    // whole suite, so it pinned stickiness as though stickiness alone were the
+    // requirement — and the clearing path ended up with ZERO call sites.
     //
-    // The flag is checked before `isConnected` on every status poll, so once set
-    // it answers "unpaired" for the life of the extension process. Re-pair, and
-    // the first poll tells the app to delete the pairing it just made. That is
-    // an unbreakable re-pair loop, and it is what "re-pairing fails and I have
-    // to retry several times" actually was.
+    // The flag is checked before anything else on every status poll, so once
+    // set it answers "unpaired" for the life of the extension process. Re-pair,
+    // and the first poll tells the app to delete the pairing it just made. That
+    // is an unbreakable re-pair loop, and it is what "re-pairing fails and I
+    // have to retry several times" actually was.
     //
     // Clearing belongs to the state machine, not to a caller who has to
-    // remember: establishing a session at all means the Mac accepted us, which
+    // remember: establishing a session at all means the peer accepted us, which
     // means we are paired, which means any earlier revocation is stale.
     @Test("Starting a new session clears a stale unpaired flag")
     func newSessionClearsTheFlag() async throws {
-        let state = PhoneSessionState()
-        let channel = liveLookingChannel()
-        let responder = BridgeResponder(
-            channel: channel,
-            dialer: CellularDialer(queue: DispatchQueue(label: "regression.repair"), requiredInterface: nil),
-            localFingerprint: "phone"
-        )
+        let notice = UnpairNotice()
 
-        // A previous pairing was revoked, and the flag correctly survived.
-        await state.noteUnpairedByPeer()
-        await state.teardown()
-        #expect(await state.wasUnpairedByPeer)
+        // A previous pairing was revoked, and the notice correctly survived.
+        await notice.note(fingerprint: "mac-1")
+        #expect(await notice.isPending)
 
         // Now the user re-pairs and a session is established.
-        try await state.runningSession(channel: channel, responder: responder) {
-            #expect(
-                await state.wasUnpairedByPeer == false,
-                "a freshly established session still reports the phone as unpaired — the app's next poll deletes the pairing that was just created, and re-pairing can never succeed"
-            )
-        }
+        await notice.sessionEstablished()
+
+        #expect(
+            await notice.isPending == false,
+            "a freshly established session still reports the phone as unpaired — the app's next poll deletes the pairing that was just created, and re-pairing can never succeed"
+        )
+        #expect(await notice.take() == nil)
     }
 
     @Test("The opcode is distinct from every other kind")

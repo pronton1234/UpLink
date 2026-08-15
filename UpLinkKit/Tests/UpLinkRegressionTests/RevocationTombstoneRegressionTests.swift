@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import CryptoKit
 @testable import UpLinkKit
 
 // SYMPTOM, the offline half of "removing a device on one end doesn't register
@@ -119,5 +120,81 @@ struct RevocationTombstoneRegressionTests {
         let restored = try JSONDecoder().decode(RevocationTombstones.self, from: data)
 
         #expect(restored.isRevoked("aaaa"), "a tombstone did not survive being seeded into the extension")
+    }
+}
+
+// REGRESSION: tombstones did not survive an extension restart.
+//
+// The set lives in memory on whichever side holds the listener, and iOS
+// relaunches that extension often — far more often than a pairing changes. A
+// restart was therefore exactly the moment a Mac revoked while it was unplugged
+// came back to life: the notice it had never received was forgotten, and its
+// next dial was refused with nothing on either side to explain why.
+//
+// The Mac used to carry these across in `providerConfiguration`. That route is
+// gone with the role swap — the phone holds the listener now — and for a while
+// nothing replaced it: the restore/snapshot accessors it left behind had no
+// callers at all, which is the same "wired up to nothing" shape as the
+// `clearUnpairedByPeer` bug in the unpair suite. `TombstoneStore` replaced them,
+// and they are deleted rather than left looking usable.
+@Suite("Regression: revocations must survive a restart")
+struct TombstonePersistenceRegressionTests {
+
+    private func scratchDefaults() -> UserDefaults {
+        let suite = "uplink.tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        return defaults
+    }
+
+    private func device(_ name: String) -> PairedDevice {
+        let key = Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation
+        return PairedDevice(
+            fingerprint: PairedDevice.fingerprint(of: key),
+            name: name,
+            publicKey: key,
+            pairedAt: Date()
+        )
+    }
+
+    @Test("A revoked device is still revoked after a restart")
+    func survivesRestart() {
+        let defaults = scratchDefaults()
+        let removed = device("Revoked Mac")
+
+        var tombstones = RevocationTombstones()
+        tombstones.revoke(removed)
+        TombstoneStore(defaults: defaults).save(tombstones)
+
+        // A fresh process reads its own store.
+        let restored = TombstoneStore(defaults: defaults).load()
+        #expect(
+            restored.isRevoked(removed.fingerprint),
+            "a device revoked while it was disconnected was forgotten by the restart, so it can never be told"
+        )
+    }
+
+    @Test("A delivered notice does not come back after a restart")
+    func deliveryIsPersisted() {
+        let defaults = scratchDefaults()
+        let removed = device("Revoked Mac")
+        let store = TombstoneStore(defaults: defaults)
+
+        var tombstones = RevocationTombstones()
+        tombstones.revoke(removed)
+        store.save(tombstones)
+
+        tombstones.delivered(removed.fingerprint)
+        store.save(tombstones)
+
+        #expect(
+            store.load().isRevoked(removed.fingerprint) == false,
+            "a device that was already told is told again on every restart"
+        )
+    }
+
+    @Test("An empty store restores cleanly rather than throwing")
+    func emptyStoreIsFine() {
+        #expect(TombstoneStore(defaults: scratchDefaults()).load().all.isEmpty)
     }
 }
