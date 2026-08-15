@@ -89,9 +89,20 @@ struct UnpairPropagationRegressionTests {
     // retry, the other means stop and tell the user to pair again.
     @Test("An unpaired status is not mistaken for disconnected")
     func unpairedStatusIsDistinct() {
-        #expect(BridgeStatusReply.parse("unpaired") == .unpaired)
+        #expect(BridgeStatusReply.parse("unpaired") == .unpaired(fingerprint: nil))
         #expect(BridgeStatusReply.parse("disconnected") == .disconnected)
         #expect(BridgeStatusReply.parse("unpaired") != .disconnected)
+    }
+
+    // The Mac names WHICH phone forgot it. Only the app can update the keychain,
+    // and it cannot act on "someone unpaired us".
+    @Test("An unpaired status carries the fingerprint when the Mac sends one")
+    func unpairedStatusCarriesFingerprint() {
+        #expect(
+            BridgeStatusReply.parse("unpaired|336ee249d249baa4")
+                == .unpaired(fingerprint: "336ee249d249baa4"),
+            "the Mac cannot tell its app which device to forget"
+        )
     }
 
     // Sticky on purpose: the notice arrives as the session is ending, so a flag

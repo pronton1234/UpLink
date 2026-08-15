@@ -44,7 +44,15 @@ public actor PhoneSessionState {
     /// retry several times" actually was.
     public private(set) var wasUnpairedByPeer = false
 
+    /// Which Mac the live session is with, so an unpair can be addressed.
+    ///
+    /// Without it the extension acted on whichever session was live, and
+    /// deleting one Mac could revoke another.
+    public private(set) var peerFingerprint: String?
+
     public init() {}
+
+    public func setPeerFingerprint(_ fingerprint: String?) { peerFingerprint = fingerprint }
 
     public func noteUnpairedByPeer() { wasUnpairedByPeer = true }
     public func clearUnpairedByPeer() { wasUnpairedByPeer = false }

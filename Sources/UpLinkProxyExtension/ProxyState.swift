@@ -79,6 +79,9 @@ actor ProxyState {
     /// Seeded from providerConfiguration at startup; the app owns durable
     /// storage. See ``InMemoryDeviceDirectory`` for why this process cannot.
     private var store = InMemoryDeviceDirectory()
+    /// Set when a phone says it has forgotten this Mac, cleared once the app has
+    /// been told. The app owns the keychain; this process cannot reach it.
+    private var unpairedByPeer: String?
 
     /// Apps whose traffic must never be bridged, from `providerConfiguration`.
     ///
@@ -204,6 +207,11 @@ actor ProxyState {
             log?.error("egress: \(interface.displayName, privacy: .public)")
 
         case let .peerUnpaired(fingerprint):
+            // Sticky, and read by the "status" reply below. Without it the app
+            // was never told, so `MenuBarModel.refreshStatus`'s `.unpaired`
+            // case was dead code, the keychain kept the phone, and the next
+            // re-seed handed the revoked device straight back to the listener.
+            unpairedByPeer = fingerprint
             // The app owns durable storage — this process cannot reach the
             // keychain — so it has to be told, or the pairing comes straight
             // back the next time the app re-seeds the extension.
@@ -233,6 +241,13 @@ actor ProxyState {
         }
 
         if message == "status" {
+            // Checked before anything else, and cleared by the read: this is the
+            // only chance to tell the app, and the app is the only side that can
+            // update durable storage.
+            if let fingerprint = unpairedByPeer {
+                unpairedByPeer = nil
+                return "unpaired|\(fingerprint)"
+            }
             guard let initiator else { return "waiting" }
             let egress = await initiator.observedEgress ?? .unknown
             let peer = await host.peerDescription ?? ""

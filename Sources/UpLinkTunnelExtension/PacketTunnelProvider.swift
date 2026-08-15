@@ -190,6 +190,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
             Task { await self?.state.noteUnpairedByPeer() }
         }
 
+        await state.setPeerFingerprint(config.macFingerprint)
         try await state.runningSession(channel: channel, responder: responder) {
             try await responder.run()
         }
@@ -244,13 +245,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
             return
         }
         switch request {
-        case "unpair":
+        case _ where request.hasPrefix("unpair"):
             // Announce over the live session, then stop. The other order
             // guarantees the notice is never delivered, since it travels on the
             // connection being torn down.
+            // `unpair:<fingerprint>` names which Mac. A bare "unpair" is
+            // accepted for compatibility but the addressed form is what the app
+            // now sends: acting on whichever session happened to be live is how
+            // deleting one Mac could revoke another.
+            let wanted = request.hasPrefix("unpair:")
+                ? String(request.dropFirst("unpair:".count))
+                : nil
             let state = self.state
             let reply = UncheckedSendableBox(completionHandler)
             Task {
+                if let wanted, let live = await state.peerFingerprint, live != wanted {
+                    self.log.error("ipc: refusing unpair of \(wanted, privacy: .public) — live session is \(live, privacy: .public)")
+                    reply.value?(Data("wrong-peer".utf8))
+                    return
+                }
                 await state.announceUnpaired()
                 await state.teardown()
                 reply.value?(Data("ok".utf8))

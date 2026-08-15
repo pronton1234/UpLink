@@ -370,10 +370,19 @@ final class BridgeController {
             disconnect()
             return
         }
-        try? store.remove(fingerprint: fingerprint)
+        do {
+            try store.remove(fingerprint: fingerprint)
+        } catch {
+            // Otherwise the phone says it has forgotten a Mac it still holds
+            // the key for, and the row reappears with no explanation.
+            state = .failed(error.localizedDescription)
+            return
+        }
         reloadPairedDevices()
         disconnect()
-        state = .failed("This Mac removed this iPhone. Pair again to reconnect.")
+        // Deliberately no message: the device simply disappears from both
+        // lists, which is the agreed behaviour. `disconnect()` already returns
+        // the UI to idle.
     }
 
     // MARK: Pairing
@@ -441,8 +450,14 @@ final class BridgeController {
         // never delivered, so the Mac keeps the phone in its paired list and
         // keeps advertising a key the user has just revoked.
         Task { [weak self] in
-            if self?.activePeerFingerprint == device.fingerprint || self?.state.isConnected == true {
-                _ = await self?.sendProviderMessage("unpair")
+            // ADDRESSED, and only when the live session is this device.
+            //
+            // It used to send a bare "unpair" whenever anything was connected,
+            // and the extension acted on whichever session was live — so
+            // deleting Mac B while bridging Mac A told A it had been unpaired,
+            // and A acted on it. The Mac's own version was addressed all along.
+            if self?.activePeerFingerprint == device.fingerprint {
+                _ = await self?.sendProviderMessage("unpair:\(device.fingerprint)")
             }
             await MainActor.run {
                 guard let self else { return }

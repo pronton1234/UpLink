@@ -121,6 +121,10 @@ final class MenuBarModel {
     /// this configuration at all.
     private var failedStarts = 0
 
+    /// Remembers deliberate removals so the device poll cannot re-learn them.
+    /// See ``PairedDeviceMerge`` for the two ways that used to undo a removal.
+    private var merge = PairedDeviceMerge()
+
     private var pollTask: Task<Void, Never>?
     private var extensionDelegate: SystemExtensionDelegate?
     private let extensionBundleID = UpLinkIdentifiers.macProxyExtension
@@ -412,15 +416,62 @@ final class MenuBarModel {
               let devices = try? JSONDecoder().decode([PairedDevice].self, from: json)
         else { return }
 
-        let known = Set(pairedDevices.map(\.fingerprint))
-        let unknown = devices.filter { !known.contains($0.fingerprint) }
+        // `pairedDevices` is read AFTER the await on purpose, and the merge
+        // additionally screens out anything removed while that round trip was in
+        // flight — the reply was composed before the removal, so without this
+        // the device looks new and is written straight back.
+        merge.expire()
+        let unknown = merge.devicesToPersist(
+            reportedByExtension: devices,
+            alreadyKnown: Set(pairedDevices.map(\.fingerprint))
+        )
         guard !unknown.isEmpty else { return }
 
+        var learned = false
         for device in unknown {
-            try? store.save(device)
-            log.error("persisted pairing with \(device.name, privacy: .public)")
+            do {
+                try store.save(device)
+                merge.notePaired(device.fingerprint)
+                learned = true
+                log.error("persisted pairing with \(device.name, privacy: .public)")
+            } catch {
+                // Was logged as success unconditionally, so a keychain refusal
+                // read as a stored pairing that then vanished on relaunch.
+                log.error("COULD NOT persist pairing with \(device.name, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
         }
+        guard learned else { return }
         reloadPairedDevices()
+        // The extension re-seeds from this snapshot on every restart, so a new
+        // pairing that never reaches it is lost the moment the extension dies.
+        await reseedExtension()
+    }
+
+    /// Rewrites the extension's persisted seed to match the keychain.
+    ///
+    /// THE FIX FOR RESURRECTION. `providerConfiguration` was written exactly
+    /// once per app launch, and the extension's directory is in memory and
+    /// rebuilt from it on every extension restart. So a device removed after
+    /// launch came back — with its PSK re-advertised — and the device poll then
+    /// copied it into the keychain again. The mirror image lost new pairings:
+    /// one made after launch existed only in the extension's memory and the
+    /// keychain, never in the snapshot, so an extension restart dropped it and
+    /// the phone was refused with `sessionKeys` that omitted it.
+    private func reseedExtension() async {
+        guard let manager,
+              let proto = manager.protocolConfiguration as? NETunnelProviderProtocol,
+              var configuration = proto.providerConfiguration
+        else { return }
+
+        do {
+            configuration["pairedDevices"] = try JSONEncoder().encode(pairedDevices)
+            proto.providerConfiguration = configuration
+            manager.protocolConfiguration = proto
+            try await manager.saveToPreferences()
+            log.error("reseeded extension with \(self.pairedDevices.count, privacy: .public) device(s)")
+        } catch {
+            log.error("could not reseed extension: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     private func refreshStatus() async {
@@ -437,11 +488,21 @@ final class MenuBarModel {
             if status != .waiting { status = .waiting; notifyObservers() }
             setBridgeInterface(nil)
             await reconcileRouteTunnel(sessionLive: false)
-        case .unpaired:
-            // The phone removed this Mac. Reload rather than assume: the
-            // extension has already dropped its copy and told us, and the
-            // paired list on screen is otherwise still showing the device.
+        case let .unpaired(fingerprint):
+            // The phone removed this Mac. The extension has already dropped its
+            // in-memory copy; only the app can drop the durable one, and if it
+            // does not the pairing returns on the next re-seed.
+            if let fingerprint, !fingerprint.isEmpty {
+                merge.noteRemoved(fingerprint)
+                do {
+                    try store.remove(fingerprint: fingerprint)
+                    log.error("phone \(fingerprint, privacy: .public) unpaired us — forgotten")
+                } catch {
+                    log.error("could not forget \(fingerprint, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                }
+            }
             reloadPairedDevices()
+            await reseedExtension()
             if status != .waiting { status = .waiting; notifyObservers() }
             setBridgeInterface(nil)
             await reconcileRouteTunnel(sessionLive: false)
@@ -619,7 +680,18 @@ final class MenuBarModel {
         // keeps running on revoked keys while the menu still reads "Connected".
         // A status display that can be wrong makes every test after it
         // worthless, which is worse than the stale pairing itself.
-        try? store.remove(fingerprint: device.fingerprint)
+        //
+        // Recorded BEFORE the store write, so a poll that is already in flight
+        // cannot re-learn the device from the reply it is about to deliver.
+        merge.noteRemoved(device.fingerprint)
+        do {
+            try store.remove(fingerprint: device.fingerprint)
+        } catch {
+            // Surfaced rather than swallowed: a failed removal used to leave
+            // the row on screen with no explanation at all.
+            log.error("COULD NOT remove \(device.name, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            status = .failed("Could not forget \(device.name): \(error.localizedDescription)")
+        }
         reloadPairedDevices()
         // AND it has to reach the phone. The extension owns the session and the
         // listener, so it is the only side that can say so before tearing down.
@@ -628,6 +700,7 @@ final class MenuBarModel {
         // from here like a phone that will not connect.
         Task { [weak self] in
             _ = await self?.sendToExtension("unpair:\(device.fingerprint)")
+            await self?.reseedExtension()
             await MainActor.run { self?.reloadPairedDevices() }
         }
     }
