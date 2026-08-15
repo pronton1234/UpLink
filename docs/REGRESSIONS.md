@@ -450,3 +450,47 @@ from `NEVPNManager` — so neither filter could ever fire, which is what the
 compiler had been warning. They now match on the configuration name. The bug was
 harmless; the comment asserting a false fact about the framework was not, because
 it is exactly the kind of thing the next reader takes on trust.
+
+## Pairing, 2026-08-14 — "removing a device doesn't register, and re-pairing fails"
+
+Two complaints, ten faults. Two of the worst were mine, introduced hours earlier
+while fixing the first complaint, and one of those *was* the second complaint.
+
+| Test | Guards against |
+| --- | --- |
+| `UnpairPropagationRegressionTests` — new session clears the flag | An unbreakable re-pair loop. `wasUnpairedByPeer` is checked ahead of `isConnected` on every status poll, and `clearUnpairedByPeer()` had **zero call sites** — so once set it answered "unpaired" for the life of the extension process. Re-pair, and the first poll told the app to delete the pairing it had just made. |
+| `PairingFailureReportingTests` | A pairing failure that says nothing. A wrong code fails inside TLS and surfaced as an opaque `NWError`; an expired one gets *past* TLS and the Mac merely closed the channel. So `.codeMismatch`, `.expired` and `.tooManyAttempts` were values no path could produce, with good human strings that could never be shown. |
+| `PairingCodeConsumptionTests` | A failure the user did not cause burning the code. `verify` consumed it before the response was written, and the Mac answered before committing its own side — so a failed save left the phone storing a Mac with no record of it, and the code was spent. |
+| `PairedDeviceMergeRegressionTests` | A removed device coming back. The device poll's rule was additive, which undoes a removal two ways: it races the Remove button (the reply was composed before the removal, so the device looks new), and it copies resurrections back into the keychain. |
+| `RevocationTombstoneRegressionTests` | A device unpaired while offline never finding out. The `unpaired` frame rides on the live session; with no session there is nothing to write to, and neither Bonjour nor TLS carries revocation state. |
+| `PeerPairedLabelRegressionTests` | A green "Paired" seal against a Mac never paired with. `isKnown` was `fingerprint != nil` — "does this Mac publish an identity", which every UpLink Mac does — so the label misled precisely during a stale-pairing failure. |
+
+### The method lesson, and it is the same one twice
+
+**A test covering one half of an invariant reads exactly like a test covering
+the invariant.** `unpairFlagSurvivesTeardown` was correct, necessary, and the
+whole suite — so it pinned stickiness as though stickiness alone were the
+requirement, and the missing half shipped. The fix was not just to add the
+second test but to move the clearing *into* `runningSession`, where no caller
+can forget it. That type already exists because of an invariant a caller forgot.
+
+**Test the input the code actually receives.** `AWDLPresence.awdlHost` was
+written and tested against the dot-separated form printed in the `accept:` log,
+while `MacSessionHost.describe` passes a colon-separated one — so it was green
+against a string the code never sees, and in production held towards a host with
+`:52540` glued on. That is the third time this shape has appeared here, after the
+`169.254.4.183/16` case and the staleness test that used a never-started
+discovery.
+
+**`(any Error).self` is not an assertion.** The consumption test's second half
+would have accepted `.alreadyConsumed` — the exact failure under test — and
+passed. It asserts by name now.
+
+### Two gaps left open deliberately
+
+- `handleSession` now refuses a fingerprint this Mac holds no key for, but does
+  **not** bind the claim to the PSK identity actually negotiated, so one paired
+  phone can still announce another's fingerprint. That needs
+  `sec_protocol_options_set_pre_shared_key_selection_block` on the listener.
+- The same missing block is why a wrong pairing code and a revoked device both
+  produce `-9816` with nothing to tell them apart.

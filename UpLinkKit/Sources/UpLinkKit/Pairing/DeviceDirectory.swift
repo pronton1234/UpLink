@@ -24,59 +24,15 @@ extension PairedDeviceStore: DeviceDirectory {}
 ///
 /// Readable and writable by both the app and the system extension, which is the
 /// point: the extension accepts pairings, the app displays and revokes them.
-public struct GroupDeviceDirectory: DeviceDirectory {
-
-    private let containerURL: URL
-
-    /// - Returns: `nil` if the app group is unavailable, which means the
-    ///   entitlement is missing rather than that there are no devices — worth
-    ///   failing loudly rather than silently behaving as if nothing is paired.
-    public init?(appGroup: String = "group.com.uplink.app") {
-        guard let url = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: appGroup
-        ) else { return nil }
-        self.containerURL = url
-    }
-
-    private var fileURL: URL { containerURL.appendingPathComponent("paired-devices.json") }
-
-    public func pairedDevices() throws -> [PairedDevice] {
-        guard let data = try? Data(contentsOf: fileURL) else { return [] }
-        return (try? JSONDecoder().decode([PairedDevice].self, from: data)) ?? []
-    }
-
-    public func save(_ device: PairedDevice) throws {
-        var devices = try pairedDevices()
-        devices.removeAll { $0.fingerprint == device.fingerprint }
-        devices.append(device)
-        try write(devices)
-    }
-
-    public func remove(fingerprint: String) throws {
-        var devices = try pairedDevices()
-        devices.removeAll { $0.fingerprint == fingerprint }
-        try write(devices)
-    }
-
-    private func write(_ devices: [PairedDevice]) throws {
-        let data = try JSONEncoder().encode(devices)
-        // Atomic so a reader in the other process never sees a half-written
-        // file — the app polls this while the extension may be writing it.
-        try data.write(to: fileURL, options: .atomic)
-    }
-}
-
-/// Paired devices held in memory for the lifetime of a process.
-///
-/// Used by the macOS system extension. That process is root, outside the login
-/// session, so it can reach neither the user keychain nor a sandboxed app
-/// group container reliably — and the app is unsandboxed while the extension is
-/// sandboxed, so the two resolve group paths differently.
-///
-/// Rather than fight that, the extension holds the list in memory: seeded from
-/// `providerConfiguration` at startup, and read back by the app through the
-/// existing `"devices"` provider message when a new pairing completes. The app
-/// remains the only writer of durable state, in its keychain.
+// `GroupDeviceDirectory` lived here: an app-group JSON file implementing
+// `DeviceDirectory`. It had ZERO call sites and was superseded by the
+// in-memory directory plus the "devices" IPC round trip.
+//
+// Deleted rather than left in place. A third storage path that looks
+// production-ready is worse than none: durability here is genuinely confusing
+// — the extension's store is in memory, the app's is the keychain, and the
+// two are reconciled by a poll — and an unused fourth option invites someone
+// to "fix" that by wiring up the one nothing has ever exercised.
 public final class InMemoryDeviceDirectory: DeviceDirectory, @unchecked Sendable {
 
     private var devices: [PairedDevice]
