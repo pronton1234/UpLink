@@ -7,11 +7,17 @@ import OSLog
 import UpLinkKit
 
 /// What the user is currently looking at.
+///
+/// **The phone is passive now.** `usbmuxd` carries connections one way only, so
+/// the Mac dials and this phone listens. There is nothing to search for and
+/// nothing to pick: either a Mac is bridging through us or one is not, and the
+/// only thing the user can influence is whether the listener is up.
 enum BridgeState: Equatable {
     case needsPermission
+    /// The bridge is switched off. Nothing is listening.
     case idle
-    case searching
-    case connecting(String)
+    /// Listening, with no Mac connected. Plug the cable in.
+    case waitingForMac
     case connected(peer: String, egress: EgressInterface)
     case failed(String)
 
@@ -23,20 +29,22 @@ enum BridgeState: Equatable {
 
 /// Drives the tunnel on the user's behalf.
 ///
-/// The phone owns the session: the user opens the app, picks a Mac, and taps
-/// Connect. The Mac is entirely passive throughout. Stopping is equally
-/// explicit — there is no on-demand rule, because a bridge that turned itself
-/// back on would spend the user's cellular data without being asked.
+/// The user switches the bridge on, and the extension then listens on a
+/// loopback port that `usbmuxd` exposes to whatever Mac is plugged in. Starting
+/// is explicit — there is no on-demand rule, because a bridge that turned
+/// itself back on would spend the user's cellular data without being asked —
+/// but nothing else is: once it is on, plugging in the cable is the whole
+/// interaction.
 @MainActor
 @Observable
 final class BridgeController {
 
     private(set) var state: BridgeState = .idle
-    private(set) var peers: [DiscoveredPeer] = []
     private(set) var pairedDevices: [PairedDevice] = []
 
-    /// Non-nil while a pairing is in progress and the user must type a code.
-    var pendingPairingPeer: DiscoveredPeer?
+    /// True while the pairing sheet is up and the user is typing the code they
+    /// read off the Mac.
+    var isPairing = false
 
     /// The phone drives every session, and until now it did so in total
     /// silence: 370 lines with not one log call. When autoconnect failed the
@@ -53,8 +61,6 @@ final class BridgeController {
     private var manager: NETunnelProviderManager?
     private let store = PairedDeviceStore()
     private let queue = DispatchQueue(label: "com.uplink.app")
-    private var discovery: PeerDiscovery?
-    private var discoveryTask: Task<Void, Never>?
     private var statusTask: Task<Void, Never>?
     private var missedStatusReplies = 0
     /// The device the live session is using, so forgetting it can end it.
@@ -70,10 +76,13 @@ final class BridgeController {
         // that looked like connection failures and were really the harness
         // never firing. The controller is constructed at process launch, so
         // this runs either way. No-op unless UPLINK_AUTOCONNECT is set.
-        if ProcessInfo.processInfo.environment["UPLINK_AUTOCONNECT"] != nil {
+        let environment = ProcessInfo.processInfo.environment
+        if environment["UPLINK_AUTOCONNECT"] != nil
+            || environment["UPLINK_AUTOPAIR"] != nil
+            || environment["UPLINK_AUTOUNPAIR"] != nil {
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.startDiscovery()
+                await self.runPairingHarnessIfRequested()
                 await self.autoConnectIfRequested()
             }
         }
@@ -96,53 +105,20 @@ final class BridgeController {
         }
     }
 
-    // MARK: Discovery
+    // MARK: Headless harness
+    //
+    // The pairing lifecycle — pair, remove on both devices, pair again — is the
+    // flow that has actually been broken, and the only way to exercise it used
+    // to be a person holding a phone and reading a code off a Mac screen. That
+    // made every check a one-off, which is how a half-removed pairing kept
+    // poisoning later measurements.
+    //
+    // Neither hook can run without someone having put a code on the Mac's
+    // screen, so this is not a way to pair without consent — it is a way to
+    // type the code without a human thumb.
 
-    func startDiscovery() {
-        guard discovery == nil else { return }
-        state = .searching
-
-        // AWDL first when available, falling back to the local link. Which one
-        // wins is decided by the Phase 0 spike; this ordering is the only place
-        // that has to change.
-        let discovery = PeerDiscovery(profile: TransportProfile.preferenceOrder.first ?? .localLink)
-        self.discovery = discovery
-
-        discoveryTask = Task { [weak self] in
-            await discovery.start(on: self?.queue ?? .main)
-            for await found in await discovery.peers() {
-                await MainActor.run { self?.peers = found }
-            }
-        }
-    }
-
-    /// Connects without a tap, when and only when the harness asks for it.
-    ///
-    /// Gated behind an environment variable the app is never launched with in
-    /// normal use — `devicectl … --environment-variables '{"UPLINK_AUTOCONNECT":"1"}'`.
-    /// This deliberately does **not** become an on-demand rule: the product's
-    /// position is that a bridge which turns itself back on spends the user's
-    /// cellular data without being asked. This is a test affordance, so that
-    /// "does the bridge actually carry traffic over the radio" can be answered
-    /// by a script rather than by a human holding a phone.
-    ///
-    /// Only ever connects to an already-paired Mac; it cannot initiate pairing,
-    /// which still requires a person and a code.
-    /// Drives pairing and unpairing from the environment, for automated tests.
-    ///
-    /// Sibling of ``autoConnectIfRequested()``, and it exists for the same
-    /// reason: the pairing lifecycle — pair, remove on both devices, pair again
-    /// — is the flow that has actually been broken, and until now the only way
-    /// to exercise it was a person holding a phone and reading a code off a Mac
-    /// screen. That made every check a one-off, which is exactly how a
-    /// half-removed pairing kept poisoning later measurements.
-    ///
-    /// `UPLINK_AUTOPAIR=<six digits>` pairs with the first Mac discovered.
     /// `UPLINK_AUTOUNPAIR=1` forgets every paired Mac.
-    ///
-    /// Neither can run without someone having put a code on the Mac's screen,
-    /// so this is not a way to pair without consent — it is a way to type the
-    /// code without a human thumb.
+    /// `UPLINK_AUTOPAIR=<six digits>` arms the listener with that code.
     func runPairingHarnessIfRequested() async {
         let environment = ProcessInfo.processInfo.environment
 
@@ -156,29 +132,40 @@ final class BridgeController {
         }
 
         guard let digits = environment["UPLINK_AUTOPAIR"] else { return }
-        log.error("harness: pairing with code \(digits, privacy: .public)")
+        log.error("harness: arming pairing with code \(digits, privacy: .public)")
 
-        // Discovery needs a moment before there is anything to pair with.
-        var target: DiscoveredPeer?
-        for _ in 0 ..< 60 {
-            if let found = peers.first(where: { $0.publishesIdentity }) {
-                target = found
-                break
-            }
-            try? await Task.sleep(for: .milliseconds(500))
+        // The listener has to be up before a code can be armed, and the Mac has
+        // to be able to dial it. Starting the bridge is part of the harness's
+        // job for the same reason it is part of the user's.
+        if !isRunning { await startBridge() }
+        for _ in 0 ..< 40 {
+            if isRunning { break }
+            try? await Task.sleep(for: .milliseconds(250))
         }
-        guard let target else {
-            log.error("harness: FAILED — no Mac discovered")
+
+        if let message = await completePairing(code: digits) {
+            log.error("harness: PAIRING FAILED — \(message, privacy: .public)")
             return
         }
-
-        if let message = await completePairing(peer: target, code: digits) {
-            log.error("harness: PAIRING FAILED — \(message, privacy: .public)")
-        } else {
-            log.error("harness: PAIRED with \(target.name, privacy: .public); now \(self.pairedDevices.count, privacy: .public) device(s)")
+        // Armed is not paired. The Mac still has to dial, so the harness waits
+        // for the record to appear rather than declaring success on the arming.
+        for _ in 0 ..< 60 {
+            try? await Task.sleep(for: .seconds(1))
+            reloadPairedDevices()
+            if let device = pairedDevices.first {
+                log.error("harness: PAIRED with \(device.name, privacy: .public); now \(self.pairedDevices.count, privacy: .public) device(s)")
+                return
+            }
         }
+        log.error("harness: PAIRING FAILED — code armed but no Mac dialled within 60s")
     }
 
+    /// `UPLINK_AUTOCONNECT=1` switches the bridge on; `stop` switches it off.
+    ///
+    /// Gated behind an environment variable the app is never launched with in
+    /// normal use. This deliberately does **not** become an on-demand rule: a
+    /// bridge that turns itself back on spends the user's cellular data without
+    /// being asked.
     func autoConnectIfRequested() async {
         let request = ProcessInfo.processInfo.environment["UPLINK_AUTOCONNECT"]
 
@@ -209,88 +196,61 @@ final class BridgeController {
             }
         }
 
-        // Discovery needs a moment to populate before there is anything to pick.
+        await startBridge()
+
+        // The phone is passive, so "connected" is not something it can bring
+        // about — it can only be listening and wait for the Mac to dial. Report
+        // both facts, because they fail differently: no listener is a phone
+        // problem, a listener with no session is a cable or Mac problem.
         for _ in 0 ..< 60 {
-            if let peer = peers.first(where: { peer in
-                guard let fingerprint = peer.fingerprint else { return false }
-                return pairedDevices.contains { $0.fingerprint == fingerprint }
-            }) {
-                log.error("autoconnect: connecting to \(peer.name, privacy: .public)")
-                await connect(to: peer)
+            if state.isConnected {
+                log.error("autoconnect: a Mac is bridging")
                 return
             }
             try? await Task.sleep(for: .milliseconds(500))
         }
-
-        // Both counts, because they fail differently and the difference decides
-        // what to do next. Nothing discovered means the Mac is not advertising
-        // or is unreachable on this link; peers discovered but none of them
-        // paired means the phone has lost its half of the pairing — which is
-        // what reinstalling the app does — and someone has to enter a code.
-        // Reporting only "no paired Mac appeared" conflates the two.
-        let seen = peers.map { "\($0.name)/\($0.fingerprint ?? "no-fp")" }.joined(separator: ",")
         log.error("""
-            autoconnect FAILED after 30s: \
-            \(self.peers.count, privacy: .public) peer(s) discovered [\(seen, privacy: .public)], \
-            \(self.pairedDevices.count, privacy: .public) paired
+            autoconnect: listening but no Mac dialled within 30s — \
+            \(self.pairedDevices.count, privacy: .public) paired device(s); \
+            check the cable and that UpLink is running on the Mac
             """)
-        state = .failed("autoconnect: no paired Mac appeared within 30s")
     }
 
-    func stopDiscovery() {
-        discoveryTask?.cancel()
-        discoveryTask = nil
-        Task { [discovery] in await discovery?.stop() }
-        discovery = nil
-    }
-
-    // MARK: Connect / disconnect
-
-    func connect(to peer: DiscoveredPeer) async {
-        guard let fingerprint = peer.fingerprint,
-              let paired = pairedDevices.first(where: { $0.fingerprint == fingerprint })
-        else {
-            // Unknown Mac — the user must pair before any traffic flows.
-            pendingPairingPeer = peer
-            return
+    /// Whether the tunnel is up, which is what puts the listener on the air.
+    var isRunning: Bool {
+        switch manager?.connection.status {
+        case .connected, .connecting: true
+        default: false
         }
-
-        state = .connecting(peer.name)
-        await start(with: paired, profile: peer.profile)
     }
 
-    private func start(with device: PairedDevice, profile: TransportProfile) async {
+    // MARK: Switching the bridge on
+
+    /// Starts the tunnel, which is what puts the listener on the air.
+    ///
+    /// No peer is chosen and none is configured: the extension binds a loopback
+    /// port and waits for whatever Mac is plugged in to dial it. That is also
+    /// what makes a FIRST pairing possible — the Mac has to be able to reach
+    /// something before any pairing exists, so the listener must come up
+    /// unpaired and refuse every handshake until a code is typed.
+    func startBridge() async {
         do {
             await prepare()
             guard let manager else { throw BridgeError.noManager }
 
-            let identity = try store.loadOrCreateIdentity()
-            let remoteKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: device.publicKey)
-
-            // Keyed by THIS phone's fingerprint, not the Mac's. The Mac may
-            // have several phones paired and offers one PSK per phone; the
-            // identity we present is what selects ours.
-            let localFingerprint = PairedDevice.fingerprint(of: identity.publicKey.rawRepresentation)
-            let psk = try KeySchedule.sessionKey(
-                localPrivate: identity,
-                remotePublic: remoteKey,
-                context: Data(localFingerprint.utf8)
-            )
-
             let proto = NETunnelProviderProtocol()
             proto.providerBundleIdentifier = "com.uplink.app.tunnel"
-            // Required by NetworkExtension but unused: there is no remote
-            // server, only a Mac on the local link.
-            proto.serverAddress = device.name
-            proto.providerConfiguration = [
-                "macFingerprint": device.fingerprint,
-                "localFingerprint": localFingerprint,
-                "preSharedKey": psk.withUnsafeBytes { Data($0) },
-                "profile": profile.rawValue,
-            ]
+            // Required by NetworkExtension but meaningless here: there is no
+            // remote server, only a Mac on the other end of a cable.
+            proto.serverAddress = "UpLink"
+            // Deliberately EMPTY. The extension reads its identity and its
+            // paired Macs straight from the keychain — on iOS an app extension
+            // shares the app's access group — so there is nothing to seed and
+            // no snapshot to go stale.
+            proto.providerConfiguration = [:]
 
             manager.protocolConfiguration = proto
-            manager.localizedDescription = "UpLink — \(device.name)"
+            manager.localizedDescription = "UpLink"
             manager.isEnabled = true
             // Deliberately no on-demand rules.
             manager.onDemandRules = []
@@ -300,26 +260,20 @@ final class BridgeController {
             try await manager.loadFromPreferences()
             try manager.connection.startVPNTunnel()
 
-            // Egress starts unknown and is corrected by the status poll below.
-            // It must never be left at the placeholder: the dial reads the
-            // interface the connection actually used, and that observation is
-            // the user's only evidence that they are bypassing anything. An
-            // earlier version set this once and never updated it, so the phone
-            // permanently warned "not going over cellular" while the Mac was
-            // correctly reporting Cellular.
-            // Deliberately NOT `.connected` yet. `startVPNTunnel()` only means
-            // the request was accepted; the tunnel still has to come up, find
-            // the Mac and complete a handshake, any of which can fail. Claiming
-            // success here is what let the UI show "connected" while nothing
-            // was connected — and an unreliable indicator makes every test
-            // afterwards meaningless.
-            state = .connecting(device.name)
-            activePeerFingerprint = device.fingerprint
-            startStatusPolling(peer: device.name)
+            // Deliberately NOT `.connected`. `startVPNTunnel()` only means the
+            // request was accepted; the listener still has to bind, and a Mac
+            // still has to dial it. Claiming success here is what let the UI
+            // show a connection that did not exist.
+            state = .waitingForMac
+            startStatusPolling()
         } catch {
             state = .failed(error.localizedDescription)
         }
     }
+
+    // MARK: Connect / disconnect
+
+
 
     func disconnect() {
         statusTask?.cancel()
@@ -335,11 +289,11 @@ final class BridgeController {
     /// Provider messages are request/response only — the extension cannot push
     /// — so the app polls, exactly as the Mac's menu bar does. Once a second is
     /// imperceptible and keeps the warning honest.
-    private func startStatusPolling(peer: String) {
+    private func startStatusPolling() {
         statusTask?.cancel()
         statusTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                await self?.refreshStatus(peer: peer)
+                await self?.refreshStatus()
                 try? await Task.sleep(for: .seconds(1))
             }
         }
@@ -369,7 +323,7 @@ final class BridgeController {
         return reply ?? "The extension did not answer."
     }
 
-    private func refreshStatus(peer: String) async {
+    private func refreshStatus() async {
         guard let session = manager?.connection as? NETunnelProviderSession else { return }
 
         let response: String? = await withCheckedContinuation { continuation in
@@ -387,7 +341,7 @@ final class BridgeController {
         guard let response else {
             missedStatusReplies += 1
             if missedStatusReplies >= 3, state.isConnected {
-                state = .connecting(peer)
+                state = .waitingForMac
             }
             return
         }
@@ -398,25 +352,35 @@ final class BridgeController {
         // already ended. Believing the extension in both directions is the
         // whole point of asking it.
         switch BridgeStatusReply.parse(response) {
-        case let .connected(_, egress):
-            let updated = BridgeState.connected(peer: peer, egress: egress)
+        case let .connected(fingerprint, egress):
+            // The name comes from our own paired record, not from the wire: the
+            // extension reports a fingerprint, which is the thing it can prove.
+            let name = pairedDevices.first { $0.fingerprint == fingerprint }?.name ?? "Mac"
+            let updated = BridgeState.connected(peer: name, egress: egress)
             if state != updated { state = updated }
+            activePeerFingerprint = fingerprint
         case .disconnected:
-            if state.isConnected { state = .connecting(peer) }
-        case .unpaired:
-            // The Mac has removed this phone. Retrying is pointless — its
-            // listener no longer holds our key — and without acting on it the
-            // phone dials forever into a refused handshake, which is exactly
-            // what made the two devices disagree about whether they were
-            // connected.
-            await forgetPeerAfterRemoteUnpair()
+            if state != .idle { state = .waitingForMac }
+            activePeerFingerprint = nil
+        case let .unpaired(fingerprint):
+            // ADDRESSED. The reply names WHICH Mac forgot us, and the phone
+            // must act on that one — it used to ignore the field entirely and
+            // remove `activePeerFingerprint` instead, so a notice about Mac A
+            // arriving while Mac B was bridging deleted **B's** pairing and
+            // then stopped the whole tunnel, taking the listener off the air
+            // for every other paired Mac. The Mac's own side bound the
+            // fingerprint correctly all along; this was a one-sided asymmetry.
+            await forgetPeerAfterRemoteUnpair(fingerprint: fingerprint)
+        case .connecting:
+            // The Mac's vocabulary, not the phone's. Handled so the switch
+            // stays exhaustive and a future sender is not silently ignored.
+            break
+
         case .refused:
-            // The Mac is there and will not have us — almost always a pairing it
-            // no longer has. Retrying at a five-second ceiling forever cannot
-            // fix that, and "Connecting…" with no timeout gave the user nothing
-            // to act on.
-            disconnect()
-            state = .failed("\(peer) no longer recognises this iPhone. Pair again to reconnect.")
+            // The phone listens now, so a refusal is the MAC's to report, not
+            // ours. Kept so the switch stays exhaustive and a future sender is
+            // not silently ignored.
+            break
         case .unintelligible:
             break  // ask again rather than act on noise
         }
@@ -433,10 +397,14 @@ final class BridgeController {
         reloadPairedDevices()
     }
 
-    /// Drops our half of a pairing the Mac has already dropped.
-    private func forgetPeerAfterRemoteUnpair() async {
-        guard let fingerprint = activePeerFingerprint else {
-            disconnect()
+    /// Drops our half of a pairing the named Mac has already dropped.
+    ///
+    /// - Parameter fingerprint: which Mac. Nil only from an older extension
+    ///   that sent a bare "unpaired"; in that case there is nothing safe to
+    ///   remove, so the notice is logged and dropped rather than guessed at.
+    private func forgetPeerAfterRemoteUnpair(fingerprint: String?) async {
+        guard let fingerprint, !fingerprint.isEmpty else {
+            log.error("unpaired notice with no fingerprint — ignoring rather than guessing")
             return
         }
         do {
@@ -448,10 +416,16 @@ final class BridgeController {
             return
         }
         reloadPairedDevices()
-        disconnect()
+
+        // Only if it was THIS Mac bridging. Stopping the tunnel outright took
+        // the listener off the air for every other paired Mac — one Mac
+        // forgetting us is not a reason to stop being reachable by the rest.
+        if activePeerFingerprint == fingerprint {
+            activePeerFingerprint = nil
+            state = .waitingForMac
+        }
         // Deliberately no message: the device simply disappears from both
-        // lists, which is the agreed behaviour. `disconnect()` already returns
-        // the UI to idle.
+        // lists, which is the agreed behaviour.
     }
 
     // MARK: Pairing
@@ -465,32 +439,62 @@ final class BridgeController {
     /// typed a code, the spinner stopped, and nothing appeared to happen. The
     /// only rational response is to try again, which is exactly what was
     /// reported: "re-pairing fails and I have to retry several times."
+    /// Arms the listener with the code the user read off the Mac.
+    ///
+    /// **The phone no longer runs the handshake.** The Mac dials, so typing the
+    /// code here does one thing: it puts the matching PSK into the extension's
+    /// TLS options so the Mac's dial can succeed. The pairing itself completes
+    /// a moment later, on the Mac's side, and arrives back here as a new record
+    /// in the shared keychain.
+    ///
+    /// Returns nil once the code is armed, or the message to show IN the sheet.
+    /// Deliberately not `state = .failed(...)`: the sheet is still up and would
+    /// hide it, which is what made a failed pairing look like nothing happening
+    /// at all — and the only rational response to that is to try again, which
+    /// is exactly what was reported.
     @discardableResult
-    func completePairing(peer: DiscoveredPeer, code: String) async -> String? {
+    func completePairing(code: String) async -> String? {
         do {
-            let parsed = try PairingCode(digits: code)
-            let identity = try store.loadOrCreateIdentity()
-
-            // The pairing session authenticates with the code, and its only
-            // job is to carry the long-term key exchange. Everything after
-            // this uses the 256-bit derived key.
-            let device = try await PairingClient(queue: queue).pair(
-                with: peer,
-                code: parsed,
-                localIdentity: identity
-            )
-
-            try store.save(device)
-            reloadPairedDevices()
-            pendingPairingPeer = nil
-
-            await connect(to: peer)
-            return nil
+            // Parsed here so a malformed code is rejected before the tunnel is
+            // involved, and the message names the actual problem.
+            _ = try PairingCode(digits: code)
         } catch {
-            // Deliberately NOT `state = .failed(...)`: the sheet is still up and
-            // would hide it. The caller shows this where the user is looking.
             return pairingMessage(for: error)
         }
+
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              manager?.connection.status == .connected || manager?.connection.status == .connecting
+        else {
+            return "Turn UpLink on first, then enter the code."
+        }
+
+        let reply: String? = await withCheckedContinuation { continuation in
+            do {
+                try session.sendProviderMessage(Data("pair:\(code)".utf8)) { data in
+                    continuation.resume(returning: data.flatMap { String(data: $0, encoding: .utf8) })
+                }
+            } catch {
+                continuation.resume(returning: "error|\(error)")
+            }
+        }
+
+        guard reply == "ok" else {
+            return "Couldn't get ready to pair. \(reply ?? "The bridge didn't answer.")"
+        }
+
+        // Armed. The Mac has 60 seconds to dial; the sheet closes and the
+        // paired list fills in when it does.
+        isPairing = false
+        // Pick up the new record as soon as the Mac writes it.
+        Task { [weak self] in
+            for _ in 0 ..< 60 {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self else { return }
+                self.reloadPairedDevices()
+                if !self.pairedDevices.isEmpty { return }
+            }
+        }
+        return nil
     }
 
     private func pairingMessage(for error: Error) -> String {
@@ -519,18 +523,29 @@ final class BridgeController {
         // never delivered, so the Mac keeps the phone in its paired list and
         // keeps advertising a key the user has just revoked.
         Task { [weak self] in
-            // ADDRESSED, and only when the live session is this device.
+            // ADDRESSED, and sent ALWAYS — not only when this Mac is the live
+            // session.
             //
-            // It used to send a bare "unpair" whenever anything was connected,
-            // and the extension acted on whichever session was live — so
-            // deleting Mac B while bridging Mac A told A it had been unpaired,
-            // and A acted on it. The Mac's own version was addressed all along.
-            if self?.activePeerFingerprint == device.fingerprint {
-                _ = await self?.sendProviderMessage("unpair:\(device.fingerprint)")
-            }
+            // The address matters: a bare "unpair" made the extension act on
+            // whichever session was live, so deleting Mac B while bridging Mac
+            // A told A it had been unpaired. But gating the message on the
+            // device being live was the opposite mistake, and it made the whole
+            // tombstone path dead code. Removing a Mac that is NOT connected is
+            // precisely the case that needs the extension: it is the side that
+            // holds the listener, so it is the only thing that can keep that
+            // Mac's key on the air long enough to tell it, and the only thing
+            // that can rebuild the listener so the key stops being offered.
+            // Without this the removed Mac is never told and redials forever
+            // into a refusal nothing explains.
+            _ = await self?.sendProviderMessage("unpair:\(device.fingerprint)")
+
             await MainActor.run {
                 guard let self else { return }
-                if self.activePeerFingerprint == device.fingerprint || self.state.isConnected {
+                // Only if it was THIS device bridging. `state.isConnected` is
+                // true whenever any Mac is connected, so testing it here tore
+                // down a healthy bridge with Mac A because the user removed
+                // Mac B — the exact cross-talk the addressing above prevents.
+                if self.activePeerFingerprint == device.fingerprint {
                     self.disconnect()
                 }
                 try? self.store.remove(fingerprint: device.fingerprint)

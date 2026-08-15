@@ -42,7 +42,7 @@ struct TLSHandshakeRegressionTests {
             using: TransportParameters.listener(
                 sessionKeys: [(identity, psk)],
                 pairingKey: nil,
-                profile: .localLink
+                port: UInt16.random(in: 41000 ..< 48000)
             )
         )
         let held = Held<NWConnection?>(nil)
@@ -58,7 +58,7 @@ struct TLSHandshakeRegressionTests {
         let connection = NWConnection(
             host: "127.0.0.1",
             port: bound,
-            using: TransportParameters.session(psk: psk, identity: identity, profile: .localLink)
+            using: TransportParameters.session(psk: psk, identity: identity)
         )
         defer { connection.cancel() }
 
@@ -128,7 +128,7 @@ struct TLSHandshakeRegressionTests {
             using: TransportParameters.listener(
                 sessionKeys: [("regression", SymmetricKey(size: .bits256))],
                 pairingKey: nil,
-                profile: .localLink
+                port: UInt16.random(in: 41000 ..< 48000)
             )
         )
         let held = Held<NWConnection?>(nil)
@@ -145,8 +145,7 @@ struct TLSHandshakeRegressionTests {
             port: bound,
             using: TransportParameters.session(
                 psk: SymmetricKey(size: .bits256),
-                identity: "regression",
-                profile: .localLink
+                identity: "regression"
             )
         )
         defer { connection.cancel() }

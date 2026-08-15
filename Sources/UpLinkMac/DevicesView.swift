@@ -25,9 +25,9 @@ struct DevicesView: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            Image(systemName: model.status.isConnected ? "personalhotspot" : "personalhotspot.slash")
+            Image(systemName: headerSymbol)
                 .font(.system(size: 26, weight: .light))
-                .foregroundStyle(model.status.isConnected ? .green : .secondary)
+                .foregroundStyle(headerTint)
                 .frame(width: 34)
 
             VStack(alignment: .leading, spacing: 2) {
@@ -39,6 +39,27 @@ struct DevicesView: View {
             Spacer()
         }
         .padding(16)
+    }
+
+    /// Mirrors the menu bar glyph: the cable's presence is the first thing to
+    /// read off this window.
+    private var headerSymbol: String {
+        switch model.status {
+        case .connected(_, .cellular): "personalhotspot"
+        case .connected: "exclamationmark.triangle"
+        case .waitingForCable: "cable.connector.slash"
+        default: "cable.connector"
+        }
+    }
+
+    private var headerTint: Color {
+        switch model.status {
+        case .connected(_, .cellular): .green
+        case .connected: .orange
+        case .failed: .red
+        case .waitingForCable: .secondary
+        default: .accentColor
+        }
     }
 
     private var pairingCard: some View {

@@ -24,11 +24,5 @@
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 	</array>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>UpLink finds your Mac on the local network so it can share this iPhone's cellular connection with it.</string>
-	<key>NSBonjourServices</key>
-	<array>
-		<string>_uplink._tcp</string>
-	</array>
 </dict>
 </plist>

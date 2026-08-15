@@ -65,18 +65,14 @@ struct ContentView: View {
         }
         .task {
             await controller.prepare()
-            controller.startDiscovery()
-            // No-op unless the harness set UPLINK_AUTOCONNECT=1.
-            await controller.runPairingHarnessIfRequested()
-            await controller.autoConnectIfRequested()
         }
         .onChange(of: scenePhase) { _, phase in
             // See `refreshFromStore`: a launch before the device's first unlock
             // reads an empty keychain and nothing looked again.
             if phase == .active { controller.refreshFromStore() }
         }
-        .sheet(item: $controller.pendingPairingPeer) { peer in
-            PairingSheet(peer: peer, controller: controller)
+        .sheet(isPresented: $controller.isPairing) {
+            PairingSheet(controller: controller)
         }
     }
 
@@ -103,54 +99,66 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.red)
+        } else if controller.isRunning {
+            // Listening. Nothing left to do but plug the cable in — so the
+            // control stops being a button and starts being an instruction.
+            Button(role: .destructive) {
+                controller.disconnect()
+            } label: {
+                Text("Turn Off")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+            }
+            .buttonStyle(.bordered)
         } else {
             Button {
-                if let peer = controller.peers.first {
-                    Task { await controller.connect(to: peer) }
-                }
+                Task { await controller.startBridge() }
             } label: {
-                Text(controller.peers.isEmpty ? "Looking for your Mac…" : "Connect")
+                Text("Turn On")
                     .font(.headline)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(controller.peers.isEmpty)
         }
     }
 
     @ViewBuilder
     private var peerSection: some View {
-        if !controller.peers.isEmpty && !controller.state.isConnected {
+        if !controller.state.isConnected {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Nearby Macs")
+                Text("Paired Macs")
                     .font(.footnote.weight(.semibold))
                     .foregroundStyle(.secondary)
 
-                ForEach(controller.peers) { peer in
-                    Button {
-                        Task { await controller.connect(to: peer) }
-                    } label: {
+                if controller.pairedDevices.isEmpty {
+                    Text("No Macs yet. Connect the cable and pair to get started.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 10)
+                        .padding(.horizontal, 14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                } else {
+                    ForEach(controller.pairedDevices) { device in
                         HStack {
                             Image(systemName: "laptopcomputer")
-                            Text(peer.name)
+                            Text(device.name)
                             Spacer()
-                            if peer.isPaired(with: controller.pairedDevices) {
-                                Image(systemName: "checkmark.seal.fill")
-                                    .foregroundStyle(.green)
-                                    .accessibilityLabel("Paired")
-                            } else {
-                                Text("Pair")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.blue)
-                            }
+                            Image(systemName: "checkmark.seal.fill")
+                                .foregroundStyle(.green)
+                                .accessibilityLabel("Paired")
                         }
                         .padding(.vertical, 10)
                         .padding(.horizontal, 14)
                         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
                     }
-                    .buttonStyle(.plain)
                 }
+
+                Button("Pair a Mac…") { controller.isPairing = true }
+                    .font(.footnote.weight(.semibold))
+                    .padding(.top, 2)
             }
         }
     }
@@ -191,7 +199,7 @@ struct StatusDial: View {
         // fault and must not look like one — see `headline`.
         case .connected(_, .unknown): "antenna.radiowaves.left.and.right"
         case .connected: "exclamationmark.triangle"
-        case .connecting, .searching: "dot.radiowaves.left.and.right"
+        case .waitingForMac: "cable.connector"
         case .failed: "exclamationmark.triangle"
         case .needsPermission: "lock.shield"
         case .idle: "personalhotspot"
@@ -208,8 +216,7 @@ struct StatusDial: View {
         // from the real warning, which is "we looked, and it is NOT cellular".
         case .connected(_, .unknown): "Connected"
         case let .connected(_, egress): egress.displayName
-        case .connecting: "Connecting"
-        case .searching: "Searching"
+        case .waitingForMac: "Waiting"
         case .failed: "Problem"
         case .needsPermission: "Setup"
         case .idle: "Ready"
@@ -252,8 +259,7 @@ struct StatusCaption: View {
         case let .connected(peer, .cellular): "Bridging \(peer)"
         case let .connected(peer, .unknown): "Connected to \(peer)"
         case let .connected(peer, egress): "Bridging \(peer) over \(egress.displayName)"
-        case let .connecting(peer): "Connecting to \(peer)…"
-        case .searching: "Looking for your Mac"
+        case .waitingForMac: "Waiting for your Mac"
         case .idle: "Not bridging"
         case .needsPermission: "One-time setup needed"
         case .failed: "Couldn't bridge"
@@ -269,12 +275,17 @@ struct StatusCaption: View {
         case .connected:
             // The warning that makes the whole egress-reporting path worth it.
             "Traffic is not going over cellular, so you're not bypassing anything. Check that cellular data is on."
+        case .waitingForMac:
+            // The one instruction that matters, and the one the old copy got
+            // wrong: nothing is "found automatically" any more. The cable is
+            // the whole mechanism.
+            "Connect this iPhone to your Mac with a cable. You can lock your phone once it's bridging."
         case .idle:
-            "Open your Mac's lid and it'll be found automatically."
+            "Turn UpLink on, then connect the cable to your Mac."
+        case .needsPermission:
+            "iOS needs your permission to add a VPN configuration. UpLink uses it to keep running while the phone is locked — it does not send your traffic to a server."
         case let .failed(message):
             message
-        default:
-            nil
         }
     }
 }

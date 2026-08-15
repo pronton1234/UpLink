@@ -20,10 +20,16 @@ public protocol DeviceDirectory: Sendable {
 
 extension PairedDeviceStore: DeviceDirectory {}
 
-/// Paired devices in a file inside the shared app-group container.
+/// Paired devices held in memory, for a process that cannot keep them.
 ///
-/// Readable and writable by both the app and the system extension, which is the
-/// point: the extension accepts pairings, the app displays and revokes them.
+/// The Mac's system extension runs as root outside the login session and gets
+/// `errSecNotAvailable (-25291)` from the keychain, so it cannot store anything
+/// durable: the app seeds it through `providerConfiguration` and learns about
+/// new pairings over the "devices" IPC round trip.
+///
+/// The PHONE has no such problem — an iOS app extension shares the app's
+/// keychain access group — so its listener uses `PairedDeviceStore` directly
+/// and none of this applies there.
 // `GroupDeviceDirectory` lived here: an app-group JSON file implementing
 // `DeviceDirectory`. It had ZERO call sites and was superseded by the
 // in-memory directory plus the "devices" IPC round trip.

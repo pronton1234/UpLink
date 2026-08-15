@@ -7,7 +7,6 @@ import UpLinkKit
 /// user has to walk to their Mac, so the instruction has to be unambiguous.
 struct PairingSheet: View {
 
-    let peer: DiscoveredPeer
     @Bindable var controller: BridgeController
 
     @State private var code = ""
@@ -26,9 +25,9 @@ struct PairingSheet: View {
                     .padding(.top, 24)
 
                 VStack(spacing: 8) {
-                    Text("Pair with \(peer.name)")
+                    Text("Pair with your Mac")
                         .font(.title2.weight(.semibold))
-                    Text("Click UpLink in your Mac's menu bar and choose **Show Pairing Code**, then enter the six digits here.")
+                    Text("Connect the cable, click UpLink in your Mac's menu bar and choose **Show Pairing Code**, then enter the six digits here.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -67,7 +66,7 @@ struct PairingSheet: View {
                     isSubmitting = true
                     failure = nil
                     Task {
-                        let message = await controller.completePairing(peer: peer, code: code)
+                        let message = await controller.completePairing(code: code)
                         isSubmitting = false
                         withAnimation { failure = message }
                         // Only the digits, so a mistyped one costs a retype
@@ -90,7 +89,7 @@ struct PairingSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
-                        controller.pendingPairingPeer = nil
+                        controller.isPairing = false
                         dismiss()
                     }
                 }

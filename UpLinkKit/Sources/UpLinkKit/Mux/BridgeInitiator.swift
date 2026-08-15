@@ -119,8 +119,28 @@ public actor BridgeInitiator {
     /// WINDOW frame that would unblock them.
     private var creditWaiters: [UInt32: [CheckedContinuation<Void, Never>]] = [:]
 
-    public init(channel: FrameChannel) {
+    /// This Mac's own fingerprint, announced in the opening `HELLO`.
+    private let localFingerprint: String
+
+    /// Proves the announced fingerprint is ours. See ``HelloProof``.
+    private let helloProof: Data
+
+    public init(
+        channel: FrameChannel,
+        localFingerprint: String = "",
+        peerFingerprint: String? = nil,
+        helloProof: Data = Data()
+    ) {
         self.channel = channel
+        self.localFingerprint = localFingerprint
+        self.helloProof = helloProof
+        // Set from what this Mac dialled, not learned from the peer.
+        //
+        // The session PSK is derived from this phone's public key, so a
+        // completed TLS handshake is already proof of which phone answered.
+        // Taking the value from our own paired record rather than from a frame
+        // means there is no claim here to have to verify.
+        self.peerFingerprint = peerFingerprint
     }
 
     public func onEgressChange(_ handler: @escaping @Sendable (EgressInterface) -> Void) -> UUID {
@@ -139,23 +159,13 @@ public actor BridgeInitiator {
         egressObservers.removeValue(forKey: token)
     }
 
-    /// Pumps frames until the peer disconnects.
-    public func run() async throws {
-        try await pump()
-    }
-
-    /// Resumes after the caller has already read the opening `HELLO` in order
-    /// to tell a session connection from a pairing one.
+    /// Opens the session and pumps frames until the peer disconnects.
     ///
-    /// The partially-consumed decoder is handed over rather than recreated:
-    /// the phone may well have pipelined its first `OPEN` into the same TCP
-    /// segment as the `HELLO`, and a fresh decoder would drop it.
-    public func run(resuming hello: Frame, decoder: FrameDecoder) async throws {
-        self.decoder = decoder
-        try await handle(hello)
-        while let frame = try self.decoder.next() {
-            try await handle(frame)
-        }
+    /// **This side speaks first.** Over `usbmuxd` only the Mac can dial, so the
+    /// Mac opens with `HELLO`; the phone's listener reads that frame to tell a
+    /// session from a pairing attempt, and answers `HELLO_ACK`.
+    public func run() async throws {
+        try await write(mux.makeHello(identity: localFingerprint, proof: helloProof))
         try await pump()
     }
 
@@ -319,17 +329,21 @@ public actor BridgeInitiator {
             case .pingReceived:
                 try await write(Frame(kind: .pong, streamID: Multiplexer.controlStreamID))
 
-            case let .helloReceived(version, identity):
+            case let .helloAcknowledged(version):
                 guard version == Multiplexer.protocolVersion else {
                     throw ChannelError.versionMismatch(version)
                 }
-                peerFingerprint = identity
-                try await write(mux.makeHelloAck())
+
+            case .helloReceived:
+                // This side dials and opens, so a HELLO coming back means the
+                // peer believes it is the dialer — a build from before the
+                // roles swapped. See `run()`.
+                throw ChannelError.handshakeFailed("peer sent HELLO to the dialing side")
 
             case let .creditGranted(streamID):
                 creditArrived(on: streamID)
 
-            case .pongReceived, .openRequested, .helloAcknowledged:
+            case .pongReceived, .openRequested:
                 break
             }
         }

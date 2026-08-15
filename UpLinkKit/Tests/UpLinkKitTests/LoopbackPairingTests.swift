@@ -35,56 +35,85 @@ func withTimeout<T: Sendable>(
     }
 }
 
+/// Pairing never dials a destination, so this exists only to satisfy the
+/// responder's dependency. Anything reaching it is a bug in the test.
+actor NeverDialer: DestinationDialer {
+    func connect(to destination: StreamOpen) async throws -> DestinationConnection {
+        throw ChannelError.notConnected
+    }
+}
+
 @Suite("Loopback pairing over a real TLS-PSK socket")
 struct LoopbackPairingTests {
 
-    /// Spins up a real `MacSessionHost` and returns it with a peer that points
-    /// straight at its port, skipping Bonjour.
+    /// Spins up a real `PhoneSessionHost` — the phone, which is the LISTENER
+    /// now that `usbmuxd` dictates the Mac must be the one that dials.
+    ///
+    /// Its `store` holds paired **Macs**, which is the mirror image of what it
+    /// held when the Mac was the host. The port is randomised per test so these
+    /// can run in parallel against a fixed-port design.
     fileprivate func makeHost(
-        deviceName: String = "Test Mac"
-    ) async throws -> (host: MacSessionHost, identity: Curve25519.KeyAgreement.PrivateKey, store: InMemoryDeviceDirectory) {
+        deviceName: String = "Test iPhone"
+    ) async throws -> (host: PhoneSessionHost, identity: Curve25519.KeyAgreement.PrivateKey, store: InMemoryDeviceDirectory) {
         let identity = Curve25519.KeyAgreement.PrivateKey()
         let store = InMemoryDeviceDirectory()
-        let host = MacSessionHost(
+        let host = PhoneSessionHost(
             identity: identity,
             deviceName: deviceName,
             store: store,
+            dialer: NeverDialer(),
             queue: DispatchQueue(label: "test.host"),
-            // Loopback, not AWDL: the peer-to-peer profile needs two devices.
-            profile: .localLink
+            port: UInt16.random(in: 41000 ..< 48000)
         )
         try await host.start()
         return (host, identity, store)
     }
 
-    fileprivate func peer(for host: MacSessionHost, name: String = "Test Mac") async throws -> DiscoveredPeer {
-        // NWListener binds asynchronously, so the port is nil for a beat after
-        // start(). Dialing port 0 would stall in .waiting forever rather than
-        // fail, so wait for a real one.
-        var port: NWEndpoint.Port?
+    /// The port the phone actually bound.
+    ///
+    /// `NWListener` binds asynchronously, so it is nil for a beat after
+    /// `start()`. Dialing port 0 would stall in `.waiting` forever rather than
+    /// fail, so wait for a real one.
+    fileprivate func port(of host: PhoneSessionHost) async throws -> UInt16 {
         for _ in 0 ..< 100 {
-            port = await host.listeningPort
-            if let port, port.rawValue != 0 { break }
+            if let bound = await host.listeningPort, bound.rawValue != 0 {
+                return bound.rawValue
+            }
             try await Task.sleep(for: .milliseconds(50))
         }
-        guard let port, port.rawValue != 0 else {
-            throw ChannelError.handshakeFailed("listener never bound a port")
-        }
-        return DiscoveredPeer(
-            id: name,
-            name: name,
-            endpoint: .hostPort(host: "127.0.0.1", port: port),
-            fingerprint: await host.fingerprint,
-            profile: .localLink
-        )
+        throw ChannelError.handshakeFailed("listener never bound a port")
+    }
+
+    /// Dials the phone as the Mac would and runs the pairing exchange.
+    ///
+    /// In production the loopback port belongs to the menu-bar app's relay,
+    /// which pumps it down the cable. Here the phone's listener is on loopback
+    /// directly, so everything from TLS-PSK upward is byte-for-byte the
+    /// production path — only the cable in the middle is absent.
+    @discardableResult
+    fileprivate func dialAndPair(
+        port: UInt16,
+        code: PairingCode,
+        macIdentity: Curve25519.KeyAgreement.PrivateKey = .init(),
+        deviceName: String = "Test Mac",
+        udid: String = "TEST-UDID",
+        store: InMemoryDeviceDirectory = InMemoryDeviceDirectory(),
+        label: String = "test.client"
+    ) async throws -> PairedDevice {
+        try await MacSessionClient(
+            identity: macIdentity,
+            deviceName: deviceName,
+            store: store,
+            queue: DispatchQueue(label: label)
+        ).pair(relayPort: port, code: code, udid: udid)
     }
 
     /// Waits for the host to record the pairing.
     ///
-    /// The Mac sends its half of the exchange *before* it writes to the store,
-    /// so a client that returns the instant it reads the reply can legitimately
-    /// observe an empty store. Polling makes the assertion about the outcome
-    /// rather than about which side won a microsecond race.
+    /// The listener sends its half of the exchange *before* it writes to the
+    /// store, so a dialer that returns the instant it reads the reply can
+    /// legitimately observe an empty store. Polling makes the assertion about
+    /// the outcome rather than about which side won a microsecond race.
     private func awaitSavedDevices(
         in store: InMemoryDeviceDirectory,
         count: Int,
@@ -108,24 +137,25 @@ struct LoopbackPairingTests {
         let code = PairingCode.random()
         try await host.setPairingCode(code)
 
-        let phoneIdentity = Curve25519.KeyAgreement.PrivateKey()
-        let target = try await peer(for: host)
+        let macIdentity = Curve25519.KeyAgreement.PrivateKey()
+        let target = try await port(of: host)
         let device = try await withTimeout(10, "correct-code pairing") {
-            try await PairingClient(
-                queue: DispatchQueue(label: "test.client"),
-                deviceName: "Test iPhone"
-            ).pair(with: target, code: code, localIdentity: phoneIdentity)
+            try await dialAndPair(port: target, code: code, macIdentity: macIdentity, deviceName: "Test Mac", label: "test.client")
         }
 
-        // The phone learned the Mac.
+        // The Mac learned the phone it dialled.
         #expect(device.publicKey == hostIdentity.publicKey.rawRepresentation)
-        #expect(device.name == "Test Mac")
+        #expect(device.name == "Test iPhone")
+        // And pinned it to the physical device usbmuxd reported.
+        #expect(device.udid == "TEST-UDID")
 
-        // The Mac learned the phone.
+        // The phone learned the Mac.
         let saved = try await awaitSavedDevices(in: store, count: 1)
         #expect(saved.count == 1)
-        #expect(saved.first?.name == "Test iPhone")
-        #expect(saved.first?.publicKey == phoneIdentity.publicKey.rawRepresentation)
+        #expect(saved.first?.name == "Test Mac")
+        #expect(saved.first?.publicKey == macIdentity.publicKey.rawRepresentation)
+        // The phone never sees a UDID — iOS does not let an app read its own.
+        #expect(saved.first?.udid == nil)
     }
 
     @Test("A wrong code fails and pairs nothing")
@@ -135,15 +165,10 @@ struct LoopbackPairingTests {
 
         try await host.setPairingCode(try PairingCode(digits: "123456"))
 
-        let target = try await peer(for: host)
+        let target = try await port(of: host)
         await #expect(throws: (any Error).self) {
             try await withTimeout(10, "wrong-code pairing") {
-                try await PairingClient(queue: DispatchQueue(label: "test.client"))
-                    .pair(
-                        with: target,
-                        code: try PairingCode(digits: "654321"),
-                        localIdentity: Curve25519.KeyAgreement.PrivateKey()
-                    )
+                try await dialAndPair(port: target, code: try PairingCode(digits: "654321"), macIdentity: Curve25519.KeyAgreement.PrivateKey(), label: "test.client")
             }
         }
         #expect((try store.pairedDevices()).isEmpty)
@@ -155,15 +180,10 @@ struct LoopbackPairingTests {
         let (host, _, store) = try await makeHost()
         defer { Task { await host.stop() } }
 
-        let target = try await peer(for: host)
+        let target = try await port(of: host)
         await #expect(throws: (any Error).self) {
             try await withTimeout(10, "no-code pairing") {
-                try await PairingClient(queue: DispatchQueue(label: "test.client"))
-                    .pair(
-                        with: target,
-                        code: PairingCode.random(),
-                        localIdentity: Curve25519.KeyAgreement.PrivateKey()
-                    )
+                try await dialAndPair(port: target, code: PairingCode.random(), macIdentity: Curve25519.KeyAgreement.PrivateKey(), label: "test.client")
             }
         }
         #expect((try store.pairedDevices()).isEmpty)
@@ -181,12 +201,9 @@ struct LoopbackPairingTests {
         let code = PairingCode.random()
         try await host.setPairingCode(code)
 
-        let target = try await peer(for: host, name: name)
+        let target = try await port(of: host)
         let device = try await withTimeout(10, "apostrophe-name pairing") {
-            try await PairingClient(
-                queue: DispatchQueue(label: "test.client"),
-                deviceName: "Test iPhone"
-            ).pair(with: target, code: code, localIdentity: .init())
+            try await dialAndPair(port: target, code: code, macIdentity: .init(), deviceName: "Test iPhone", label: "test.client")
         }
 
         #expect(device.name == name)
@@ -203,17 +220,15 @@ struct LoopbackPairingTests {
         let code = PairingCode.random()
         try await host.setPairingCode(code)
 
-        let target = try await peer(for: host)
+        let target = try await port(of: host)
         _ = try await withTimeout(10, "first use of code") {
-            try await PairingClient(queue: DispatchQueue(label: "test.client"))
-                .pair(with: target, code: code, localIdentity: .init())
+            try await dialAndPair(port: target, code: code, macIdentity: .init(), label: "test.client")
         }
 
-        let second = try await peer(for: host)
+        let second = try await port(of: host)
         await #expect(throws: (any Error).self) {
             try await withTimeout(10, "replay of code") {
-                try await PairingClient(queue: DispatchQueue(label: "test.client2"))
-                    .pair(with: second, code: code, localIdentity: .init())
+                try await dialAndPair(port: second, code: code, macIdentity: .init(), label: "test.client2")
             }
         }
     }
@@ -250,16 +265,11 @@ struct PairingFailureReportingTests {
         defer { Task { await host.stop() } }
 
         try await host.setPairingCode(try PairingCode(digits: "123456"))
-        let target = try await harness.peer(for: host)
+        let target = try await harness.port(of: host)
 
         await #expect(throws: PairingError.codeMismatch) {
             try await withTimeout(10, "wrong-code pairing") {
-                try await PairingClient(queue: DispatchQueue(label: "test.client"))
-                    .pair(
-                        with: target,
-                        code: try PairingCode(digits: "654321"),
-                        localIdentity: Curve25519.KeyAgreement.PrivateKey()
-                    )
+                try await harness.dialAndPair(port: target, code: try PairingCode(digits: "654321"), macIdentity: Curve25519.KeyAgreement.PrivateKey(), label: "test.client")
             }
         }
     }
@@ -283,12 +293,11 @@ struct PairingFailureReportingTests {
         // PSK is on the air, so the handshake still succeeds.
         let code = try PairingCode(digits: "424242")
         try await host.setPairingCode(code, now: Date().addingTimeInterval(-120))
-        let target = try await harness.peer(for: host)
+        let target = try await harness.port(of: host)
 
         await #expect(throws: PairingError.expired) {
             try await withTimeout(10, "expired pairing") {
-                try await PairingClient(queue: DispatchQueue(label: "test.client.exp"))
-                    .pair(with: target, code: code, localIdentity: Curve25519.KeyAgreement.PrivateKey())
+                try await harness.dialAndPair(port: target, code: code, macIdentity: Curve25519.KeyAgreement.PrivateKey(), label: "test.client.exp")
             }
         }
         #expect((try store.pairedDevices()).isEmpty, "an expired code paired anyway")
@@ -316,13 +325,13 @@ struct PairingCodeConsumptionTests {
     @Test("A code survives a failure that happens after it was verified")
     func codeSurvivesLateFailure() async throws {
         let store = FailingDeviceDirectory()
-        let host = MacSessionHost(
+        let host = PhoneSessionHost(
             identity: Curve25519.KeyAgreement.PrivateKey(),
-            deviceName: "Test Mac",
+            deviceName: "Test iPhone",
             store: store,
+            dialer: NeverDialer(),
             queue: DispatchQueue(label: "test.consumption"),
-            profile: .localLink,
-            monitorsPath: false
+            port: UInt16.random(in: 41000 ..< 48000)
         )
         try await host.start()
         defer { Task { await host.stop() } }
@@ -333,11 +342,10 @@ struct PairingCodeConsumptionTests {
         let harness = LoopbackPairingTests()
         // The Mac must not confirm a pairing it could not record: the phone
         // fails too, rather than storing a Mac that has no record of it.
-        let first = try await harness.peer(for: host)
+        let first = try await harness.port(of: host)
         await #expect(throws: (any Error).self) {
             try await withTimeout(10, "first attempt") {
-                try await PairingClient(queue: DispatchQueue(label: "test.c1"))
-                    .pair(with: first, code: code, localIdentity: Curve25519.KeyAgreement.PrivateKey())
+                try await harness.dialAndPair(port: first, code: code, macIdentity: Curve25519.KeyAgreement.PrivateKey(), label: "test.c1")
             }
         }
 
@@ -348,11 +356,10 @@ struct PairingCodeConsumptionTests {
         // Asserted by NAME, not merely "some error". `(any Error).self` would
         // accept `.alreadyConsumed` — the exact failure under test — and the
         // test would pass for the wrong reason.
-        let second = try await harness.peer(for: host)
+        let second = try await harness.port(of: host)
         do {
             _ = try await withTimeout(10, "second attempt") {
-                try await PairingClient(queue: DispatchQueue(label: "test.c2"))
-                    .pair(with: second, code: code, localIdentity: Curve25519.KeyAgreement.PrivateKey())
+                try await harness.dialAndPair(port: second, code: code, macIdentity: Curve25519.KeyAgreement.PrivateKey(), label: "test.c2")
             }
             Issue.record("the second attempt should still have failed on the store")
         } catch let error as PairingError {

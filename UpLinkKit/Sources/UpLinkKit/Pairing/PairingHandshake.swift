@@ -55,14 +55,22 @@ struct PairingHello: Sendable, Equatable {
     }
 }
 
-/// The phone's side of pairing: dials the Mac using the typed code.
+/// The dialling side of pairing.
+///
+/// **This is the Mac now.** Over `usbmuxd` only the Mac can open a connection,
+/// so the Mac dials with the code and the phone's listener answers. The user
+/// still reads the code off the Mac and types it into the phone — who displays
+/// and who types is independent of who dials; typing it is what arms the
+/// phone's listener with the pairing PSK.
+///
+/// Transport-agnostic: the caller supplies an already-connected channel. That
+/// keeps the TLS-PSK dial in one place (``MacSessionClient``) and lets the
+/// whole exchange be tested over an in-memory pipe.
 public struct PairingClient: Sendable {
 
-    private let queue: DispatchQueue
     private let deviceName: String
 
-    public init(queue: DispatchQueue, deviceName: String = PairingClient.defaultDeviceName) {
-        self.queue = queue
+    public init(deviceName: String = PairingClient.defaultDeviceName) {
         self.deviceName = deviceName
     }
 
@@ -74,42 +82,16 @@ public struct PairingClient: Sendable {
         #endif
     }
 
-    /// Runs the exchange and returns the peer to remember.
+    /// Runs the exchange on an open channel and returns the peer to remember.
+    ///
+    /// A wrong code fails earlier, in the TLS-PSK handshake the caller performs
+    /// when opening the channel, and never reaches here — see
+    /// ``MacSessionClient/pair(relayPort:code:)``, which maps that failure to
+    /// `.codeMismatch`.
     public func pair(
-        with peer: DiscoveredPeer,
-        code: PairingCode,
+        on channel: FrameChannel,
         localIdentity: Curve25519.KeyAgreement.PrivateKey
     ) async throws -> PairedDevice {
-
-        // Salted with the Mac's fingerprint from its TXT record — the same
-        // input the Mac uses. The service NAME cannot be used: it travels
-        // through DNS-SD, may be renamed for uniqueness, and typically contains
-        // a typographic apostrophe that can round-trip differently, which
-        // yields a different salt, a different PSK, and a TLS failure with no
-        // usable diagnostic.
-        guard let fingerprint = peer.fingerprint else {
-            throw PairingError.handshakeFailed
-        }
-        let salt = Data(SHA256.hash(data: Data(fingerprint.utf8)))
-        let parameters = TransportParameters.pairing(code: code, salt: salt, profile: peer.profile)
-
-        let connection = NWConnection(to: peer.endpoint, using: parameters)
-        let channel = NWConnectionChannel(connection: connection)
-
-        // A wrong code fails here, in the TLS handshake, before any key
-        // material is exchanged — so this is the ONLY place a code mismatch can
-        // be detected, and it arrives as an opaque transport error.
-        //
-        // Reporting it as such made `pairingMessage(for:)`'s `.codeMismatch`
-        // arm unreachable: it says exactly the right thing and nothing could
-        // ever throw the value it matches on. A PSK rejection during pairing
-        // has one meaning, and this is it.
-        do {
-            try await channel.start(on: queue)
-        } catch {
-            throw PairingError.codeMismatch
-        }
-        defer { Task { await channel.close() } }
 
         let hello = PairingHello(
             publicKey: localIdentity.publicKey.rawRepresentation,
@@ -151,7 +133,11 @@ public struct PairingClient: Sendable {
     }
 }
 
-/// The Mac's side of pairing: answers one incoming attempt.
+/// The listening side of pairing: answers one incoming attempt.
+///
+/// **This is the phone now.** The Mac dials, so the pairing connection arrives
+/// here — the mirror image of the AWDL era, and the reason the user types the
+/// code into the phone even though the Mac is what generates it.
 public struct PairingResponder: Sendable {
 
     private let deviceName: String
@@ -160,14 +146,13 @@ public struct PairingResponder: Sendable {
         self.deviceName = deviceName
     }
 
-    /// Answers one pairing attempt whose request frame has already been read.
+    /// Reads the request and works out who the peer is, WITHOUT answering.
     ///
     /// The caller reads the first frame in order to tell a pairing connection
     /// from a session connection, so the request arrives here already decoded
     /// rather than being read a second time.
-    /// Reads the request and works out who the peer is, WITHOUT answering.
     ///
-    /// Split from ``confirm(to:on:localIdentity:)`` so the caller can commit its
+    /// Split from ``confirm(on:localIdentity:)`` so the caller can commit its
     /// own side of the pairing before telling the peer it is paired. Answering
     /// first — which is what this used to do — means a failure in the caller's
     /// own storage leaves the phone believing it is paired with a Mac that has
@@ -200,14 +185,4 @@ public struct PairingResponder: Sendable {
         )
     }
 
-    /// Convenience for callers with nothing to commit — tests and probes.
-    public func respond(
-        to request: Frame,
-        on channel: FrameChannel,
-        localIdentity: Curve25519.KeyAgreement.PrivateKey
-    ) async throws -> PairedDevice {
-        let device = try identify(request)
-        try await confirm(on: channel, localIdentity: localIdentity)
-        return device
-    }
 }

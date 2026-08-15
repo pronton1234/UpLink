@@ -5,7 +5,7 @@ import CryptoKit
 import OSLog
 import UpLinkKit
 
-/// Everything mutable about the proxy, and the bridge to ``MacSessionHost``.
+/// Everything mutable about the proxy, and the bridge to ``MacSessionClient``.
 ///
 /// The extension hosts the listener rather than the containing app, because it
 /// owns the captured flows and an established TLS session cannot be handed
@@ -28,7 +28,40 @@ enum ProxyStartupError: LocalizedError {
 
 actor ProxyState {
 
-    private var host: MacSessionHost?
+    /// The Mac's side of the bridge. It DIALS now: `usbmuxd` only carries
+    /// Mac→phone connections, so the phone is the listener and this extension
+    /// connects out to a loopback port the menu-bar app relays onto the cable.
+    /// This process cannot reach `usbmuxd` itself — it is sandboxed.
+    private var client: MacSessionClient?
+
+    /// The loopback port the app's relay is currently serving, and the device
+    /// behind it. Nil whenever no cable is attached.
+    private var relayPort: UInt16?
+    private var relayUDID: String?
+
+    /// Redials the phone while the cable is attached.
+    private var sessionTask: Task<Void, Never>?
+    /// Retries a pairing dial for the life of the six-digit code.
+    private var pairingTask: Task<Void, Never>?
+
+    /// What ``sessionTask`` is actually dialling right now.
+    ///
+    /// Distinct from `relayPort`/`relayUDID`, which record the most recent
+    /// announcement. Conflating the two is what let the extension keep dialling
+    /// a port that no longer existed.
+    private var dialingPort: UInt16?
+    private var dialingUDID: String?
+
+    /// Set by an explicit Disconnect, cleared by anything the user does that
+    /// means "bridge again". Without it the app's relay re-announcement would
+    /// immediately undo the Disconnect, since from the app's side nothing about
+    /// the cable has changed.
+    private var disconnectedByUser = false
+
+    /// The last device a relay was announced for, kept across a Disconnect so
+    /// "is this the same cable?" can still be answered. See the `usbrelay:`
+    /// handler.
+    private var lastRelayUDID: String?
     private(set) var initiator: BridgeInitiator?
     private var eventTask: Task<Void, Never>?
     private var log: Logger?
@@ -120,33 +153,168 @@ actor ProxyState {
         // seen by the app. Silence is not evidence of absence.
         log.error("never bridging: [\(self.directApps.sorted().joined(separator: ","), privacy: .public)]")
 
-        let host = MacSessionHost(
+        let client = MacSessionClient(
             identity: identity,
             deviceName: (configuration?["deviceName"] as? String) ?? "Mac",
             store: store,
             queue: queue
         )
-        self.host = host
+        self.client = client
+        self.queue = queue
 
-        // Tombstones must outlive this process, because an extension restart is
-        // exactly when a revoked device would otherwise come back to life — the
-        // directory is in memory and rebuilt from this same snapshot. Restored
-        // BEFORE `start()`, so the first listener already carries the keys those
-        // revoked devices need in order to be told.
-        if let data = configuration?["revokedDevices"] as? Data,
-           let restored = try? JSONDecoder().decode(RevocationTombstones.self, from: data) {
-            await host.restoreTombstones(restored)
-            log.error("restored \(restored.all.count, privacy: .public) revocation tombstone(s)")
-        }
+        // Tombstones are the PHONE's business now: it owns the listener, so it
+        // is the side that must keep a revoked Mac's key on the air long enough
+        // to tell it. Nothing to restore here.
 
-        let events = await host.events()
+        let events = await client.events()
         eventTask = Task { [weak self] in
             for await event in events {
-                await self?.handle(event: event, host: host)
+                await self?.handle(event: event, client: client)
             }
         }
+        // Nothing to start. The session begins when the app reports a cable.
+    }
 
-        try await host.start()
+    /// The queue sessions are dialled on, kept from `startHosting`.
+    private var queue: DispatchQueue?
+
+    /// Attempts pairing until the user has typed the code, or it expires.
+    ///
+    /// See the `pair:` handler for why this is a loop rather than one dial.
+    private func startPairing(
+        client: MacSessionClient,
+        code: PairingCode,
+        port: UInt16,
+        udid: String
+    ) {
+        let log = self.log
+        pairingTask = Task { [weak self] in
+            let deadline = ContinuousClock.now + .seconds(Int(PairingSession.validity))
+            while !Task.isCancelled, ContinuousClock.now < deadline {
+                do {
+                    let device = try await client.pair(relayPort: port, code: code, udid: udid)
+                    log?.error("ipc: paired \(device.fingerprint, privacy: .public)")
+                    guard let self else { return }
+                    // Straight into a session, so the user does not have to do
+                    // anything else to start bridging.
+                    await self.beginSession(client: client, port: port, udid: udid)
+                    return
+                } catch {
+                    // Expected until the phone is armed. Only logged once a
+                    // second at most, and only at this level, because the
+                    // common case is "the user is still walking to the phone".
+                    try? await Task.sleep(for: .milliseconds(1500))
+                }
+            }
+            log?.error("ipc: pairing window closed without the phone answering")
+        }
+    }
+
+    private func beginSession(client: MacSessionClient, port: UInt16, udid: String) {
+        startRedialing(client: client, port: port, udid: udid)
+    }
+
+    /// Keeps a session up for as long as the cable is attached.
+    ///
+    /// The Mac dials, so something has to decide when to dial again. Ending a
+    /// session is normal — the phone's extension restarts, the screen locks and
+    /// the listener rebuilds — and the cable being physically present is the
+    /// signal that trying again is worthwhile. Detachment cancels this, so the
+    /// loop never spins against a device that has gone.
+    private func startRedialing(client: MacSessionClient, port: UInt16, udid: String) {
+        // Idempotent, and it must compare against what the RUNNING LOOP is
+        // dialling — not against `relayPort`.
+        //
+        // FOUND ON HARDWARE. The caller assigns `relayPort = port` before
+        // calling this, so `relayPort == port` was always true: the guard
+        // returned whenever any loop existed, and a genuinely NEW port could
+        // never take effect. Quitting and relaunching the menu-bar app binds a
+        // fresh ephemeral relay port, so the extension went on dialling the
+        // dead one — "connection refused — nothing is listening there", every
+        // five seconds, forever, while a perfectly good listener sat on the new
+        // port. The bridge could not recover from an app restart.
+        //
+        // No test caught this because it needs two successive relay ports, and
+        // every test dials one.
+        if let existing = sessionTask, !existing.isCancelled,
+           dialingPort == port, dialingUDID == udid {
+            return
+        }
+        sessionTask?.cancel()
+        dialingPort = port
+        dialingUDID = udid
+        // Captured up front: the task body is not isolated to this actor, so
+        // reaching back for `self.log` on every line would mean an await per
+        // log statement.
+        let log = self.log
+        sessionTask = Task { [weak self] in
+            var policy = ReconnectPolicy(baseDelay: 0.5, maxDelay: 5)
+            while !Task.isCancelled {
+                guard let self else { return }
+                guard let device = await self.pairedDevice(matching: udid) else {
+                    // Attached but not paired. Not an error and not worth
+                    // retrying in a loop — the app is showing "not paired" and
+                    // the next pairing restarts this.
+                    log?.error("no pairing for \(udid, privacy: .public) — not dialling")
+                    return
+                }
+                // Pin a legacy record to the device it just worked with.
+                //
+                // Records written before the wired transport carry no UDID, so
+                // `pairedDevice(matching:)` lets one match any device. Leaving
+                // it that way would mean a pairing that never becomes specific
+                // — the UDID is the one identifier the peer cannot claim, and
+                // its whole purpose is to stop a different handset bridging on
+                // a key it somehow holds. Adopting it here, on the first
+                // successful dial, is the migration.
+                if device.udid == nil {
+                    await self.adoptUDID(udid, for: device)
+                }
+                do {
+                    try await client.runSession(relayPort: port, with: device)
+                    // A session that ran and ended is not a failure: the phone
+                    // restarted its extension, or the screen locked. Reset, so
+                    // the next drop is retried promptly rather than inheriting
+                    // backoff from an unrelated earlier one.
+                    policy.recordSuccess()
+                } catch {
+                    log?.error("dial failed: \(String(describing: error), privacy: .public)")
+                }
+                guard !Task.isCancelled else { return }
+                try? await Task.sleep(for: .seconds(policy.recordFailure()))
+            }
+        }
+    }
+
+    /// Records the UDID a legacy pairing turned out to belong to.
+    ///
+    /// Only the app can write durable storage — this process cannot reach the
+    /// keychain — so the in-memory copy is updated and the app picks it up on
+    /// its next `devices` poll, which is the same route a fresh pairing takes.
+    private func adoptUDID(_ udid: String, for device: PairedDevice) {
+        var updated = device
+        updated.udid = udid
+        try? store.save(updated)
+        log?.error("pinned \(device.fingerprint, privacy: .public) to device \(udid, privacy: .public)")
+    }
+
+    /// The paired phone this UDID belongs to.
+    ///
+    /// Records made before the wired transport carry no UDID; such a record
+    /// adopts the first device it successfully sessions with. A record that
+    /// HAS a UDID must match exactly — that is the point of storing it, and it
+    /// is the one identifier in the exchange the peer cannot claim for itself.
+    private func pairedDevice(matching udid: String) -> PairedDevice? {
+        let paired = (try? store.pairedDevices()) ?? []
+        if let exact = paired.first(where: { $0.udid == udid }) { return exact }
+        return paired.first { $0.udid == nil }
+    }
+
+    /// A short, stable token the app can turn into a sentence.
+    private static func wireReason(for error: Error) -> String {
+        if let pairing = error as? PairingError { return "pairing|\(pairing.wireCode)" }
+        if case let USBMuxError.refused(code) = error { return "usb|\(code.rawValue)" }
+        return "other"
     }
 
     func stopHosting() async {
@@ -155,13 +323,19 @@ actor ProxyState {
         hasSession = false
         eventTask?.cancel()
         eventTask = nil
-        await host?.stop()
-        host = nil
+        sessionTask?.cancel()
+        sessionTask = nil
+        pairingTask?.cancel()
+        pairingTask = nil
+        await client?.endSession()
+        client = nil
+        relayPort = nil
+        relayUDID = nil
         initiator = nil
         currentPolicy = CapturePolicy()
     }
 
-    private func handle(event: SessionHostEvent, host: MacSessionHost) async {
+    private func handle(event: SessionHostEvent, client: MacSessionClient) async {
         switch event {
         case let .sessionStarted(fingerprint, peerDescription):
             // Record the phone's address BEFORE exposing the initiator, or the
@@ -192,7 +366,7 @@ actor ProxyState {
                 .map { "\($0.network.count == 16 ? "v6" : "v4")/\($0.prefixLength)" }
                 .joined(separator: ",")
             log?.error("capture policy: peer=\(peerDescription, privacy: .public) resolvers=\(resolvers.sorted().joined(separator: ","), privacy: .public) on-link=[\(networks, privacy: .public)]")
-            initiator = await host.initiator
+            initiator = await client.initiator
             hasSession = true
             // Error level so it survives in `log show`: info-level messages
             // live only in the memory ring buffer and are the first thing
@@ -246,8 +420,8 @@ actor ProxyState {
         // Logged because a pairing code that never reaches the extension looks
         // exactly like one the phone typed wrongly.
         log?.error("ipc: received \(message.prefix(5), privacy: .public)…")
-        guard let host else {
-            log?.error("ipc: no host yet — message dropped")
+        guard let client else {
+            log?.error("ipc: no client yet — message dropped")
             return "unavailable"
         }
 
@@ -259,9 +433,15 @@ actor ProxyState {
                 unpairedByPeer = nil
                 return "unpaired|\(fingerprint)"
             }
-            guard let initiator else { return "waiting" }
+            guard let initiator else {
+                // The app knows about the cable; the extension only knows
+                // whether it has a session. Reporting "waiting" and letting the
+                // app decide WHICH waiting it is keeps one source of truth for
+                // each fact.
+                return relayPort == nil ? "waiting" : "connecting"
+            }
             let egress = await initiator.observedEgress ?? .unknown
-            let peer = await host.peerDescription ?? ""
+            let peer = await client.peerDescription ?? ""
             return "connected|\(peer)|\(egress.rawValue)"
         }
 
@@ -270,39 +450,120 @@ actor ProxyState {
         // "unknown" and the only thing that changed was the menu bar label. The
         // session stayed up, the proxy went on claiming every flow, and the
         // user's one obvious way to stop bridging was a lie.
-        if message == "disconnect" {
-            log?.error("ipc: disconnect requested")
-            // `endSession`, NOT `stop()`.
-            //
-            // `stop()` cancels the listener and the path monitor as well as the
-            // session, and nothing restarted them — so after a Disconnect the
-            // Mac was off the air entirely and an already-paired phone could
-            // never reconnect. The only ways back were "Show Pairing Code",
-            // which rebuilds the listener as a side effect, or relaunching the
-            // app. Disconnecting one session is not a reason to stop being
-            // findable.
-            //
-            // This still emits `.sessionEnded`, which is what clears
-            // `hasSession`, releases the claim path, and lets the app drop the
-            // route tunnel.
-            await host.endSession()
+        // Undoes a Disconnect. Its own verb, because nothing else can:
+        // `lastRelayUDID` deliberately survives a Disconnect so a re-announced
+        // relay for the SAME cable cannot silently restart the bridge — which
+        // also meant `reconnect()` could not restart it either. The Reconnect
+        // menu item existed and did nothing.
+        if message == "reconnect" {
+            log?.error("ipc: reconnect requested")
+            disconnectedByUser = false
             return "ok"
         }
 
+        // The cable came up. Everything the extension needs to reach the phone
+        // arrives in this one message: the loopback port the app is relaying,
+        // and which physical device is on the other end of it.
+        if message.hasPrefix("usbrelay:") {
+            let parts = message.dropFirst("usbrelay:".count).split(separator: ":", maxSplits: 1)
+            guard parts.count == 2, let port = UInt16(parts[0]) else {
+                return "error|malformed usbrelay"
+            }
+            let udid = String(parts[1])
+            // A relay announcement for a DIFFERENT device is a new cable, which
+            // is the user plainly asking to bridge again.
+            //
+            // Compared against `lastRelayUDID`, NOT `relayUDID`: Disconnect
+            // clears `relayUDID`, so comparing that made this test always true
+            // and cleared the flag before the guard below could ever see it —
+            // the whole extension-side half of Disconnect was dead code, and
+            // the only thing holding it was a check in the app that a
+            // concurrent status poll could race past.
+            if lastRelayUDID != udid { disconnectedByUser = false }
+            lastRelayUDID = udid
+            guard !disconnectedByUser else {
+                log?.error("ipc: relay offered but the user disconnected — not dialling")
+                return "ok|disconnected"
+            }
+            log?.error("ipc: relay on 127.0.0.1:\(port, privacy: .public) for \(udid, privacy: .public)")
+            relayPort = port
+            relayUDID = udid
+            startRedialing(client: client, port: port, udid: udid)
+            return "ok"
+        }
+
+        // The cable went away. Ending the session promptly is what stops the
+        // proxy claiming flows it can no longer carry — the failure mode that
+        // once produced 31,034 broken pipes against a session both ends still
+        // believed was healthy.
+        if message == "usbgone" {
+            log?.error("ipc: cable detached")
+            // A physical detach clears an explicit Disconnect: replugging is
+            // unambiguously "bridge again".
+            disconnectedByUser = false
+            relayPort = nil
+            relayUDID = nil
+            sessionTask?.cancel()
+            sessionTask = nil
+            dialingPort = nil
+            dialingUDID = nil
+            await client.endSession()
+            return "ok"
+        }
+
+        if message == "disconnect" {
+            log?.error("ipc: disconnect requested")
+            // Cancel the redial loop as well as the session. Without that,
+            // Disconnect ends one session and the loop immediately opens
+            // another — the button would flicker and change nothing, which is
+            // the same lie it used to tell for a different reason.
+            sessionTask?.cancel()
+            sessionTask = nil
+            await client.endSession()
+            // Deliberately switched OFF rather than merely stopped.
+            //
+            // Leaving `relayPort` set made `status` keep answering "connecting"
+            // — so the menu bar read "Connecting…" forever, and because the
+            // app only re-announces the relay when the extension reports
+            // "disconnected", nothing could ever restart the loop. The only way
+            // back to a working bridge was to physically unplug the cable.
+            // Clearing it makes the next status poll say "disconnected", which
+            // is both true and what triggers the app to hand the relay back.
+            disconnectedByUser = true
+            relayPort = nil
+            relayUDID = nil
+            dialingPort = nil
+            dialingUDID = nil
+            return "ok"
+        }
+
+        // PAIRING DIALS NOW, AND THAT CHANGES ITS SHAPE.
+        //
+        // The Mac shows six digits and the user walks to their phone and types
+        // them. Only when they do does the phone arm its listener with the
+        // matching PSK — so a single dial at the moment the code appears would
+        // always fail, because the phone cannot possibly be ready yet.
+        //
+        // So this starts a RETRY LOOP for the life of the code. Each attempt is
+        // cheap and, importantly, harmless: with no code armed the phone's
+        // listener holds no pairing PSK, so the attempt dies in the TLS
+        // handshake and never reaches the phone's `handlePairing`. Nothing is
+        // booked against the three-guess lockout until a code genuinely matches.
         if message.hasPrefix("pair:") {
             let digits = String(message.dropFirst("pair:".count))
-            do {
-                if digits == "off" {
-                    try await host.setPairingCode(nil)
-                } else {
-                    try await host.setPairingCode(try PairingCode(digits: digits))
-                }
-                log?.error("ipc: pairing code set")
-                return "ok"
-            } catch {
-                log?.error("ipc: pairing code FAILED \(String(describing: error), privacy: .public)")
-                return "error|\(error)"
+            pairingTask?.cancel()
+            pairingTask = nil
+            guard digits != "off" else { return "ok" }
+            disconnectedByUser = false
+            guard let port = relayPort, let udid = relayUDID else {
+                log?.error("ipc: pairing attempted with no cable")
+                return "error|nocable"
             }
+            guard let code = try? PairingCode(digits: digits) else {
+                return "error|pairing|\(PairingError.invalidCodeFormat.wireCode)"
+            }
+            startPairing(client: client, code: code, port: port, udid: udid)
+            return "ok"
         }
 
         // Forgetting a phone must reach the phone.
@@ -325,23 +586,21 @@ actor ProxyState {
             let removed = (try? store.pairedDevices())?.first { $0.fingerprint == fingerprint }
             try? store.remove(fingerprint: fingerprint)
 
-            if let initiator, await host.activeFingerprint == fingerprint {
-                // Connected right now: say it directly, no tombstone needed.
-                await initiator.announceUnpaired()
-                await host.endSession()
-            } else if let removed {
-                // Not connected, so there is no session to carry the notice.
-                // Without a tombstone the phone never finds out and re-dials
-                // forever holding a pairing this Mac has forgotten.
-                await host.revoke(removed)
+            if initiator != nil, await client.activeFingerprint == fingerprint {
+                // Connected right now: say it directly.
+                await client.announceUnpaired()
+                sessionTask?.cancel()
+                sessionTask = nil
+                await client.endSession()
+            } else if removed != nil {
+                // Not connected. The Mac dials now, so there is nothing to keep
+                // "on the air" for a phone to find — this Mac simply stops
+                // dialling that device. The tombstone machinery lives on the
+                // PHONE, which owns the listener and is the side that has to
+                // keep a revoked peer reachable long enough to be told.
+                log?.error("ipc: \(fingerprint, privacy: .public) removed while not connected — it learns on its next dial")
             }
-            return "ok|\(await host.currentTombstones.all.count)"
-        }
-
-        // Handed back so the app can persist them into the next seed.
-        if message == "tombstones" {
-            guard let json = try? JSONEncoder().encode(await host.currentTombstones) else { return "" }
-            return json.base64EncodedString()
+            return "ok"
         }
 
         if message == "devices" {

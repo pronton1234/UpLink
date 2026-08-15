@@ -28,12 +28,6 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>UpLink connects to your iPhone on the local network to bridge this Mac's traffic.</string>
-	<key>NSBonjourServices</key>
-	<array>
-		<string>_uplink._tcp</string>
-	</array>
 	<key>NetworkExtension</key>
 	<dict>
 		<!-- Must be prefixed with an App Group from the entitlements, NOT the

@@ -35,8 +35,12 @@ public protocol DestinationDialer: Sendable {
 }
 
 /// An in-memory `FrameChannel` pair, used to run both ends of the protocol in
-/// one process. Ships in the library rather than the test target because the
-/// spike apps use it too.
+/// one process.
+///
+/// Ships in the library rather than the test target because both test targets
+/// use it — `UpLinkKitTests` for the loopback bridge and `UpLinkRegressionTests`
+/// for the datagram and concurrency suites — and a type shared across targets
+/// has to live somewhere both can see.
 public actor InMemoryFrameChannel: FrameChannel {
 
     private var inbox: [Data] = []

@@ -7,10 +7,29 @@ import Observation
 import OSLog
 import UpLinkKit
 
+/// What the Mac can truthfully say about the bridge.
+///
+/// **"Waiting" used to be one case, and that was the bug.** Not bridging has
+/// several causes with completely different remedies — no cable, cable but the
+/// phone's app is not running, cable and app but no pairing — and collapsing
+/// them meant the menu bar said "Waiting for iPhone" at a user whose iPhone was
+/// plugged in and sitting right there. Now the cable's state is carried
+/// through, so the sentence on screen names the thing to fix.
 enum MacBridgeStatus: Equatable {
     case installingExtension
     case needsApproval
-    case waiting
+    /// No cabled iPhone attached.
+    case waitingForCable
+    /// Attached, but nothing answered on either UpLink port.
+    case deviceNotResponding
+    /// Attached and answering, but this Mac has no pairing for it.
+    case deviceNotPaired
+    /// Attached, paired, dialling.
+    case connecting
+    /// The user switched the bridge off by hand. Not a fault, and not
+    /// something to keep retrying — but it needs saying, or the menu bar looks
+    /// identical to a bridge that is failing to connect.
+    case switchedOff
     case connected(peer: String, egress: EgressInterface)
     case failed(String)
 
@@ -30,14 +49,14 @@ enum MacBridgeStatus: Equatable {
 @Observable
 final class MenuBarModel {
 
-    fileprivate(set) var status: MacBridgeStatus = .waiting
+    fileprivate(set) var status: MacBridgeStatus = .waitingForCable
     private(set) var pairedDevices: [PairedDevice] = []
 
     private(set) var activePairingCode: PairingCode?
     private(set) var pairingExpiresAt: Date?
 
     /// Multiple observers, not a single closure. The app delegate refreshes the
-    /// status item and the watchdog reacts to bridge state; a lone `onChange`
+    /// status item and the Devices window both react to bridge state; a lone `onChange`
     /// property meant whichever registered second silently disconnected the
     /// other.
     private var observers: [UUID: () -> Void] = [:]
@@ -141,7 +160,11 @@ final class MenuBarModel {
         switch status {
         case .installingExtension: "Installing…"
         case .needsApproval: "Approval needed in System Settings"
-        case .waiting: "Waiting for iPhone"
+        case .waitingForCable: LinkStatus.waitingForCable.headline
+        case .deviceNotResponding: LinkStatus.deviceNotResponding.headline
+        case .deviceNotPaired: LinkStatus.deviceNotPaired.headline
+        case .connecting: LinkStatus.connecting.headline
+        case .switchedOff: LinkStatus.switchedOff.headline
         case let .connected(peer, .cellular): "Connected — \(peer) · Cellular ✓"
         case let .connected(peer, egress): "⚠ \(peer) — via \(egress.displayName), not cellular"
         case .failed: "Something went wrong"
@@ -154,8 +177,11 @@ final class MenuBarModel {
             "Setting up network routing"
         case .needsApproval:
             "System Settings → General → Login Items & Extensions → Network Extensions"
-        case .waiting:
-            "Open UpLink on your iPhone to start"
+        case .waitingForCable: LinkStatus.waitingForCable.detail
+        case .deviceNotResponding: LinkStatus.deviceNotResponding.detail
+        case .deviceNotPaired: LinkStatus.deviceNotPaired.detail
+        case .connecting: LinkStatus.connecting.detail
+        case .switchedOff: LinkStatus.switchedOff.detail
         case .connected(_, .cellular):
             "All apps routed — TCP and UDP"
         case .connected:
@@ -169,10 +195,21 @@ final class MenuBarModel {
 
     func start() {
         reloadPairedDevices()
+        startRelay()
+        // BEFORE the extension work, so a tunnel left behind by a previous
+        // launch is reachable from the very first reconcile tick. Otherwise a
+        // crash or a quit at the wrong moment leaves the Mac with no network
+        // and no way for the app to give it back.
+        Task { @MainActor [weak self] in await self?.adoptExistingRouteTunnel() }
         installSystemExtension()
     }
 
     func stop() {
+        relayFeed?.finish()
+        relayFeed = nil
+        relayConsumer?.cancel()
+        relayConsumer = nil
+        relay.stop()
         pollTask?.cancel()
         pollTask = nil
         // Stop the proxy on quit. The extension outlives this app, and a
@@ -322,7 +359,7 @@ final class MenuBarModel {
             self.manager = manager
             try manager.connection.startVPNTunnel()
 
-            status = .waiting
+            setIdleStatus()
             notifyObservers()
             startPolling()
             // The route tunnel is NOT started here. It follows the session —
@@ -345,6 +382,41 @@ final class MenuBarModel {
     /// Failure here is deliberately not fatal to the session. Without it the
     /// bridge still works whenever the Mac has a network of its own, which is
     /// how it behaved before this existed.
+    /// Adopts a route tunnel this app did not start.
+    ///
+    /// **Without this, a failure becomes a Mac with no network that nothing can
+    /// fix.** `routeManager` used to be assigned only by
+    /// ``enableRouteConfiguration``, which runs only on the session-live path —
+    /// so after the app was quit and relaunched with no session, the property
+    /// was nil, `reconcileRouteTunnel`'s teardown guard returned silently, and
+    /// the tunnel started by the PREVIOUS instance stayed up forever. The
+    /// default route pointed into a packet tunnel that drops everything, the
+    /// bridge behind it was dead, and the running app was structurally
+    /// incapable of taking it down.
+    ///
+    /// Measured 2026-08-15: `curl` timed out, `default … utun5` outranked en0,
+    /// and the only way back was `scutil --nc stop "UpLink Route"` by hand.
+    /// This is the hazard `reconcileRouteTunnel` calls "impossible to undo",
+    /// reached by nothing more exotic than restarting the app.
+    ///
+    /// Called at startup, before anything else can go wrong.
+    private func adoptExistingRouteTunnel() async {
+        guard routeManager == nil else { return }
+        do {
+            let managers = try await NETunnelProviderManager.loadAllFromPreferences()
+            guard let existing = managers.first(
+                where: { $0.localizedDescription == Self.routeConfigurationName }
+            ) else { return }
+            routeManager = existing
+            let status = existing.connection.status
+            if status != .disconnected && status != .invalid {
+                log.error("route: adopted a tunnel left running by a previous launch (status \(String(describing: status), privacy: .public))")
+            }
+        } catch {
+            log.error("route: could not look for an existing tunnel: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
     private func enableRouteConfiguration() async {
         do {
             let identity = try store.loadOrCreateIdentity()
@@ -465,13 +537,13 @@ final class MenuBarModel {
 
         do {
             configuration["pairedDevices"] = try JSONEncoder().encode(pairedDevices)
-            // Carried across so a revoked device is still told after an
-            // extension restart, which is precisely when it would otherwise
-            // come back to life.
-            if let tombstones = await sendToExtension("tombstones"),
-               let data = Data(base64Encoded: tombstones), !data.isEmpty {
-                configuration["revokedDevices"] = data
-            }
+            // NO TOMBSTONES HERE ANY MORE. They belong to whichever side holds
+            // the listener, because keeping a revoked peer's key on the air
+            // long enough to tell it is a listener's job — and that is the
+            // PHONE now. This round trip was asking an extension that no longer
+            // has the verb (so it answered "unknown") and writing a
+            // `revokedDevices` key nothing reads.
+            configuration.removeValue(forKey: "revokedDevices")
             proto.providerConfiguration = configuration
             manager.protocolConfiguration = proto
             try await manager.saveToPreferences()
@@ -492,7 +564,15 @@ final class MenuBarModel {
             setBridgeInterface(peer)
             await reconcileRouteTunnel(sessionLive: true)
         case .disconnected:
-            if status != .waiting { status = .waiting; notifyObservers() }
+            // The extension has no relay to dial. If the app can see a ready
+            // cable, the extension missed the handover — it may have restarted,
+            // or not been up when the device attached. Re-announce rather than
+            // waiting for a replug, which is what a user would otherwise have
+            // to work out for themselves.
+            if case let .ready(udid, port, _) = relayState, !userDisconnected {
+                _ = await sendToExtension("usbrelay:\(port):\(udid)")
+            }
+            setIdleStatus()
             setBridgeInterface(nil)
             await reconcileRouteTunnel(sessionLive: false)
         case let .unpaired(fingerprint):
@@ -510,14 +590,40 @@ final class MenuBarModel {
             }
             reloadPairedDevices()
             await reseedExtension()
-            if status != .waiting { status = .waiting; notifyObservers() }
+            setIdleStatus()
             setBridgeInterface(nil)
             await reconcileRouteTunnel(sessionLive: false)
+        case .connecting:
+            // RE-ANNOUNCED HERE TOO, not only on `.disconnected`.
+            //
+            // FOUND ON HARDWARE. The relay announces its port once, as soon as
+            // the cable is seen — which at launch is before the proxy IPC
+            // channel exists, so the message is silently dropped. The extension
+            // then still holds the PREVIOUS launch's port, so it answers
+            // "connecting" rather than "disconnected", and a re-announce gated
+            // on "disconnected" never fired. The result was a dead bridge that
+            // recovered only by unplugging the cable.
+            //
+            // Safe to send every tick: `startRedialing` is idempotent on the
+            // port the loop is actually dialling, so a repeat is a no-op and a
+            // genuinely new port restarts the loop.
+            if case let .ready(udid, port, _) = relayState, !userDisconnected {
+                _ = await sendToExtension("usbrelay:\(port):\(udid)")
+            }
+            setIdleStatus()
+            setBridgeInterface(nil)
+            // Reconciled like every other not-connected branch. Skipping it
+            // left `quietTicks` frozen, so a route tunnel with nothing behind
+            // it stayed up indefinitely — and it outlives the app, which is the
+            // "this Mac has no network at all" state the teardown exists to
+            // prevent.
+            await reconcileRouteTunnel(sessionLive: false)
+
         case .refused:
             // The Mac's own extension does not send this — it is the phone's
             // vocabulary, for a Mac that refuses its key. Handled so the switch
             // stays exhaustive and a future sender is not silently ignored.
-            if status != .waiting { status = .waiting; notifyObservers() }
+            setIdleStatus()
         case .unintelligible:
             // Ask again rather than act on noise — and in particular do NOT
             // tear the tunnel down over one unparsed reply.
@@ -657,20 +763,85 @@ final class MenuBarModel {
 
     func disconnect() {
         Task { await sendToExtension("disconnect") }
-        status = .waiting
+        userDisconnected = true
+        setIdleStatus()
+        notifyObservers()
+    }
+
+    /// Whether the user has switched the bridge off by hand.
+    ///
+    /// Held here as well as in the extension so the menu can offer the way
+    /// back. Without one, Disconnect had no inverse short of unplugging the
+    /// cable.
+    private(set) var userDisconnected = false
+
+    /// Bridge again after an explicit Disconnect.
+    func reconnect() {
+        userDisconnected = false
+        if case let .ready(udid, port, _) = relayState {
+            Task { @MainActor [weak self] in
+                // The order matters: the extension refuses a relay while it
+                // still believes the user has disconnected, and the relay is
+                // for the same cable so nothing else clears that belief.
+                _ = await self?.sendToExtension("reconnect")
+                _ = await self?.sendToExtension("usbrelay:\(port):\(udid)")
+            }
+        }
+        setIdleStatus()
         notifyObservers()
     }
 
     // MARK: Pairing
 
     func beginPairing() {
+        // Pairing runs over the cable, so there has to be one. Saying so beats
+        // showing a code that cannot possibly be used and letting the user
+        // discover that by typing it.
+        guard case let .ready(udid, port, _) = relayState else {
+            status = .failed("Connect your iPhone with a cable before pairing.")
+            notifyObservers()
+            return
+        }
+
+        // Pairing is an unambiguous "bridge again", so it undoes a Disconnect.
+        //
+        // Without this the two states contradicted each other: Disconnect
+        // clears the extension's relay port, but the app's `relayState` is
+        // still `.ready`, so the guard above passed and the extension answered
+        // `error|nocable` with a perfectly good cable attached — and the
+        // message told the user to check the cable.
+        let wasDisconnected = userDisconnected
+        userDisconnected = false
+
         let code = PairingCode.random()
         activePairingCode = code
         pairingExpiresAt = Date().addingTimeInterval(PairingSession.validity)
         notifyObservers()
 
         Task { @MainActor [weak self] in
-            await self?.sendToExtension("pair:\(code.digits)")
+            // Re-armed IN THIS TASK, before `pair:`, not in a separate one.
+            //
+            // Pairing is an unambiguous "bridge again", so it undoes a
+            // Disconnect — but the re-arm has to complete first. Sent from a
+            // second task, `pair:` could overtake it and hit `relayPort == nil`,
+            // answering `error|nocable` with a perfectly good cable attached
+            // and a message telling the user to check it.
+            if wasDisconnected {
+                _ = await self?.sendToExtension("reconnect")
+                _ = await self?.sendToExtension("usbrelay:\(port):\(udid)")
+            }
+
+            let reply = await self?.sendToExtension("pair:\(code.digits)")
+            if reply?.hasPrefix("error") == true {
+                self?.log.error("pairing could not start: \(reply ?? "", privacy: .public)")
+                self?.status = .failed("Couldn't start pairing. Check the cable and try again.")
+                // Take the code down with it. Leaving it up rendered a
+                // six-digit code that could not possibly work, indefinitely,
+                // because this path returned before anything cleared it.
+                await self?.expirePairingCode()
+                self?.notifyObservers()
+                return
+            }
             // Codes expire on their own so an unattended Mac is never left
             // showing a usable credential.
             try? await Task.sleep(for: .seconds(PairingSession.validity))
@@ -722,9 +893,106 @@ final class MenuBarModel {
         notifyObservers()
     }
 
-    // MARK: Watchdog input
+    // MARK: Bridge interface
 
     var bridgeInterfaceName: String? { status.isConnected ? currentBridgeInterface : nil }
     private(set) var currentBridgeInterface: String?
     func setBridgeInterface(_ name: String?) { currentBridgeInterface = name }
+
+    // MARK: The cable
+
+    /// Pumps the USB cable onto a loopback port the extension can dial.
+    ///
+    /// Owned by the app because the extension is sandboxed and cannot open
+    /// `/var/run/usbmuxd`. See ``USBRelay``.
+    private let relay = USBRelay()
+
+    /// Told when the cable is pulled mid-session, so the app can notify.
+    var onCableRemoved: (() -> Void)?
+    private(set) var relayState: USBRelayState = .noDevice
+    private var relayFeed: AsyncStream<USBRelayState>.Continuation?
+    private var relayConsumer: Task<Void, Never>?
+
+    private func startRelay() {
+        // Serialised through one consumer, deliberately.
+        //
+        // Spawning an independent Task per change looked equivalent and is not:
+        // unstructured tasks have no ordering guarantee, and `relayChanged`
+        // awaits a provider round trip in the middle. A `.ready` → `.noDevice`
+        // pair — unplugging right after the probe — could land in either order,
+        // leaving the app believing a cable is present that has gone, and
+        // delivering `usbrelay:<stale port>` AFTER `usbgone`.
+        let (states, feed) = AsyncStream<USBRelayState>.makeStream(bufferingPolicy: .unbounded)
+        relayFeed = feed
+        relay.onStateChange = { state in feed.yield(state) }
+        relayConsumer = Task { @MainActor [weak self] in
+            for await state in states {
+                await self?.relayChanged(state)
+            }
+        }
+        relay.start()
+    }
+
+    private func relayChanged(_ state: USBRelayState) async {
+        relayState = state
+        switch state {
+        case let .ready(udid, port, _):
+            _ = await sendToExtension("usbrelay:\(port):\(udid)")
+        case .noDevice, .attachedNotAnswering, .failed:
+            // Replugging is unambiguously "bridge again".
+            userDisconnected = false
+            // Tell the user once, and only if they were actually bridging: the
+            // link they were using has physically gone.
+            if case .noDevice = state, status.isConnected { onCableRemoved?() }
+            _ = await sendToExtension("usbgone")
+        }
+        // The extension's own status poll decides connected-versus-not; this
+        // only fills in WHICH not-connected, which is the part only the app can
+        // see.
+        if !status.isConnected { setIdleStatus() }
+        notifyObservers()
+    }
+
+    /// The honest name for "not bridging right now".
+    ///
+    /// There are three of them and they need different actions from the user,
+    /// so they must not collapse into one string. The cable is the only source
+    /// of truth for which one applies.
+    private func setIdleStatus() {
+        // The decision itself lives in ``LinkStatus``, in the kit, because the
+        // Mac app has no test target — so while this switch was here, every arm
+        // of it could only be checked by physically arranging the state. That
+        // is why "Waiting for iPhone" survived being shown to users whose
+        // iPhone was plugged in.
+        let presence: LinkPresence
+        var paired = false
+        switch relayState {
+        case .noDevice:
+            presence = .noDevice
+        case .attachedNotAnswering:
+            presence = .attachedNotAnswering
+        case let .failed(reason):
+            presence = .failed(reason)
+        case let .ready(udid, _, _):
+            presence = .answering(udid: udid)
+            // A record with no UDID adopts the first device it sessions with,
+            // so it counts as paired or the migration could never happen.
+            paired = pairedDevices.contains { $0.udid == udid || $0.udid == nil }
+        }
+
+        let new: MacBridgeStatus
+        switch LinkStatus.resolve(
+            presence: presence, isPaired: paired, userDisconnected: userDisconnected
+        ) {
+        case .waitingForCable: new = .waitingForCable
+        case .deviceNotResponding: new = .deviceNotResponding
+        case .deviceNotPaired: new = .deviceNotPaired
+        case .connecting: new = .connecting
+        case .switchedOff: new = .switchedOff
+        case let .failed(reason): new = .failed(reason)
+        }
+        guard new != status else { return }
+        status = new
+        notifyObservers()
+    }
 }

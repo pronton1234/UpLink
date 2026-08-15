@@ -5,19 +5,38 @@ import CryptoKit
 /// A device this one has paired with.
 public struct PairedDevice: Sendable, Equatable, Identifiable, Codable {
     public var id: String { fingerprint }
-    /// Short hash of the peer's long-term public key. Shown in the UI and put
-    /// in the Bonjour TXT record so a known device is recognisable before any
-    /// connection is made.
+    /// Short hash of the peer's long-term public key. Shown in the UI, and the
+    /// TLS-PSK identity the dialling side offers.
     public let fingerprint: String
     public let name: String
     public let publicKey: Data
     public let pairedAt: Date
 
-    public init(fingerprint: String, name: String, publicKey: Data, pairedAt: Date) {
+    /// The peer's USB UDID, on the Mac's records only.
+    ///
+    /// Reported by `usbmuxd` rather than claimed by the peer, so it is the one
+    /// identifier in the exchange that cannot be forged over the wire. It pins
+    /// a pairing to the physical phone it was made with, so a different handset
+    /// cannot bridge on a key it somehow holds.
+    ///
+    /// Optional because records written before the wired transport have none;
+    /// such a record adopts the UDID of the first device it successfully
+    /// sessions with. `nil` on the phone's records, which never see a UDID —
+    /// iOS does not let an app read its own.
+    public var udid: String?
+
+    public init(
+        fingerprint: String,
+        name: String,
+        publicKey: Data,
+        pairedAt: Date,
+        udid: String? = nil
+    ) {
         self.fingerprint = fingerprint
         self.name = name
         self.publicKey = publicKey
         self.pairedAt = pairedAt
+        self.udid = udid
     }
 
     public static func fingerprint(of publicKey: Data) -> String {

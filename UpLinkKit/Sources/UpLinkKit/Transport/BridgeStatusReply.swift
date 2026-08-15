@@ -15,6 +15,11 @@ public enum BridgeStatusReply: Equatable, Sendable {
     case connected(peer: String, egress: EgressInterface)
     /// The extension is running but has no session.
     case disconnected
+    /// The extension has a relay to dial and is trying. Distinct from
+    /// `disconnected` so the Mac can say "Connecting…" rather than "Waiting for
+    /// USB connection" at a user whose cable is plainly plugged in — the whole
+    /// reason the idle states were split apart.
+    case connecting
     /// The peer has removed this pairing. Distinct from `disconnected`, because
     /// retrying is pointless and the user has to pair again — a state that
     /// previously presented as an endless run of ordinary connection failures.
@@ -55,6 +60,9 @@ public enum BridgeStatusReply: Equatable, Sendable {
 
         case "disconnected", "waiting":
             return .disconnected
+
+        case "connecting":
+            return .connecting
 
         default:
             return .unintelligible

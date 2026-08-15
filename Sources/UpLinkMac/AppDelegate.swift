@@ -21,7 +21,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var devicesWindow: NSWindow?
 
     private let model = MenuBarModel()
-    private var watchdogController: WatchdogController?
 
     static func main() {
         let delegate = AppDelegate()
@@ -34,8 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installStatusItem()
         requestNotificationPermission()
 
-        watchdogController = WatchdogController(model: model) { [weak self] in
-            self?.notifyWifiAvailable()
+        model.onCableRemoved = { [weak self] in
+            self?.notifyCableRemoved()
         }
 
         model.observe { [weak self] in
@@ -62,11 +61,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.menu = buildMenu()
         // Reflect a degraded bridge in the menu bar itself, not just inside the
         // menu — the user should not have to open it to find out.
+        // The glyph distinguishes "no cable" from "cable, something else
+        // wrong", because those need different things from the user and the
+        // whole point of a menu bar icon is to answer at a glance.
         let symbol: String
         switch model.status {
         case .connected(_, .cellular): symbol = "personalhotspot"
         case .connected: symbol = "exclamationmark.triangle"
-        default: symbol = "personalhotspot.slash"
+        case .waitingForCable: symbol = "cable.connector.slash"
+        case .deviceNotResponding, .deviceNotPaired: symbol = "cable.connector"
+        case .connecting: symbol = "cable.connector"
+        case .failed, .needsApproval: symbol = "exclamationmark.triangle"
+        case .switchedOff: symbol = "personalhotspot.slash"
+        case .installingExtension: symbol = "personalhotspot.slash"
         }
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "UpLink")
         image?.isTemplate = true
@@ -98,7 +105,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        if model.status.isConnected {
+        // Disconnect needs an inverse. Without one it was a one-way door: the
+        // only route back to a working bridge was to unplug the cable and plug
+        // it in again, which nothing on screen suggested.
+        if model.userDisconnected {
+            menu.addItem(
+                NSMenuItem(title: "Reconnect", action: #selector(reconnect), keyEquivalent: "")
+            )
+        } else if model.status.isConnected {
             menu.addItem(
                 NSMenuItem(title: "Disconnect", action: #selector(disconnect), keyEquivalent: "")
             )
@@ -138,6 +152,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Actions
 
+    @objc private func reconnect() {
+        model.reconnect()
+    }
+
     @objc private func disconnect() {
         model.disconnect()
     }
@@ -176,15 +194,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// The watchdog's one notification, per the spec.
-    private func notifyWifiAvailable() {
+    /// Told once when the cable comes out mid-session.
+    ///
+    /// Replaces the Wi-Fi watchdog, which warned that Wi-Fi had been available
+    /// for two minutes and it was time to stop draining the phone. That advice
+    /// no longer applies: the bridge runs over the cable, which is also
+    /// charging the phone, so there is nothing to preserve by disconnecting.
+    /// What the user does need telling is the opposite — the link they were
+    /// using has physically gone.
+    private func notifyCableRemoved() {
         let content = UNMutableNotificationContent()
-        content.title = "Wi-Fi has been available for 2 minutes"
-        content.body = "Disconnect the mobile link to preserve your phone's battery."
-        content.sound = nil  // un-intrusive, as specified
+        content.title = "iPhone disconnected"
+        content.body = "UpLink stopped bridging when the cable came out."
+        content.sound = nil
 
         let request = UNNotificationRequest(
-            identifier: "uplink.wifi-available",
+            identifier: "uplink.cable-removed",
             content: content,
             trigger: nil
         )

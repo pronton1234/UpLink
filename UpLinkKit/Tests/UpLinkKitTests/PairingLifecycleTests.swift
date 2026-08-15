@@ -17,44 +17,46 @@ import CryptoKit
 // register on the other one" and "re-pairing fails and I have to retry" could
 // both be true with a green suite.
 //
-// Real `MacSessionHost`, real `NWListener`, real TLS-PSK, real `PairingClient`.
+// Real `PhoneSessionHost`, real `NWListener`, real TLS-PSK, real `PairingClient`.
 
 @Suite("Pairing lifecycle: pair, remove, pair again")
 struct PairingLifecycleTests {
 
-    private func makeHost() async throws -> (MacSessionHost, InMemoryDeviceDirectory) {
+    private func makeHost() async throws -> (PhoneSessionHost, InMemoryDeviceDirectory) {
         let store = InMemoryDeviceDirectory()
-        let host = MacSessionHost(
+        let host = PhoneSessionHost(
             identity: Curve25519.KeyAgreement.PrivateKey(),
-            deviceName: "Lifecycle Mac",
+            deviceName: "Lifecycle iPhone",
             store: store,
+            dialer: NeverDialer(),
             queue: DispatchQueue(label: "lifecycle.host"),
-            profile: .localLink,
-            monitorsPath: false
+            port: UInt16.random(in: 41000 ..< 48000)
         )
         try await host.start()
         return (host, store)
     }
 
-    /// Aimed straight at the host's port, so the test does not depend on Bonjour
-    /// resolving inside a test runner.
-    private func peer(for host: MacSessionHost) async throws -> DiscoveredPeer {
-        let port = try #require(await host.listeningPort)
-        return DiscoveredPeer(
-            id: "lifecycle",
-            name: "Lifecycle Mac",
-            endpoint: .hostPort(host: "127.0.0.1", port: port),
-            fingerprint: await host.fingerprint,
-            profile: .localLink
-        )
+    /// Dials the phone the way the Mac's relay would, and pairs.
+    private func dialAndPair(
+        to host: PhoneSessionHost,
+        code: PairingCode,
+        macIdentity: Curve25519.KeyAgreement.PrivateKey,
+        label: String
+    ) async throws -> PairedDevice {
+        let port = try await settledPort(of: host)
+        return try await MacSessionClient(
+            identity: macIdentity,
+            deviceName: "Lifecycle Mac",
+            store: InMemoryDeviceDirectory(),
+            queue: DispatchQueue(label: label)
+        ).pair(relayPort: port.rawValue, code: code, udid: "LIFECYCLE-UDID")
     }
 
-    /// Dials as a paired phone would: same session key, same PSK identity, same
-    /// HELLO. Returns the channel so the caller can read what the Mac says back.
-    /// Pairing ends with a listener rebuild, which changes the bound port. In
-    /// the product the phone re-discovers over Bonjour; here the test has to
-    /// wait for the port to settle, or it dials one that is being released.
-    private func settledPort(of host: MacSessionHost) async throws -> NWEndpoint.Port {
+    /// Pairing ends with a listener rebuild. The port is fixed now, so unlike
+    /// the Bonjour era it comes back as the same number — but it is briefly
+    /// unbound while the old socket is released, and dialling into that window
+    /// fails. Waiting for it to settle is still required.
+    private func settledPort(of host: PhoneSessionHost) async throws -> NWEndpoint.Port {
         var last: NWEndpoint.Port?
         var stableFor = 0
         let deadline = ContinuousClock.now + .seconds(5)
@@ -72,29 +74,45 @@ struct PairingLifecycleTests {
         return try #require(await host.listeningPort)
     }
 
-    private func dialAsPairedPhone(
-        to host: MacSessionHost,
-        phoneIdentity: Curve25519.KeyAgreement.PrivateKey,
-        macDevice: PairedDevice
+    /// Dials as a paired Mac would: same session key, same PSK identity, same
+    /// HELLO. Returns the channel so the caller can read what the phone says
+    /// back.
+    ///
+    /// `phoneFingerprint` is the LISTENER's own fingerprint, and it is the
+    /// context both sides derive the session key from — the Mac takes it from
+    /// its paired record, the phone from itself.
+    private func dialAsPairedMac(
+        to host: PhoneSessionHost,
+        macIdentity: Curve25519.KeyAgreement.PrivateKey,
+        phoneDevice: PairedDevice
     ) async throws -> NWConnectionChannel {
-        let phoneFingerprint = PairedDevice.fingerprint(of: phoneIdentity.publicKey.rawRepresentation)
+        let macFingerprint = PairedDevice.fingerprint(of: macIdentity.publicKey.rawRepresentation)
+        let phoneFingerprint = phoneDevice.fingerprint
         let key = try KeySchedule.sessionKey(
-            localPrivate: phoneIdentity,
-            remotePublic: try Curve25519.KeyAgreement.PublicKey(rawRepresentation: macDevice.publicKey),
+            localPrivate: macIdentity,
+            remotePublic: try Curve25519.KeyAgreement.PublicKey(rawRepresentation: phoneDevice.publicKey),
             context: Data(phoneFingerprint.utf8)
         )
         let port = try await settledPort(of: host)
         let connection = NWConnection(
             host: "127.0.0.1",
             port: port,
-            using: TransportParameters.session(psk: key, identity: phoneFingerprint, profile: .localLink)
+            using: TransportParameters.session(psk: key, identity: macFingerprint)
         )
         let channel = NWConnectionChannel(connection: connection)
-        try await channel.start(on: DispatchQueue(label: "lifecycle.phone"))
+        try await channel.start(on: DispatchQueue(label: "lifecycle.mac"))
 
-        // The phone announces itself; the Mac dispatches on this frame.
-        var mux = Multiplexer(role: .responder)
-        try await channel.send(FrameEncoder.encode(mux.makeHello(identity: phoneFingerprint)))
+        // The Mac announces itself; the phone dispatches on this frame. The
+        // proof is what lets the phone believe the fingerprint.
+        var mux = Multiplexer(role: .initiator)
+        let proof = HelloProof.tag(
+            sessionKey: key,
+            dialerFingerprint: macFingerprint,
+            listenerFingerprint: phoneFingerprint
+        )
+        try await channel.send(
+            FrameEncoder.encode(mux.makeHello(identity: macFingerprint, proof: proof))
+        )
         return channel
     }
 
@@ -151,16 +169,15 @@ struct PairingLifecycleTests {
         defer { Task { await host.stop() } }
 
         // 1. Pair.
-        let phoneIdentity = Curve25519.KeyAgreement.PrivateKey()
-        let phoneFingerprint = PairedDevice.fingerprint(of: phoneIdentity.publicKey.rawRepresentation)
+        let macIdentity = Curve25519.KeyAgreement.PrivateKey()
+        let macFingerprint = PairedDevice.fingerprint(of: macIdentity.publicKey.rawRepresentation)
         let firstCode = try PairingCode(digits: "111111")
         try await host.setPairingCode(firstCode)
-        let macDevice = try await withTimeout(10, "first pairing") {
-            try await PairingClient(queue: DispatchQueue(label: "lifecycle.pair"))
-                .pair(with: try await self.peer(for: host), code: firstCode, localIdentity: phoneIdentity)
+        let phoneDevice = try await withTimeout(10, "first pairing") {
+            try await self.dialAndPair(to: host, code: firstCode, macIdentity: macIdentity, label: "lifecycle.pair")
         }
         #expect(
-            try store.pairedDevices().map(\.fingerprint) == [phoneFingerprint],
+            try store.pairedDevices().map(\.fingerprint) == [macFingerprint],
             "the Mac did not record the pairing"
         )
 
@@ -173,8 +190,8 @@ struct PairingLifecycleTests {
         #expect(try store.pairedDevices().isEmpty, "the Mac still lists a device it removed")
 
         // 3. The phone knows nothing yet and dials as usual. It must be told.
-        let channel = try await dialAsPairedPhone(
-            to: host, phoneIdentity: phoneIdentity, macDevice: macDevice
+        let channel = try await dialAsPairedMac(
+            to: host, macIdentity: macIdentity, phoneDevice: phoneDevice
         )
         let told = await awaitFrame(.unpaired, on: channel)
         await channel.close()
@@ -191,11 +208,10 @@ struct PairingLifecycleTests {
         let secondCode = try PairingCode(digits: "222222")
         try await host.setPairingCode(secondCode)
         _ = try await withTimeout(10, "re-pairing") {
-            try await PairingClient(queue: DispatchQueue(label: "lifecycle.repair"))
-                .pair(with: try await self.peer(for: host), code: secondCode, localIdentity: phoneIdentity)
+            try await self.dialAndPair(to: host, code: secondCode, macIdentity: macIdentity, label: "lifecycle.repair")
         }
         #expect(
-            try store.pairedDevices().map(\.fingerprint) == [phoneFingerprint],
+            try store.pairedDevices().map(\.fingerprint) == [macFingerprint],
             "re-pairing after a removal did not take"
         )
     }
@@ -215,8 +231,7 @@ struct PairingLifecycleTests {
         let firstCode = try PairingCode(digits: "555555")
         try await host.setPairingCode(firstCode)
         _ = try await withTimeout(10, "pair phone one") {
-            try await PairingClient(queue: DispatchQueue(label: "multi.1"))
-                .pair(with: try await self.peer(for: host), code: firstCode, localIdentity: firstPhone)
+            try await self.dialAndPair(to: host, code: firstCode, macIdentity: firstPhone, label: "multi.1")
         }
         #expect(try store.pairedDevices().count == 1)
 
@@ -226,8 +241,7 @@ struct PairingLifecycleTests {
         let secondCode = try PairingCode(digits: "666666")
         try await host.setPairingCode(secondCode)
         _ = try await withTimeout(10, "pair phone two") {
-            try await PairingClient(queue: DispatchQueue(label: "multi.2"))
-                .pair(with: try await self.peer(for: host), code: secondCode, localIdentity: secondPhone)
+            try await self.dialAndPair(to: host, code: secondCode, macIdentity: secondPhone, label: "multi.2")
         }
 
         #expect(
@@ -244,12 +258,11 @@ struct PairingLifecycleTests {
         let (host, store) = try await makeHost()
         defer { Task { await host.stop() } }
 
-        let phoneIdentity = Curve25519.KeyAgreement.PrivateKey()
+        let macIdentity = Curve25519.KeyAgreement.PrivateKey()
         let firstCode = try PairingCode(digits: "333333")
         try await host.setPairingCode(firstCode)
-        let macDevice = try await withTimeout(10, "first pairing") {
-            try await PairingClient(queue: DispatchQueue(label: "lifecycle.pair2"))
-                .pair(with: try await self.peer(for: host), code: firstCode, localIdentity: phoneIdentity)
+        let phoneDevice = try await withTimeout(10, "first pairing") {
+            try await self.dialAndPair(to: host, code: firstCode, macIdentity: macIdentity, label: "lifecycle.pair2")
         }
 
         // Remove, then pair again immediately — without the phone ever having
@@ -261,14 +274,13 @@ struct PairingLifecycleTests {
         let secondCode = try PairingCode(digits: "444444")
         try await host.setPairingCode(secondCode)
         _ = try await withTimeout(10, "re-pairing") {
-            try await PairingClient(queue: DispatchQueue(label: "lifecycle.repair2"))
-                .pair(with: try await self.peer(for: host), code: secondCode, localIdentity: phoneIdentity)
+            try await self.dialAndPair(to: host, code: secondCode, macIdentity: macIdentity, label: "lifecycle.repair2")
         }
 
         // Now connect. A stale tombstone answers `unpaired` here, and the phone
         // deletes the pairing it has just made.
-        let channel = try await dialAsPairedPhone(
-            to: host, phoneIdentity: phoneIdentity, macDevice: macDevice
+        let channel = try await dialAsPairedMac(
+            to: host, macIdentity: macIdentity, phoneDevice: phoneDevice
         )
         let wronglyTold = await awaitFrame(.unpaired, on: channel, within: 2)
         await channel.close()

@@ -18,12 +18,6 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>UpLink connects to your Mac on the local network to share this iPhone's cellular connection.</string>
-	<key>NSBonjourServices</key>
-	<array>
-		<string>_uplink._tcp</string>
-	</array>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionPointIdentifier</key>

@@ -99,10 +99,32 @@ public actor BridgeResponder {
 
     private let localFingerprint: String
 
-    public init(channel: FrameChannel, dialer: DestinationDialer, localFingerprint: String = "") {
+    /// Decides whether a peer announcing `fingerprint` really holds that
+    /// identity's key, given the proof it sent. See ``HelloProof``.
+    ///
+    /// Injected rather than computed here because only the host knows which
+    /// paired Macs exist and holds the private key to derive their session
+    /// keys. `nil` accepts any claim, which is what the loopback tests want and
+    /// what no production caller passes.
+    private let verifyHello: (@Sendable (String, Data) -> Bool)?
+
+    /// - Parameter onUnpaired: supplied here rather than registered afterwards
+    ///   so a caller can install an entire session synchronously. Registering
+    ///   it through `onUnpairedByPeer` costs an `await`, and a suspension in
+    ///   the middle of installing a session is how two concurrent accepts
+    ///   ended up interleaving their state.
+    public init(
+        channel: FrameChannel,
+        dialer: DestinationDialer,
+        localFingerprint: String = "",
+        verifyHello: (@Sendable (String, Data) -> Bool)? = nil,
+        onUnpaired: (@Sendable () -> Void)? = nil
+    ) {
         self.channel = channel
         self.dialer = dialer
         self.localFingerprint = localFingerprint
+        self.verifyHello = verifyHello
+        if let onUnpaired { unpairObservers[UUID()] = onUnpaired }
     }
 
     /// What the phone last observed about how traffic is actually leaving.
@@ -113,15 +135,43 @@ public actor BridgeResponder {
     /// placeholder.
     public var observedEgress: EgressInterface? { reportedEgress }
 
+    /// Which Mac this session is with, taken from the `HELLO` it opened with
+    /// and — crucially — cross-checked against the TLS-PSK identity it actually
+    /// negotiated before this session is allowed to carry anything. See
+    /// `PhoneSessionHost.handleSession`.
+    public private(set) var peerFingerprint: String?
+
     /// Runs until the peer disconnects or the protocol is violated.
     ///
-    /// The phone dials, so it speaks first: the opening `HELLO` both negotiates
-    /// the version and tells the Mac which paired device this is.
+    /// **The Mac dials and therefore speaks first.** Over `usbmuxd` only the Mac
+    /// can open a connection, so the phone is the listener: it reads the opening
+    /// frame to tell a pairing attempt from a session, then resumes here through
+    /// ``run(resuming:decoder:)``. This bare entry point exists for the loopback
+    /// tests, which wire two channels together with no listener in between.
     public func run() async throws {
         defer { Task { await self.teardown() } }
+        try await pumpFrames()
+    }
 
-        try await write(mux.makeHello(identity: localFingerprint))
+    /// Resumes after the listener has already read the opening `HELLO` in order
+    /// to dispatch pairing versus session.
+    ///
+    /// The partially-consumed decoder is handed over rather than recreated: the
+    /// Mac may have pipelined its first `OPEN` into the same segment as the
+    /// `HELLO`, and a fresh decoder would silently drop it — the same hazard
+    /// that made this method necessary on the other role before the roles
+    /// swapped.
+    public func run(resuming hello: Frame, decoder: FrameDecoder) async throws {
+        defer { Task { await self.teardown() } }
+        self.decoder = decoder
+        try await handle(hello)
+        while let frame = try self.decoder.next() {
+            try await handle(frame)
+        }
+        try await pumpFrames()
+    }
 
+    private func pumpFrames() async throws {
         let heartbeat = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: Self.heartbeatInterval)
@@ -158,10 +208,6 @@ public actor BridgeResponder {
         let token = UUID()
         unpairObservers[token] = handler
         return token
-    }
-
-    public func removeUnpairObserver(_ token: UUID) {
-        unpairObservers.removeValue(forKey: token)
     }
 
     /// Tells the peer this pairing is gone, best effort.
@@ -213,12 +259,31 @@ public actor BridgeResponder {
             case .pingReceived:
                 try await write(Frame(kind: .pong, streamID: Multiplexer.controlStreamID))
 
-            case let .helloAcknowledged(version):
+            case let .helloReceived(version, identity, proof):
                 guard version == Multiplexer.protocolVersion else {
                     throw ChannelError.versionMismatch(version)
                 }
+                // Before the fingerprint is believed for anything. It decides
+                // which Mac is shown as connected and which pairing an `unpair`
+                // over this session applies to, so an unverified claim is a way
+                // for one paired Mac to revoke another.
+                if let verifyHello, !verifyHello(identity, proof) {
+                    throw ChannelError.handshakeFailed(
+                        "peer announced fp=\(identity) without holding that identity's key"
+                    )
+                }
+                peerFingerprint = identity
+                try await write(mux.makeHelloAck())
 
-            case .pongReceived, .egressReported, .helloReceived:
+            case .helloAcknowledged:
+                // This side never sends HELLO — the Mac dials, so the Mac
+                // opens. An ACK arriving here means the peer believes it is the
+                // listener, which is a build from before the roles swapped.
+                // Failing loudly beats a half-configured session that carries
+                // traffic in one direction only.
+                throw ChannelError.handshakeFailed("peer acknowledged a HELLO this side never sent")
+
+            case .pongReceived, .egressReported:
                 break
             }
         }

@@ -34,7 +34,7 @@ public enum MuxEvent: Equatable, Sendable {
     case pingReceived
     case pongReceived
     case egressReported(EgressInterface)
-    case helloReceived(version: UInt16, identity: String)
+    case helloReceived(version: UInt16, identity: String, proof: Data)
     case helloAcknowledged(version: UInt16)
     /// The peer has forgotten this pairing. Not a failure — an instruction.
     case unpairedByPeer
@@ -72,7 +72,16 @@ public struct Multiplexer: Sendable {
     public static let maxConcurrentStreams = 4_096
 
     public static let controlStreamID: UInt32 = 0
-    public static let protocolVersion: UInt16 = 1
+
+    /// Bumped to 2 when the transport moved from AWDL to the USB cable.
+    ///
+    /// The frame *format* did not change, but the direction of the opening
+    /// handshake did: the Mac now dials and sends `HELLO`, because `usbmuxd`
+    /// only carries Mac→phone connections. A version-1 peer would sit waiting
+    /// for a `HELLO` that is never coming while this side waits for its `ACK` —
+    /// a mutual hang rather than an error. Refusing the version turns a
+    /// mismatched pair of builds into a message instead of a silence.
+    public static let protocolVersion: UInt16 = 2
 
     private struct StreamState {
         /// Bytes we may still send before the peer must grant more.
@@ -234,12 +243,16 @@ public struct Multiplexer: Sendable {
     /// Carries the sender's long-term fingerprint as well as the version, so
     /// the listener knows *which* paired device this is without having to
     /// infer it from the TLS layer.
-    public func makeHello(identity: String) -> Frame {
+    ///
+    /// `proof` is optional only so the frame codec stays testable on its own;
+    /// every production caller supplies one. See ``HelloProof``.
+    public func makeHello(identity: String, proof: Data = Data()) -> Frame {
         var payload = Data()
         payload.append(bigEndian16: Self.protocolVersion)
         let identityBytes = Data(identity.utf8.prefix(255))
         payload.append(UInt8(identityBytes.count))
         payload.append(identityBytes)
+        payload.append(proof)
         return Frame(kind: .hello, streamID: Self.controlStreamID, payload: payload)
     }
 
@@ -253,12 +266,12 @@ public struct Multiplexer: Sendable {
         Frame(kind: .egressReport, streamID: Self.controlStreamID, payload: Data([interface.rawValue]))
     }
 
-    /// "I have forgotten you; stop trying."
-    ///
-    /// Sent before tearing down, so the peer learns why instead of inferring it
-    /// from a TLS-PSK handshake that now refuses an identity which no longer
-    /// exists — indistinguishable, from the other end, from any other failure.
     /// Tells the dialling side why its pairing attempt was refused.
+    ///
+    /// Without it a refusal is indistinguishable from any other handshake
+    /// failure, so `.expired`, `.tooManyAttempts` and `.alreadyConsumed` were
+    /// values nothing could ever produce — each with a good message that could
+    /// never be shown.
     public static func pairFailureFrame(_ error: PairingError) -> Frame {
         Frame(kind: .pairFailure, streamID: controlStreamID, payload: Data([error.wireCode]))
     }
@@ -320,7 +333,8 @@ public struct Multiplexer: Sendable {
             else {
                 throw MuxError.malformedControlPayload(frame.kind)
             }
-            return [.helloReceived(version: version, identity: identity)]
+            let proof = Data(frame.payload[(base + 3 + identityLength)...])
+            return [.helloReceived(version: version, identity: identity, proof: proof)]
         case .egressReport:
             guard let raw = frame.payload.first,
                   let interface = EgressInterface(rawValue: raw) else {

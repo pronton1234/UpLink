@@ -3,24 +3,6 @@ import Network
 import CryptoKit
 import OSLog
 
-/// How the two devices reach each other.
-///
-/// Ordered by preference. `peerToPeer` needs no Wi-Fi network at all — AWDL
-/// brings up a direct radio link — but whether it survives inside an iOS
-/// Network Extension is the open question Phase 0 exists to answer. `localLink`
-/// works over the phone's Personal Hotspot or a shared Wi-Fi network and is
-/// known to work from an extension, so it is the guaranteed fallback.
-public enum TransportProfile: String, Sendable, CaseIterable {
-    case peerToPeer
-    case localLink
-
-    /// Try AWDL first, fall back to plain IP. Once the Phase 0 spike reports,
-    /// this list is the single place that changes.
-    public static var preferenceOrder: [TransportProfile] { [.peerToPeer, .localLink] }
-
-    var includesPeerToPeer: Bool { self == .peerToPeer }
-}
-
 /// The resolvers the Mac uses while the bridge is running.
 ///
 /// **Why the bridge must supply DNS at all.** A Mac using nothing but the phone
@@ -68,16 +50,25 @@ public enum UpLinkDNS {
     public static let port: UInt16 = 53
 }
 
-public enum UpLinkService {
-    /// Bonjour service type. AWDL **requires** Bonjour — a direct IP endpoint
-    /// will not traverse a peer-to-peer link — so discovery is mandatory rather
-    /// than a convenience.
-    public static let bonjourType = "_uplink._tcp"
-    public static let bonjourDomain = "local."
+/// Constants shared by both ends of pairing.
+public enum UpLinkPairing {
 
-    /// TXT record key carrying the Mac's long-term public key fingerprint, so
-    /// the phone can recognise a known Mac before connecting.
-    public static let fingerprintKey = "fp"
+    /// Salt for the pairing PSK.
+    ///
+    /// **Why this is now a constant.** It used to be `SHA256(macFingerprint)`,
+    /// which both sides could derive because the Mac published its fingerprint
+    /// in a Bonjour TXT record. Over the cable there is no discovery and no TXT
+    /// record, so at the moment the code is typed the phone does not yet know
+    /// which Mac is about to dial it — and both sides must derive an identical
+    /// salt or the handshake fails with no usable diagnostic.
+    ///
+    /// This costs less than it looks. The salt was never secret; it provided
+    /// domain separation, not entropy, and the 10^6 bound on guessing the code
+    /// is unchanged. What is lost is that a dictionary could be precomputed
+    /// once rather than per-Mac — and mounting that requires already being root
+    /// on the Mac with the cable attached, at the moment the user pairs. The
+    /// real remedy for a weak code remains a PAKE; see ``KeySchedule``.
+    public static let salt = Data("uplink-pairing-v2".utf8)
 }
 
 /// Builds the `NWParameters` for the peer link.
@@ -105,8 +96,9 @@ public enum TransportParameters {
     /// under TLS 1.3 in Network.framework: the handshake fails with -9858, and
     /// because the failure surfaces as `.waiting` rather than `.failed` it
     /// presents as a connection that hangs forever with no error. Every
-    /// configuration with a 1.3 floor was measured to fail; see
-    /// `spike/pair-probe --tls`, which is the harness that established this.
+    /// configuration with a 1.3 floor was measured to fail. The harness that
+    /// established it (`spike/pair-probe --tls`) is gone with the AWDL
+    /// transport; the finding outlived it, which is why it is written here.
     ///
     /// Among the suites that do work, this one is chosen for two properties:
     /// ChaCha20-Poly1305 is AEAD, and the ECDHE half provides **forward
@@ -129,18 +121,32 @@ public enum TransportParameters {
         )
     }
 
-    /// Parameters for an authenticated session with an already-paired device.
+    /// Parameters for the Mac's dial to the local relay.
     ///
     /// The original spec called for "no authentication handshake, for latency"
-    /// — that would leave an open proxy on the local network for anyone to
-    /// use. A PSK handshake costs one round trip on a link whose RTT is under a
-    /// millisecond, which is not a latency budget worth an open relay.
-    public static func session(psk: SymmetricKey, identity: String, profile: TransportProfile) -> NWParameters {
+    /// — that would leave an open proxy for anyone who can reach the port. A
+    /// PSK handshake costs one round trip on a loopback link, which is not a
+    /// latency budget worth an open relay.
+    ///
+    /// The peer link is now a loopback TCP connection to the menu-bar app,
+    /// which pumps it down the cable through `usbmuxd`. So none of the
+    /// interface steering the AWDL era needed applies: there is no radio to
+    /// pin, no address family to force, and no cellular interface for
+    /// Network.framework to wander onto. What remains is the TLS-PSK, which is
+    /// still end to end between this process and the phone — the relay carries
+    /// ciphertext it has no key for.
+    public static func session(psk: SymmetricKey, identity: String) -> NWParameters {
         let tls = NWProtocolTLS.Options()
 
         applyPSK(tls, psk: psk, identity: identity)
         applyPSKCiphersuite(tls)
 
+        let parameters = NWParameters(tls: tls, tcp: Self.tcpOptions())
+        parameters.preferNoProxies = true
+        return parameters
+    }
+
+    private static func tcpOptions() -> NWProtocolTCP.Options {
         let tcp = NWProtocolTCP.Options()
         // The bridge multiplexes many logical streams over this one connection,
         // so Nagle would add delay to every small interactive stream while a
@@ -148,91 +154,28 @@ public enum TransportParameters {
         tcp.noDelay = true
         tcp.enableKeepalive = true
         tcp.keepaliveIdle = 10
-
-        let parameters = NWParameters(tls: tls, tcp: tcp)
-        parameters.includePeerToPeer = profile.includesPeerToPeer
-        parameters.prohibitedInterfaceTypes = Self.peerLinkProhibitedInterfaces
-        Self.pinToIPv6IfPeerToPeer(parameters, profile: profile)
-        return parameters
+        return tcp
     }
 
-    /// Pins a peer-to-peer link to IPv6.
+    /// Parameters for the phone's listener.
     ///
-    /// MEASURED 2026-08-14, and it is the difference between a session that
-    /// lasts and one that dies in half a minute.
+    /// Every paired Mac contributes one PSK keyed by that Mac's fingerprint,
+    /// and an armed pairing code contributes one more. TLS selects by the
+    /// identity the client offers, so a single listener serves both an
+    /// already-paired Mac and one pairing for the first time — one port, one
+    /// accept path.
     ///
-    /// The kernel decides how much airtime to give AWDL from how many *active
-    /// AWDL sockets* it can see. Two seconds before a live session died:
-    ///
-    ///     monitorAWDLState: Active Sockets false ... SocketsActive 0
-    ///     setScheduleState: reason:DiscoveryTimeout sc:Idle and force:YES
-    ///     LQM-WiFi:AWDL State #16 Idle(3)
-    ///
-    /// and at the moment a later session worked:
-    ///
-    ///     monitorAWDLState: Active Sockets true ... SocketsActive 1
-    ///     setScheduleState: reason:UserTriggered sc:Infra Priority
-    ///
-    /// The only difference between the two was the address family the phone
-    /// dialled:
-    ///
-    ///     169.254.203.164:55881              -> SocketsActive 0, dead in 26s
-    ///     fe80::2063:e4ff:fed6:7ce0%awdl0    -> SocketsActive 1, Infra Priority
-    ///
-    /// An IPv4 link-local socket is not attributed to `awdl0`, so the kernel
-    /// concludes nothing is using AWDL, drops the schedule to Idle, and the link
-    /// we are sitting on goes away underneath us. Nothing in the log blames us,
-    /// because from the kernel's side it did exactly what it was asked.
-    ///
-    /// Safe to require rather than merely prefer: the peer link is a *local
-    /// link* by definition — AWDL, shared Wi-Fi, hotspot, or USB — and every
-    /// local link on an Apple platform has an IPv6 link-local address. Bonjour
-    /// publishes it. IPv4 link-local is the accident here, not the baseline.
-    ///
-    /// Related, and the same mistake one layer up: `peerLinkProhibitedInterfaces`
-    /// exists because an unconstrained connection pinned itself to `pdp_ip0` and
-    /// *suppressed* a `169.254.x` peer path. Both are Network.framework picking
-    /// a technically-valid address that cannot do the job.
-    private static func pinToIPv6IfPeerToPeer(_ parameters: NWParameters, profile: TransportProfile) {
-        guard profile.includesPeerToPeer,
-              let ip = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options
-        else { return }
-        ip.version = .v6
-    }
-
-
-    /// The peer link is a *local* link by definition — AWDL, a shared Wi-Fi
-    /// network, the phone's own hotspot, or USB. The Mac is never reachable
-    /// through the carrier, so cellular is not a fallback for it; it is a dead
-    /// end that Network.framework will nonetheless select.
-    ///
-    /// Left unconstrained, a phone with an active radio pins the connection to
-    /// `pdp_ip0` and then *suppresses* the link-local AWDL path that is the only
-    /// one able to carry data:
-    ///
-    ///     [C1 … ready parent-flow (satisfied, interface: pdp_ip0[endc_sub6],
-    ///      scoped, uses cell, …)] suppressing better path notification
-    ///      (comparing …_uplink._tcp.local. to 169.254.135.159:59175)
-    ///
-    /// The connection reports `.ready` and carries nothing, so the failure looks
-    /// like a hang rather than an error. That is the difference between the
-    /// bridge working with no Wi-Fi anywhere and the Mac simply being offline.
-    ///
-    /// This costs nothing on the paths that already worked: over USB or a shared
-    /// network the peer link was never on cellular to begin with.
-    private static let peerLinkProhibitedInterfaces: [NWInterface.InterfaceType] = [.cellular]
-
-    /// Parameters for the Mac's listener.
-    ///
-    /// Every paired phone contributes one PSK keyed by its own fingerprint, and
-    /// an active pairing code contributes one more. TLS selects by the identity
-    /// the client offers, so a single listener serves both already-paired
-    /// phones and a phone pairing for the first time — no second port, no
-    /// second Bonjour service.
+    /// **Bound to loopback.** `usbmuxd`'s device side dials `127.0.0.1` on the
+    /// phone, so binding loopback-only is both sufficient and the safest
+    /// choice: the port is unreachable from Wi-Fi or cellular, and cannot be
+    /// probed by anything off the device. If a device run ever shows the muxer
+    /// dialling a non-loopback address instead, this is the one line to change
+    /// — and the trade being made is stated here so that change is a decision
+    /// rather than a shrug.
     public static func listener(
         sessionKeys: [(identity: String, key: SymmetricKey)],
         pairingKey: (identity: String, key: SymmetricKey)?,
-        profile: TransportProfile
+        port: UInt16
     ) -> NWParameters {
         let tls = NWProtocolTLS.Options()
 
@@ -243,18 +186,24 @@ public enum TransportParameters {
         // line is what makes PSK work at all.
         applyPSKCiphersuite(tls)
 
-        let tcp = NWProtocolTCP.Options()
-        tcp.noDelay = true
-        tcp.enableKeepalive = true
-        tcp.keepaliveIdle = 10
-
-        let parameters = NWParameters(tls: tls, tcp: tcp)
-        parameters.includePeerToPeer = profile.includesPeerToPeer
-        parameters.prohibitedInterfaceTypes = Self.peerLinkProhibitedInterfaces
-        // Symmetric with the client: a listener that still accepts IPv4
-        // link-local would let the phone open exactly the socket the kernel
-        // does not count. See `pinToIPv6IfPeerToPeer`.
-        Self.pinToIPv6IfPeerToPeer(parameters, profile: profile)
+        let parameters = NWParameters(tls: tls, tcp: Self.tcpOptions())
+        // BOTH lines are required, and that is measured, not assumed.
+        //
+        // `requiredLocalEndpoint` pins the bind to loopback and the fixed port.
+        // `acceptLocalOnly` reads like it means the same thing and its
+        // documented wording suggests something wider ("the local network"),
+        // so it was removed as redundant — and the end-to-end test immediately
+        // stopped establishing a session at all. Whatever it does here, the
+        // listener does not accept the loopback connection without it.
+        //
+        // Left in with the evidence attached rather than reasoned away again.
+        parameters.requiredLocalEndpoint = .hostPort(
+            host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port)!
+        )
+        parameters.acceptLocalOnly = true
+        // The extension can be restarted while the old socket is still in
+        // TIME_WAIT, and a fixed port cannot simply move to another number the
+        // way the old ephemeral listener did.
         parameters.allowLocalEndpointReuse = true
         return parameters
     }
@@ -270,13 +219,14 @@ public enum TransportParameters {
     ///
     /// On a fresh install there are no paired devices and no pairing code, so
     /// the natural key set is empty — and a TLS listener with no key material
-    /// cannot start. That would leave the Mac unable to advertise over Bonjour,
-    /// so the phone could never see it *in order to start pairing*: a
-    /// chicken-and-egg deadlock on the very first run.
+    /// cannot start. That would leave the phone with nothing bound on the
+    /// pairing port, so `usbmux Connect` would be refused and the Mac would
+    /// report "iPhone connected, not answering" for a phone that is running
+    /// perfectly well and simply has nothing to say yet.
     ///
-    /// A random placeholder key nobody holds keeps the listener startable and
-    /// advertising while refusing every handshake, which is exactly the desired
-    /// behaviour for an unpaired Mac.
+    /// A random placeholder key nobody holds keeps the listener startable while
+    /// refusing every handshake, which is exactly the desired behaviour for an
+    /// unpaired phone.
     public static func listenerKeySet(
         sessionKeys: [(identity: String, key: SymmetricKey)],
         pairingKey: (identity: String, key: SymmetricKey)?
@@ -289,11 +239,10 @@ public enum TransportParameters {
 
     /// Parameters for the one-time pairing handshake, keyed by the six-digit
     /// code rather than a long-term secret.
-    public static func pairing(code: PairingCode, salt: Data, profile: TransportProfile) -> NWParameters {
+    public static func pairing(code: PairingCode, salt: Data = UpLinkPairing.salt) -> NWParameters {
         session(
             psk: KeySchedule.pairingKey(code: code, salt: salt),
-            identity: Self.pairingIdentity,
-            profile: profile
+            identity: Self.pairingIdentity
         )
     }
 }
@@ -340,11 +289,16 @@ public actor NWConnectionChannel: FrameChannel {
     /// How long a connection may sit in `.waiting` before it is called a
     /// failure.
     ///
-    /// `.waiting` is not always fatal — an AWDL link takes a moment to come up,
-    /// and Network.framework retries on its own — so it cannot be treated as an
-    /// error immediately. But it is also where a **failed TLS handshake**
-    /// lands, and waiting forever on one is indistinguishable from a hang. A
-    /// local-link peer that is not ready within this window is not going to be.
+    /// `.waiting` is not always fatal — Network.framework retries on its own —
+    /// so it cannot be treated as an error immediately. But it is also where a
+    /// **failed TLS handshake** lands, and waiting forever on one is
+    /// indistinguishable from a hang.
+    ///
+    /// Twelve seconds is now generous rather than tight: the peer link is a
+    /// loopback connection to the app's relay, so there is no radio to come up
+    /// and nothing to discover. Anything not ready in this window is not going
+    /// to be, and the honest answer is to fail so the redial loop can try
+    /// again.
     public static let connectTimeout: TimeInterval = 12
 
     /// Starts the connection and waits until it is ready or has failed.
@@ -418,17 +372,35 @@ public actor NWConnectionChannel: FrameChannel {
                 case let .waiting(error):
                     Logger(subsystem: UpLinkIdentifiers.logSubsystem, category: "channel")
                         .error("connection waiting: \(String(describing: error), privacy: .public)")
-                    // A TLS error in `.waiting` is not something waiting fixes:
-                    // the peer rejected the handshake, which for us means the
-                    // pairing code was wrong or the device is not paired.
-                    // Failing now turns a 12-second stall into an immediate,
-                    // accurate message. Anything else — no route yet, AWDL
-                    // still coming up — is genuinely transient, so it keeps
-                    // waiting until the timeout.
-                    if case .tls = error {
+                    // Two errors in `.waiting` are not something waiting fixes.
+                    //
+                    // A TLS error means the peer rejected the handshake, which
+                    // for us means the pairing code was wrong or the device is
+                    // not paired.
+                    //
+                    // ECONNREFUSED means nothing is listening on that port.
+                    // Over the cable that is the ORDINARY case — it is what
+                    // "UpLink is not running on the phone" looks like — and
+                    // riding the 12-second timeout for it makes the redial loop
+                    // take twelve seconds to notice something the kernel
+                    // answered instantly. Network.framework reports a refused
+                    // connection as `.waiting` rather than `.failed` because it
+                    // intends to retry; for a loopback port that will not help.
+                    //
+                    // Anything else — the relay's listener not bound yet, the
+                    // extension still starting — is genuinely transient, so it
+                    // keeps waiting until the timeout.
+                    switch error {
+                    case .tls:
                         once.resume(throwing: ChannelError.handshakeFailed(
                             "TLS rejected: \(error)"
                         ))
+                    case let .posix(code) where code == .ECONNREFUSED:
+                        once.resume(throwing: ChannelError.handshakeFailed(
+                            "connection refused — nothing is listening there"
+                        ))
+                    default:
+                        break
                     }
                 default:
                     break

@@ -36,11 +36,5 @@
 	     and the app activates properly when it opens. -->
 	<key>LSUIElement</key>
 	<true/>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>UpLink discovers your iPhone on the local network so it can bridge this Mac's traffic through your phone's cellular data.</string>
-	<key>NSBonjourServices</key>
-	<array>
-		<string>_uplink._tcp</string>
-	</array>
 </dict>
 </plist>
