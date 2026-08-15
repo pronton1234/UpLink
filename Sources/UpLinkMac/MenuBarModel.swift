@@ -561,7 +561,6 @@ final class MenuBarModel {
             let name = pairedDevices.first?.name ?? "iPhone"
             let new = MacBridgeStatus.connected(peer: name, egress: egress)
             if new != status { status = new; notifyObservers() }
-            setBridgeInterface(peer)
             await reconcileRouteTunnel(sessionLive: true)
         case .disconnected:
             // The extension has no relay to dial. If the app can see a ready
@@ -573,7 +572,6 @@ final class MenuBarModel {
                 _ = await sendToExtension("usbrelay:\(port):\(udid)")
             }
             setIdleStatus()
-            setBridgeInterface(nil)
             await reconcileRouteTunnel(sessionLive: false)
         case let .unpaired(fingerprint):
             // The phone removed this Mac. The extension has already dropped its
@@ -591,7 +589,6 @@ final class MenuBarModel {
             reloadPairedDevices()
             await reseedExtension()
             setIdleStatus()
-            setBridgeInterface(nil)
             await reconcileRouteTunnel(sessionLive: false)
         case .connecting:
             // RE-ANNOUNCED HERE TOO, not only on `.disconnected`.
@@ -611,7 +608,6 @@ final class MenuBarModel {
                 _ = await sendToExtension("usbrelay:\(port):\(udid)")
             }
             setIdleStatus()
-            setBridgeInterface(nil)
             // Reconciled like every other not-connected branch. Skipping it
             // left `quietTicks` frozen, so a route tunnel with nothing behind
             // it stayed up indefinitely — and it outlives the app, which is the
@@ -893,11 +889,6 @@ final class MenuBarModel {
         notifyObservers()
     }
 
-    // MARK: Bridge interface
-
-    var bridgeInterfaceName: String? { status.isConnected ? currentBridgeInterface : nil }
-    private(set) var currentBridgeInterface: String?
-    func setBridgeInterface(_ name: String?) { currentBridgeInterface = name }
 
     // MARK: The cable
 

@@ -4,7 +4,6 @@ public enum DatagramError: Error, Equatable, Sendable {
     case malformed
     /// The datagram cannot fit in one frame. Reported rather than thrown on the
     /// send path, because dropping is the correct response.
-    case tooLarge
 }
 
 /// One UDP datagram, with the destination it is going to.

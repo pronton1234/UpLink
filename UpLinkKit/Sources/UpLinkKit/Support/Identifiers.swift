@@ -17,8 +17,6 @@ public enum UpLinkIdentifiers {
     /// macOS transparent proxy system extension.
     public static let macProxyExtension = "com.uplink.app.proxy"
 
-    /// iOS packet tunnel extension.
-    public static let iosTunnelExtension = "com.uplink.app.tunnel"
 
     /// Log subsystem for every target.
     public static let logSubsystem = "com.uplink.app"

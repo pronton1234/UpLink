@@ -581,7 +581,8 @@ Worth listing because the repeat offenders are the point.
 - **Wired up to nothing.** `restoreTombstones`/`currentTombstones` had no
   callers, so revocations died with the extension; meanwhile the Mac still asked
   *its* extension for tombstones it no longer owns and wrote a `revokedDevices`
-  key nothing read. This is the `clearUnpairedByPeer` shape exactly.
+  key nothing read. The restore/snapshot accessors left behind are deleted too,
+  rather than left looking usable. This is the `clearUnpairedByPeer` shape exactly.
 - **A guard that reads the wrong variable.** `unpair` disconnected when
   `state.isConnected` — true for *any* live session — so removing Mac B tore
   down a healthy bridge with Mac A. Two lines above sat the comment explaining

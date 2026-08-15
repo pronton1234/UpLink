@@ -135,10 +135,6 @@ public struct PhoneDiagnosticLog: Sendable {
         return String(data: data, encoding: .utf8) ?? "(unreadable)"
     }
 
-    public func clear() {
-        guard let url else { return }
-        queue.async { try? Data().write(to: url, options: .atomic) }
-    }
 
     private static func timestamp() -> String {
         let formatter = DateFormatter()

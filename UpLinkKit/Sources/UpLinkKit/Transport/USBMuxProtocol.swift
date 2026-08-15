@@ -259,7 +259,7 @@ public enum USBMuxCodec {
 }
 
 /// One device `usbmuxd` can see.
-public struct USBDevice: Sendable, Equatable, Identifiable {
+public struct USBDevice: Sendable, Equatable {
 
     /// How `usbmuxd` is reaching this device.
     ///
@@ -294,7 +294,6 @@ public struct USBDevice: Sendable, Equatable, Identifiable {
     public let udid: String
     public let connectionType: ConnectionType
 
-    public var id: UInt32 { deviceID }
 
     public init(deviceID: UInt32, udid: String, connectionType: ConnectionType) {
         self.deviceID = deviceID

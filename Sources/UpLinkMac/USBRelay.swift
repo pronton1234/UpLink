@@ -9,7 +9,7 @@ enum USBRelayState: Sendable, Equatable {
     case noDevice
     /// Attached, but nothing answered on either UpLink port — the phone's app
     /// is not running, or the bridge is switched off over there.
-    case attachedNotAnswering(udid: String)
+    case attachedNotAnswering
     /// Attached and answering. `port` is the loopback port the extension should
     /// dial; `answeringPort` records which side of the phone picked up.
     case ready(udid: String, port: UInt16, answeringPort: UInt16)
@@ -128,7 +128,7 @@ final class USBRelay {
         guard let answering = await probePorts(of: device) else {
             guard isStillCurrent(device) else { return }
             teardown()
-            state = .attachedNotAnswering(udid: device.udid)
+            state = .attachedNotAnswering
             return
         }
         guard isStillCurrent(device) else { return }
@@ -258,7 +258,7 @@ final class USBRelay {
             await local.close()
             // The phone stopped answering. Say so rather than leaving the UI
             // claiming a healthy cable.
-            state = .attachedNotAnswering(udid: device.udid)
+            state = .attachedNotAnswering
             return
         }
 

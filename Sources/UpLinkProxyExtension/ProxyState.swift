@@ -310,12 +310,6 @@ actor ProxyState {
         return paired.first { $0.udid == nil }
     }
 
-    /// A short, stable token the app can turn into a sentence.
-    private static func wireReason(for error: Error) -> String {
-        if let pairing = error as? PairingError { return "pairing|\(pairing.wireCode)" }
-        if case let USBMuxError.refused(code) = error { return "usb|\(code.rawValue)" }
-        return "other"
-    }
 
     func stopHosting() async {
         // Cleared first: from this instant handleNewFlow stops claiming flows,
