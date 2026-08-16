@@ -749,3 +749,80 @@ Fixed by tracking what the running loop is actually dialling (`dialingPort` /
 that answers "what did I last hear?" is not state that answers "what am I doing
 now?", and a guard that consults the wrong one is invisible to review because
 each half looks right on its own.
+
+## The route tunnel could not be restarted once the Wi-Fi it was dropped under was gone
+
+**Symptom.** "I tested with wifi off initially and it worked, but when I
+disconnected from my phone and tried reconnecting, it failed." The sequence was:
+bridge over the cable, then stop bridging and turn Wi-Fi back on, then turn
+Wi-Fi off, plug the cable in, and switch the bridge on again. The bridge itself
+came up in three seconds. Nothing worked anyway.
+
+**What was actually happening.** The bridge was never the problem. The route
+tunnel — which gives the Mac a default route and a resolver, without which no
+socket can be created for the proxy to claim — refused to start, once a second,
+for thirty-one seconds. `startVPNTunnel()` did not throw. NetworkExtension
+accepted it, moved to `connecting`, and killed it milliseconds later, thirty
+times identically:
+
+```
+Entering state NESMVPNSessionStatePreparingNetwork
+E  No network available
+Entering state NESMVPNSessionStateStopping
+status changed to disconnected, last stop reason No network available
+```
+
+**NetworkExtension will not START a packet tunnel on a Mac with no network.** It
+will happily keep one RUNNING: the same session, once up, stayed connected for
+the next twenty minutes with the radio off and no status change at all. That
+asymmetry is the whole bug and the whole fix.
+
+It eventually started only because Personal Hotspot happened to give the USB
+interface an address at 17:50:40, which changed the ranked interfaces and handed
+NE a network to prepare against. With the hotspot off it would have retried
+forever.
+
+**Why the existing guard did not save it.** The teardown was already gated on
+`hasAlternativeNetwork()`, on the reasoning that dropping the tunnel is safe
+while another network exists because it can then be rebuilt. The reasoning is
+sound and the conclusion is still wrong: **reversibility is a property of the
+moment you restart, not the moment you stop**, and the user turns the network
+off in between — deliberately, because that is what the product is for. The
+check was evaluated against a network guaranteed to be gone by the time it
+mattered. No amount of tuning the condition can fix that; it is the wrong
+question.
+
+The misleading diagnostic made it worse. An earlier fix had rewritten the
+twenty-attempt message to disclaim NE-refusing-without-a-network, because it had
+once fired with Wi-Fi up — so the line was actively arguing against the true
+cause at the moment it was true.
+
+**The fix.** The tunnel is never stopped for a dead session. It is started
+eagerly, while a network still exists to start it with, and then switches
+between two modes:
+
+* `.capture` — default routes for both families plus DNS. What the bridge needs.
+* `.standby` — an address and nothing else: no routes, no resolver. The Mac's
+  own network is untouched.
+
+A mode change is `setTunnelNetworkSettings` on a live interface and needs no
+network at all. Standby is what makes never stopping safe — it is the answer to
+the original hazard that motivated the teardown, a capturing tunnel with no
+bridge behind it being a total outage that outlives the app.
+
+Measured after the fix, same machine: tunnel adopted already-connected, standby,
+then capturing 1.9s after the session started — with no `startTunnel` call at
+all, because it never went down.
+
+**A second defect found while fixing it.** `reconcileRouteTunnel` was called
+from four of `refreshStatus`'s six branches. The two it missed were `.refused`
+and `.unintelligible` — and `.unintelligible` is what an unreachable extension
+looks like, so the one state in which the tunnel most needed re-deriving was the
+one state that skipped it. Hoisted out of the switch and run unconditionally.
+Gating on an enumerated subset of replies has now been wrong in this function,
+in the relay announcement, and in the relay itself: the real failure is always
+the case the subset left out.
+
+Pinned by `RouteTunnelRestartRegressionTests`, which walks the reported sequence
+as transitions and asserts that no combination of inputs can ever tear the
+tunnel down.

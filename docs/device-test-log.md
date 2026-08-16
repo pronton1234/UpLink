@@ -650,3 +650,62 @@ Incidentally this answers half of Phase 0's first spike question: **AWDL does
 survive inside a Network Extension** and carried a full session. The other half,
 whether it survives with the phone *locked*, is still unrun — every session so
 far has been with the phone awake.
+
+## Reconnect after a disconnect — VERIFIED, 2026-08-15
+
+The failure was: bridge, stop bridging with Wi-Fi back on, then Wi-Fi off, cable
+in, bridge on. Fixed by never stopping the route tunnel; see REGRESSIONS.md.
+
+Before (old build), a session that came up in 3s still left the Mac unusable:
+
+```
+17:50:09  session started
+17:50:10  route: (re)starting, attempt 1
+17:50:30  THE TUNNEL WILL NOT START — 20 attempts
+17:50:40  route: up                      <- attempt 30, 31 seconds
+```
+
+After, across an app restart with the session dropping and returning:
+
+```
+18:22:34.480  route: adopted a tunnel left running (status connected)
+18:22:34.546  session started
+18:22:35.016  route: standby — no routes, no resolver
+18:22:36.450  route: capturing — default routes and DNS
+```
+
+No `startTunnel` at all: the tunnel never went down, so nothing ever needed a
+network to start it. Session to capturing, 1.9s.
+
+**Standby hands the network back — measured, not assumed.** Sampling once a
+second across the window, with the tunnel up the whole time:
+
+| time | default route | resolver | curl |
+| --- | --- | --- | --- |
+| 18:22:34 | en0 only (tunnel gone) | router's | 200 |
+| 18:22:35 | en0 first, **utun5 up** | router's | 200 |
+| 18:22:37 | **utun5 first** | tunnel's | 200 |
+
+At 18:22:35 the tunnel is running and not capturing, and the Mac's own network
+is entirely intact. That is the property that makes never stopping it safe.
+
+### Traffic classes over the live bridge, after the fix
+
+| Class | Result |
+| --- | --- |
+| TCP / HTTPS + DNS | bridged ✓ 216.77.46.31 |
+| TCP by IP, no DNS | bridged ✓ 301 |
+| UDP / DNS client-echo | bridged ✓ 216.77.49.33 |
+| IPv6 | bridged ✓ 2600:387:… (carrier) |
+| QUIC / HTTP-3 handshake | bridged ✓ proto=3, 200 |
+| QUIC 50 MB bulk | ✓ 50,000,000 bytes, 82.7 Mbps |
+| TCP 50 MB bulk | ✓ 50,000,000 bytes, 252.8 Mbps |
+
+Both bulk figures sit on top of the numbers recorded before this change (QUIC
+86.3, TCP 264.7 Mbps), so the mode switching costs nothing measurable.
+
+`speed.cloudflare.com` again returned 0 bytes over HTTP/3 and again is not a
+bridge defect — it refuses HTTP/3 regardless, which is why the bulk test uses
+`dl.google.com`. The first run against it also returned 138 bytes over BOTH
+QUIC and TCP, which was a missing `-L`, not a transport fault. Both traps are
+the same shape: a number that looks like a bridge failure until a control is run.
