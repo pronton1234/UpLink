@@ -97,12 +97,6 @@ final class MenuBarModel {
     /// process serves both.
     private var routeManager: NETunnelProviderManager?
 
-    /// Consecutive polls with no session. Teardown waits for a few, so a
-    /// reconnecting phone does not blink the user's default route.
-    private var quietTicks = 0
-    /// Ten seconds of genuine silence, not three. The teardown is irreversible
-    /// without another network, so it must never fire on a reconnect.
-    private static let quietTicksBeforeDroppingTunnel = 10
 
     /// Is there a network besides our own tunnel?
     ///
@@ -562,14 +556,14 @@ final class MenuBarModel {
 
     private func refreshStatus() async {
         let response = await sendToExtension("status")
+        let reply = BridgeStatusReply.parse(response)
 
-        switch BridgeStatusReply.parse(response) {
+        switch reply {
         case let .connected(peer, egress):
             pairingRefused = false
             let name = pairedDevices.first?.name ?? "iPhone"
             let new = MacBridgeStatus.connected(peer: name, egress: egress)
             if new != status { status = new; notifyObservers() }
-            await reconcileRouteTunnel(sessionLive: true)
         case .disconnected:
             pairingRefused = false
             // The extension has no relay to dial. If the app can see a ready
@@ -581,7 +575,6 @@ final class MenuBarModel {
                 _ = await sendToExtension("usbrelay:\(port):\(udid)")
             }
             setIdleStatus()
-            await reconcileRouteTunnel(sessionLive: false)
         case let .unpaired(fingerprint):
             // The phone removed this Mac. The extension has already dropped its
             // in-memory copy; only the app can drop the durable one, and if it
@@ -598,7 +591,6 @@ final class MenuBarModel {
             reloadPairedDevices()
             await reseedExtension()
             setIdleStatus()
-            await reconcileRouteTunnel(sessionLive: false)
         case .connecting:
             pairingRefused = false
             // RE-ANNOUNCED HERE TOO, not only on `.disconnected`.
@@ -618,12 +610,6 @@ final class MenuBarModel {
                 _ = await sendToExtension("usbrelay:\(port):\(udid)")
             }
             setIdleStatus()
-            // Reconciled like every other not-connected branch. Skipping it
-            // left `quietTicks` frozen, so a route tunnel with nothing behind
-            // it stayed up indefinitely — and it outlives the app, which is the
-            // "this Mac has no network at all" state the teardown exists to
-            // prevent.
-            await reconcileRouteTunnel(sessionLive: false)
 
         case .refused:
             // The phone answered and refused our key on several dials running.
@@ -651,9 +637,34 @@ final class MenuBarModel {
                 _ = await sendToExtension("usbrelay:\(port):\(udid)")
             }
         }
+
+        // RECONCILED EVERY TICK, OUTSIDE THE SWITCH.
+        //
+        // This used to be called from four of the six branches, and the two it
+        // missed were `.refused` and `.unintelligible` — the second of which is
+        // exactly what an unreachable extension looks like. So the one state in
+        // which the route tunnel most needs re-deriving was the one state that
+        // skipped it, and a tunnel left capturing there would take the Mac's
+        // network down with nothing behind it.
+        //
+        // Gating this on an enumerated subset of replies has been wrong every
+        // time it has been tried, in this function and in the relay: the real
+        // failure is always the case the subset left out. The reconciler is
+        // cheap and idempotent, so it runs unconditionally.
+        var sessionLive = false
+        if case .connected = reply { sessionLive = true }
+        await reconcileRouteTunnel(sessionLive: sessionLive)
     }
 
-    /// **No session ⇒ no tunnel.** The invariant this method exists to hold.
+    /// **No session ⇒ no capture.** The invariant this method exists to hold.
+    ///
+    /// It used to be "no session ⇒ no tunnel", and that is what broke
+    /// reconnecting. See ``RouteTunnelReconciler``: NetworkExtension will not
+    /// START a packet tunnel on a Mac with no network, but it will happily keep
+    /// one RUNNING — so a tunnel dropped while Wi-Fi was on could not be
+    /// rebuilt once Wi-Fi went off, which is the exact order the product is
+    /// used in. The tunnel now stays up for the life of the app and switches
+    /// between capturing and standby instead.
     ///
     /// The route tunnel owns the Mac's default route and points it at an
     /// interface that discards everything, so it is only ever correct while
@@ -684,112 +695,68 @@ final class MenuBarModel {
     /// The cost of getting it wrong is the user's whole network, so it is worth
     /// re-deciding every tick rather than trusting a remembered edge.
     private func reconcileRouteTunnel(sessionLive: Bool) async {
-        let status = routeManager?.connection.status
-
-        guard sessionLive else {
-            // Hysteresis before tearing down, and it is not politeness. A
-            // session can flap — observed ENDED at 13:56:36.119 and started
-            // again at 13:56:37.068, 0.9s later — and dropping the default
-            // route on the first quiet tick means the user's network blinks out
-            // every time the phone reconnects. Three consecutive ticks is ~3s:
-            // long enough that a reconnect rides through it, short enough that a
-            // genuinely dead bridge does not strand the Mac.
-            //
-            // The teardown itself stays unconditional once confirmed: leaving
-            // the tunnel up with no bridge behind it converts "the bridge
-            // stopped" into "this Mac has no network at all", and that outlives
-            // the app.
-            quietTicks += 1
-            guard quietTicks >= Self.quietTicksBeforeDroppingTunnel else { return }
-            guard let routeManager, status != .disconnected, status != .invalid else { return }
-
-            // THE ASYMMETRY THAT MATTERS. Dropping this tunnel is cheap to do
-            // and, in the configuration it exists for, IMPOSSIBLE TO UNDO:
-            // NetworkExtension will not start a packet tunnel while the Mac has
-            // no underlying network, so once it is down with Wi-Fi gone it stays
-            // down. Measured, cable-free over AWDL:
-            //
-            //   14:57:20  session started (peer=…%awdl0)
-            //   14:57:21  route: up                      <- working
-            //   14:57:31  session ENDED                  <- a 3.5s blip
-            //   14:57:34  dropping the tunnel            <- this line
-            //   14:57:35  session started                <- back already
-            //   14:57:55  THE TUNNEL WILL NOT START
-            //
-            // A working state was destroyed by a blip and could not be rebuilt.
-            // So: only hand the network back when there is a network to hand it
-            // back TO. With an alternative present, dropping is safe and
-            // reversible; without one it strands the Mac, and keeping a stale
-            // tunnel is strictly better than that.
-            guard Self.hasAlternativeNetwork() else {
-                if quietTicks % 30 == 0 {
-                    log.error("route: no session for \(self.quietTicks, privacy: .public) ticks, but this Mac has no other network — keeping the tunnel, because it could not be restarted")
-                }
-                return
+        let status: RouteTunnelStatus
+        if let connection = routeManager?.connection {
+            switch connection.status {
+            case .invalid: status = .invalid
+            case .disconnected: status = .disconnected
+            case .connecting: status = .connecting
+            case .connected: status = .connected
+            case .reasserting: status = .reasserting
+            case .disconnecting: status = .disconnecting
+            @unknown default: status = .disconnected
             }
-
-            log.error("route: no session for \(self.quietTicks, privacy: .public) ticks and another network is available — dropping the tunnel")
-            routeManager.connection.stopVPNTunnel()
-            return
+        } else {
+            status = .unconfigured
         }
-        quietTicks = 0
 
-        switch status {
-        case .connected, .connecting, .reasserting:
+        // The DECISION lives in the kit, so every transition is provable with
+        // no NetworkExtension and no Mac. This only carries it out. Note that
+        // nothing it can return stops the tunnel — see the type for why.
+        switch RouteTunnelReconciler.next(
+            status: status,
+            sessionLive: sessionLive,
+            needsRebuild: routeManagerNeedsRebuild
+        ) {
+        case .wait:
+            return
+
+        case let .setMode(mode):
             failedStarts = 0
-            return  // already where we want to be
-        case nil, .invalid:
-            // Never configured, or the configuration was removed.
+            // Sent every tick rather than on a change. The provider no-ops when
+            // the mode already matches, and re-deriving beats remembering: a
+            // missed edge here costs the user their whole network.
+            await sendToRouteTunnel(mode == .capture ? "capture" : "standby")
+
+        case .configure:
             await enableRouteConfiguration()
-        case .disconnected, .disconnecting:
-            // A configuration we already know is bad gets rebuilt rather than
-            // restarted. See the catch below.
-            if routeManagerNeedsRebuild {
-                routeManagerNeedsRebuild = false
-                self.routeManager = nil
-                failedStarts = 0
-                await enableRouteConfiguration()
-                return
-            }
-            // Includes the case that broke: a start swallowed because teardown
-            // was still in flight. Trying again next tick is the fix.
+
+        case .rebuild:
+            log.error("route: the saved configuration cannot be started — rebuilding it")
+            routeManagerNeedsRebuild = false
+            routeManager = nil
+            failedStarts = 0
+            await enableRouteConfiguration()
+
+        case .start:
             guard let routeManager else { return }
             failedStarts += 1
             do {
                 try routeManager.connection.startVPNTunnel()
-                // Rate-limited, because this runs at 1Hz and the interesting
-                // signal is "still not up after N attempts", not each attempt.
                 if failedStarts == 1 || failedStarts % 10 == 0 {
-                    log.error("route: session is live but the tunnel is not — (re)starting, attempt \(self.failedStarts, privacy: .public)")
+                    log.error("route: the tunnel is down — starting it, attempt \(self.failedStarts, privacy: .public)")
                 }
             } catch {
                 log.error("route: start threw: \(error.localizedDescription, privacy: .public)")
-                // AN INVALID CONFIGURATION IS NOT WORTH RETRYING.
+                // AN UNUSABLE CONFIGURATION IS NOT WORTH RETRYING, and THE CODE
+                // MATTERS — I checked the wrong one first. `NEVPNErrorDomain
+                // error 2` is `configurationDisabled`, not `configurationInvalid`
+                // (which is 1). A disabled configuration throws every time,
+                // forever, so checking only for `invalid` meant the rebuild arm
+                // never fired and this retried a config that could not start.
                 //
-                // `NEVPNErrorConfigurationInvalid` means the saved
-                // configuration is bad, and starting it again cannot make it
-                // good. This became reachable when the app started ADOPTING a
-                // route manager left by a previous launch: before that,
-                // `routeManager` was only ever set by `enableRouteConfiguration`,
-                // which always writes a fresh, valid config. An adopted one can
-                // be stale — and a stale manager reports `.disconnected`, not
-                // `.invalid`, so the rebuild arm above never fires and this
-                // retried a broken config once a second, forever, while the
-                // bridge sat there working.
-                //
-                // Rebuilding is the only thing that clears it.
-                // THE CODE MATTERS, and I checked the wrong one first.
-                //
-                // `NEVPNErrorDomain error 2` is `configurationDisabled`, not
-                // `configurationInvalid` (which is 1). The saved configuration
-                // was DISABLED — `isEnabled == false` — and starting a disabled
-                // configuration throws every time, forever. Checking only for
-                // `invalid` meant the rebuild never fired and this retried a
-                // config that could not possibly start.
-                //
-                // All three of these mean "the saved configuration is not
-                // usable as it stands", and the answer to all three is the same:
-                // write a fresh one, which sets `isEnabled` and saves.
+                // All three mean "not usable as it stands", and the answer to
+                // all three is to write a fresh one.
                 let ns = error as NSError
                 let unusable: Set<Int> = [
                     NEVPNError.configurationInvalid.rawValue,
@@ -797,33 +764,54 @@ final class MenuBarModel {
                     NEVPNError.configurationStale.rawValue,
                 ]
                 if ns.domain == NEVPNErrorDomain, unusable.contains(ns.code) {
-                    log.error("route: saved configuration is unusable (code \(ns.code, privacy: .public)) — rebuilding it")
                     routeManagerNeedsRebuild = true
                 }
             }
-            // The question this whole design rests on, made answerable in one
-            // test run: does NetworkExtension keep a packet tunnel alive when
-            // the Mac has NO network service of its own? If it does not, this
-            // line is what says so, unambiguously, instead of the user seeing
-            // "it just does not work".
+
+            // THE ONE FAILURE THIS CANNOT FIX BY ITSELF, named precisely.
+            //
+            // Launch the app with no network at all and there is nothing to
+            // start the tunnel with — NetworkExtension accepts the start, logs
+            // "No network available", and stops the session milliseconds later.
+            // Retrying cannot help. Say what fixes it instead of retrying in
+            // silence, which is what the user saw for thirty-one seconds.
             if failedStarts == 20 {
-                // Reports what is TRUE rather than what was assumed. This line
-                // used to assert "NetworkExtension is refusing to run a packet
-                // tunnel with no underlying network" — and it fired while Wi-Fi
-                // was up with a working default route, sending the reader after
-                // an architectural problem that did not exist. The actual cause
-                // was an invalid saved configuration.
-                let hasNetwork = Self.hasAlternativeNetwork()
-                log.error("""
-                    route: THE TUNNEL WILL NOT START — 20 attempts with a live \
-                    session. Another network present: \(hasNetwork, privacy: .public). \
-                    If that is true, this is NOT NetworkExtension refusing to run \
-                    without an underlying network — read the "start threw" line \
-                    above for the real error.
-                    """)
+                if Self.hasAlternativeNetwork() {
+                    log.error("""
+                        route: THE TUNNEL WILL NOT START — 20 attempts, and this Mac DOES \
+                        have another network, so this is NOT NetworkExtension refusing to \
+                        run without one. Read the "start threw" line above for the real error.
+                        """)
+                } else {
+                    log.error("""
+                        route: THE TUNNEL WILL NOT START — 20 attempts, and this Mac has no \
+                        network at all. NetworkExtension will not start a packet tunnel in \
+                        that state. Turn Wi-Fi on for a moment: the tunnel will start, drop \
+                        straight into standby harming nothing, and then stay up — so this \
+                        cannot happen again.
+                        """)
+                }
             }
-        @unknown default:
-            return
+        }
+    }
+
+    /// Tells the route tunnel what to capture.
+    ///
+    /// A separate NE configuration from the proxy, so a separate session, even
+    /// though the same extension process serves both.
+    @discardableResult
+    private func sendToRouteTunnel(_ message: String) async -> String? {
+        guard let session = routeManager?.connection as? NETunnelProviderSession else { return nil }
+        return await withCheckedContinuation { continuation in
+            do {
+                try session.sendProviderMessage(Data(message.utf8)) { reply in
+                    continuation.resume(returning: reply.map { String(decoding: $0, as: UTF8.self) })
+                }
+            } catch {
+                // Throws when the session is not running. The next tick
+                // re-derives everything, so there is nothing to recover here.
+                continuation.resume(returning: nil)
+            }
         }
     }
 
