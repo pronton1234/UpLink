@@ -62,53 +62,150 @@ final class RouteProvider: NEPacketTunnelProvider, @unchecked Sendable {
 
     private let counter = PacketCounter()
 
+    /// The mode currently applied, so a mode message that changes nothing does
+    /// not re-apply settings once a second. `nil` means "unknown" — set on a
+    /// rejection, so the next message retries rather than believing a mode that
+    /// never took.
+    ///
+    /// A lock rather than an actor because `handleAppMessage` is synchronous;
+    /// hopping to an actor to answer it is how a reply gets lost.
+    private let modeLock = NSLock()
+    private var appliedMode: RouteTunnelMode?
+
+    /// Settings for a mode.
+    ///
+    /// **Two modes, because this tunnel is never stopped.** It used to be
+    /// stopped whenever the bridge session went away, and restarted when one
+    /// came back — which cannot work, because NetworkExtension refuses to start
+    /// a packet tunnel on a Mac with no network, and the whole point of this
+    /// product is a Mac with no network. Measured 2026-08-15, thirty times in
+    /// thirty-one seconds:
+    ///
+    ///     NESMVPNSessionStatePreparingNetwork → "No network available"
+    ///     status changed to disconnected, last stop reason No network available
+    ///
+    /// An already-running tunnel has no such problem: the same session then
+    /// stayed connected for twenty minutes with the Wi-Fi radio off. So the
+    /// tunnel stays up and changes what it captures, which is a settings call
+    /// on a live interface and needs no network at all.
+    ///
+    /// See ``RouteTunnelReconciler`` for the decision that drives this.
+    private static func settings(for mode: RouteTunnelMode) -> NEPacketTunnelNetworkSettings {
+        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
+
+        let ipv4 = NEIPv4Settings(addresses: [tunnelAddress], subnetMasks: [tunnelMask])
+        let ipv6 = NEIPv6Settings(addresses: [tunnelAddressV6], networkPrefixLengths: [64])
+
+        switch mode {
+        case .capture:
+            // The OPPOSITE of the iOS tunnel, which sets `includedRoutes = []`
+            // because it is a process host that must capture nothing. Here the
+            // default route is the whole product of this provider.
+            ipv4.includedRoutes = [NEIPv4Route.default()]
+            // IPv6 too, or a v6-capable destination is routed out whatever
+            // interface still has a v6 default — which is a leak, and on this
+            // machine there are stale v6 defaults via idle utun interfaces that
+            // outlive the network they belonged to.
+            ipv6.includedRoutes = [NEIPv6Route.default()]
+            // The half a transparent proxy cannot do. With no network service
+            // the Mac has no resolver at all — `scutil --dns` comes back empty
+            // — so name resolution fails before a packet is sent, and the
+            // bridge looks dead while working perfectly because there is
+            // nothing for it to carry. Public anycast because it must be
+            // reachable THROUGH the bridge: a query to 1.1.1.1 is an ordinary
+            // public destination the capture policy carries to the phone.
+            settings.dnsSettings = NEDNSSettings(servers: UpLinkDNS.servers)
+
+        case .standby:
+            // NO ROUTES AND NO RESOLVER. This is what makes never stopping the
+            // tunnel safe: with no bridge behind it, a capturing tunnel drops
+            // every packet the proxy declines, and the Mac has no network at
+            // all until both apps are quit. Here it holds an address, keeps the
+            // interface alive so it never has to be started again, and takes
+            // nothing.
+            ipv4.includedRoutes = []
+            ipv6.includedRoutes = []
+            settings.dnsSettings = nil
+        }
+
+        settings.ipv4Settings = ipv4
+        settings.ipv6Settings = ipv6
+        settings.mtu = 1500
+        return settings
+    }
+
+    /// Applies a mode, unless it is already the one in force.
+    private func apply(_ mode: RouteTunnelMode, then: @escaping @Sendable (Error?) -> Void) {
+        modeLock.lock()
+        let unchanged = (appliedMode == mode)
+        appliedMode = mode
+        modeLock.unlock()
+        guard !unchanged else { then(nil); return }
+
+        let log = self.log
+        setTunnelNetworkSettings(Self.settings(for: mode)) { [weak self] error in
+            if let error {
+                log.error("route: \(String(describing: mode), privacy: .public) settings rejected: \(error.localizedDescription, privacy: .public)")
+                // Forget it, so the next tick tries again rather than believing
+                // a mode that never took.
+                if let self {
+                    self.modeLock.lock()
+                    self.appliedMode = nil
+                    self.modeLock.unlock()
+                }
+            } else {
+                switch mode {
+                case .capture:
+                    log.error("route: capturing — default routes and DNS \(UpLinkDNS.servers.joined(separator: ","), privacy: .public)")
+                case .standby:
+                    log.error("route: standby — no routes, no resolver; this Mac's own network is untouched")
+                }
+            }
+            then(error)
+        }
+    }
+
+    /// The app's 1Hz reconciler telling us what to capture.
+    override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
+        let wanted: RouteTunnelMode
+        switch String(decoding: messageData, as: UTF8.self) {
+        case "capture": wanted = .capture
+        case "standby": wanted = .standby
+        default:
+            completionHandler?(Data("unknown".utf8))
+            return
+        }
+        // Boxed for the same reason as `startTunnel`'s: the completion handler
+        // is a non-Sendable function type crossing into a @Sendable closure.
+        let done = UncheckedSendableBox(completionHandler)
+        apply(wanted) { error in
+            done.value?(Data((error == nil ? "ok" : "failed").utf8))
+        }
+    }
+
     // Completion-handler form rather than the async override: the async variant
     // receives a non-Sendable `[String: NSObject]?` across an isolation
     // boundary, which Swift 6 rejects. Same reason as the iOS provider.
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         log.error("route: startTunnel")
 
-        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
-
-        // The OPPOSITE of the iOS tunnel, which sets `includedRoutes = []`
-        // because it is a process host that must capture nothing. Here the
-        // default route is the whole product of this provider.
-        let ipv4 = NEIPv4Settings(addresses: [Self.tunnelAddress], subnetMasks: [Self.tunnelMask])
-        ipv4.includedRoutes = [NEIPv4Route.default()]
-        settings.ipv4Settings = ipv4
-
-        // IPv6 too, or a v6-capable destination is routed out whatever
-        // interface still has a v6 default — which is a leak, and on this
-        // machine there are stale v6 defaults via idle utun interfaces that
-        // outlive the network they belonged to.
-        let ipv6 = NEIPv6Settings(addresses: [Self.tunnelAddressV6], networkPrefixLengths: [64])
-        ipv6.includedRoutes = [NEIPv6Route.default()]
-        settings.ipv6Settings = ipv6
-
-        // The half a transparent proxy cannot do. With no network service the
-        // Mac has no resolver at all — `scutil --dns` comes back empty — so
-        // name resolution fails before a packet is sent, and the bridge looks
-        // dead while working perfectly because there is nothing for it to
-        // carry. Public anycast because it must be reachable THROUGH the
-        // bridge: a query to 1.1.1.1 is an ordinary public destination the
-        // capture policy carries to the phone.
-        settings.dnsSettings = NEDNSSettings(servers: UpLinkDNS.servers)
-
-        settings.mtu = 1500
-
         let log = self.log
         let counter = self.counter
         let done = UncheckedSendableBox(completionHandler)
         let flow = UncheckedSendableBox(packetFlow)
 
-        setTunnelNetworkSettings(settings) { error in
+        // STARTS IN STANDBY, ALWAYS, whatever prompted the start.
+        //
+        // The tunnel is started eagerly now — while the Mac still has a network
+        // to start it with — rather than at the moment a session appears, which
+        // is the moment the network has been taken away. Coming up capturing
+        // would mean an eager start broke the user's Wi-Fi; the reconciler
+        // switches it to `.capture` on the next tick if a session is live.
+        apply(.standby) { error in
             if let error {
-                log.error("route: settings rejected: \(error.localizedDescription, privacy: .public)")
                 done.value(error)
                 return
             }
-            log.error("route: up — default routes and DNS \(UpLinkDNS.servers.joined(separator: ","), privacy: .public)")
-
             // The read loop lives out here rather than inside the actor: it has
             // to touch `packetFlow`, which is not Sendable, and Swift 6 rejects
             // sending a closure that does so into actor-isolated code. The actor
