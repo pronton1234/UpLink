@@ -44,6 +44,11 @@ actor ProxyState {
     /// Retries a pairing dial for the life of the six-digit code.
     private var pairingTask: Task<Void, Never>?
 
+    /// Phones unpaired while they were not connected, kept only long enough to
+    /// be told once. See ``MacSessionClient/deliverUnpairNotice(relayPort:to:)``.
+    private var tombstones = RevocationTombstones()
+    private let tombstoneStore = TombstoneStore()
+
     /// What ``sessionTask`` is actually dialling right now.
     ///
     /// Distinct from `relayPort`/`relayUDID`, which record the most recent
@@ -161,6 +166,9 @@ actor ProxyState {
         )
         self.client = client
         self.queue = queue
+        // A restart is exactly when an undelivered notice would be lost, and
+        // the phone would keep a pairing nobody remembers.
+        tombstones = tombstoneStore.load()
 
         // Tombstones are the PHONE's business now: it owns the listener, so it
         // is the side that must keep a revoked Mac's key on the air long enough
@@ -195,6 +203,10 @@ actor ProxyState {
                     let device = try await client.pair(relayPort: port, code: code, udid: udid)
                     log?.error("ipc: paired \(device.fingerprint, privacy: .public)")
                     guard let self else { return }
+                    // A fresh pairing clears any "the phone refuses us" count,
+                    // or the UI would go on telling the user to pair after they
+                    // just did.
+                    await self.noteHandshakeAccepted()
                     // Straight into a session, so the user does not have to do
                     // anything else to start bridging.
                     await self.beginSession(client: client, port: port, udid: udid)
@@ -236,8 +248,16 @@ actor ProxyState {
         //
         // No test caught this because it needs two successive relay ports, and
         // every test dials one.
-        if let existing = sessionTask, !existing.isCancelled,
-           dialingPort == port, dialingUDID == udid {
+        // `isCancelled` is NOT "finished" — a task that returned normally
+        // reports false forever. Relying on it meant a redial loop that had
+        // exited still looked alive, so nothing could ever restart it.
+        //
+        // Observed: the loop ended at 16:54:51 with "no pairing", the user
+        // paired at 16:55:14, and no session ever came up because this guard
+        // kept refusing to start one. `dialingPort` is cleared by the loop on
+        // its way out, so a nil there is the honest signal that nothing is
+        // running. (Third time this idiom has bitten; see `USBRelay.pumps`.)
+        if dialingPort == port, dialingUDID == udid {
             return
         }
         sessionTask?.cancel()
@@ -249,15 +269,33 @@ actor ProxyState {
         let log = self.log
         sessionTask = Task { [weak self] in
             var policy = ReconnectPolicy(baseDelay: 0.5, maxDelay: 5)
+            var saidUnpaired = false
+            // Every exit clears the "I am dialling" marker, or the guard above
+            // locks out every future attempt — a loop that ended looks exactly
+            // like one that is running unless it says otherwise.
             while !Task.isCancelled {
                 guard let self else { return }
+
+                // Anything owed to a phone we unpaired while it was unplugged
+                // gets said first: it has no other way to find out.
+                await self.deliverPendingUnpairNotices(client: client, port: port)
+
                 guard let device = await self.pairedDevice(matching: udid) else {
-                    // Attached but not paired. Not an error and not worth
-                    // retrying in a loop — the app is showing "not paired" and
-                    // the next pairing restarts this.
-                    log?.error("no pairing for \(udid, privacy: .public) — not dialling")
-                    return
+                    // Attached but not paired YET. WAITING, not returning.
+                    //
+                    // A pairing is someone typing six digits — it can arrive at
+                    // any moment. Returning meant the session depended on an
+                    // external event to restart this loop, and when the user
+                    // paired at 16:55:14 nothing did: the pairing succeeded
+                    // into a bridge that stayed dead.
+                    if !saidUnpaired {
+                        log?.error("no pairing for \(udid, privacy: .public) yet — waiting for one")
+                        saidUnpaired = true
+                    }
+                    try? await Task.sleep(for: .seconds(2))
+                    continue
                 }
+                saidUnpaired = false
                 // Pin a legacy record to the device it just worked with.
                 //
                 // Records written before the wired transport carry no UDID, so
@@ -277,12 +315,30 @@ actor ProxyState {
                     // the next drop is retried promptly rather than inheriting
                     // backoff from an unrelated earlier one.
                     policy.recordSuccess()
+                    await self.noteHandshakeAccepted()
                 } catch {
                     log?.error("dial failed: \(String(describing: error), privacy: .public)")
+                    // A REJECTED handshake is not a transient failure.
+                    //
+                    // Retrying it cannot help: the phone answered and refused
+                    // the identity we offered, which over the cable means its
+                    // side of the pairing is gone — most often because the iOS
+                    // app was reinstalled, and iOS deletes an app's keychain
+                    // items with the app. The Mac keeps its half, so the two
+                    // disagree and every dial fails identically.
+                    //
+                    // Without this the UI said "Connecting…" forever and the
+                    // user had no way to learn that re-pairing was the fix.
+                    if case ChannelError.handshakeFailed = error {
+                        await self.noteHandshakeRejected()
+                    } else {
+                        await self.noteHandshakeAccepted()
+                    }
                 }
                 guard !Task.isCancelled else { return }
                 try? await Task.sleep(for: .seconds(policy.recordFailure()))
             }
+            await self?.clearDialing(port: port, udid: udid)
         }
     }
 
@@ -291,11 +347,61 @@ actor ProxyState {
     /// Only the app can write durable storage — this process cannot reach the
     /// keychain — so the in-memory copy is updated and the app picks it up on
     /// its next `devices` poll, which is the same route a fresh pairing takes.
+    /// Tells any phone we unpaired while it was disconnected.
+    ///
+    /// Best effort and self-clearing: a notice that lands is dropped, and one
+    /// that cannot be delivered expires on its own rather than making this Mac
+    /// dial a phone forever.
+    private func deliverPendingUnpairNotices(client: MacSessionClient, port: UInt16) async {
+        tombstones.expire()
+        let owed = tombstones.devicesToKeepOnAir()
+        guard !owed.isEmpty else { return }
+        for device in owed {
+            if await client.deliverUnpairNotice(relayPort: port, to: device) {
+                tombstones.delivered(device.fingerprint)
+            }
+        }
+        tombstoneStore.save(tombstones)
+    }
+
+    /// Marks the redial loop as no longer running, so it can be restarted.
+    private func clearDialing(port: UInt16, udid: String) {
+        guard dialingPort == port, dialingUDID == udid else { return }
+        dialingPort = nil
+        dialingUDID = nil
+    }
+
     private func adoptUDID(_ udid: String, for device: PairedDevice) {
         var updated = device
         updated.udid = udid
         try? store.save(updated)
         log?.error("pinned \(device.fingerprint, privacy: .public) to device \(udid, privacy: .public)")
+    }
+
+    /// Consecutive dials the phone answered and refused.
+    ///
+    /// Counted rather than acted on immediately: one rejection can be a race
+    /// with the phone's listener rebuilding after a pairing change, and
+    /// declaring "not paired" on that would be its own false alarm.
+    private var consecutiveRejections = 0
+    /// Rejections before the Mac stops calling it "connecting" and says the
+    /// pairing is gone.
+    private static let rejectionsBeforeReportingUnpaired = 3
+
+    private func noteHandshakeRejected() {
+        consecutiveRejections += 1
+        if consecutiveRejections == Self.rejectionsBeforeReportingUnpaired {
+            log?.error("the phone has refused \(self.consecutiveRejections, privacy: .public) handshakes — its side of the pairing is gone")
+        }
+    }
+
+    private func noteHandshakeAccepted() {
+        consecutiveRejections = 0
+    }
+
+    /// Whether the phone is answering but refusing this Mac's key.
+    var pairingLooksGone: Bool {
+        consecutiveRejections >= Self.rejectionsBeforeReportingUnpaired
     }
 
     /// The paired phone this UDID belongs to.
@@ -432,6 +538,7 @@ actor ProxyState {
                 // whether it has a session. Reporting "waiting" and letting the
                 // app decide WHICH waiting it is keeps one source of truth for
                 // each fact.
+                if pairingLooksGone { return "refused" }
                 return relayPort == nil ? "waiting" : "connecting"
             }
             let egress = await initiator.observedEgress ?? .unknown
@@ -586,13 +693,27 @@ actor ProxyState {
                 sessionTask?.cancel()
                 sessionTask = nil
                 await client.endSession()
-            } else if removed != nil {
-                // Not connected. The Mac dials now, so there is nothing to keep
-                // "on the air" for a phone to find — this Mac simply stops
-                // dialling that device. The tombstone machinery lives on the
-                // PHONE, which owns the listener and is the side that has to
-                // keep a revoked peer reachable long enough to be told.
-                log?.error("ipc: \(fingerprint, privacy: .public) removed while not connected — it learns on its next dial")
+            } else if let removed {
+                // NOT CONNECTED, and this is the case that used to be silent.
+                //
+                // The old comment here said the phone "learns on its next
+                // dial". It does not: the phone never dials — this Mac does.
+                // So forgetting the key and walking away left the phone holding
+                // a pairing for a Mac that had forgotten it, permanently, with
+                // its listener still offering that Mac's key and its UI still
+                // showing a Mac that could never connect.
+                //
+                // The key is therefore kept just long enough for one more dial,
+                // which is the exact mirror of what the phone does for a
+                // revoked Mac. Delivered by `startRedialing` the next time a
+                // relay is available.
+                tombstones.revoke(removed)
+                tombstoneStore.save(tombstones)
+                log?.error("ipc: \(fingerprint, privacy: .public) removed while not connected — will tell it on the next cable")
+                // If a relay is already up, tell it now rather than waiting.
+                if let port = relayPort, let udid = relayUDID {
+                    startRedialing(client: client, port: port, udid: udid)
+                }
             }
             return "ok"
         }

@@ -71,6 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .waitingForCable: symbol = "cable.connector.slash"
         case .deviceNotResponding, .deviceNotPaired: symbol = "cable.connector"
         case .connecting: symbol = "cable.connector"
+        case .pairingLost: symbol = "exclamationmark.triangle"
         case .failed, .needsApproval: symbol = "exclamationmark.triangle"
         case .switchedOff: symbol = "personalhotspot.slash"
         case .installingExtension: symbol = "personalhotspot.slash"

@@ -45,8 +45,8 @@ final class USBRelay {
     var onStateChange: ((USBRelayState) -> Void)?
 
     private var watchTask: Task<Void, Never>?
-    /// Retries the port probe while a device stays attached but silent.
-    private var reprobeTask: Task<Void, Never>?
+    /// Re-derives the truth on a timer. See ``start()``.
+    private var supervisor: Task<Void, Never>?
     private var listener: NWListener?
 
     /// Live relay connections, by identity, so teardown can CLOSE them.
@@ -63,134 +63,159 @@ final class USBRelay {
     private var answeringPort: UInt16?
 
     func start() {
-        guard watchTask == nil else { return }
+        guard supervisor == nil else { return }
+        // LEVEL-TRIGGERED, not edge-triggered. This is the whole design.
+        //
+        // Every failure this relay has had was a missed edge: an attach event
+        // that arrived before the extension had a client, a probe that ran a
+        // second too early, a device that re-enumerated while a retry loop held
+        // the old id, a re-probe loop that cancelled itself. Each was fixed by
+        // adding another edge to react to, and the next gap was always the case
+        // that list left out.
+        //
+        // So the supervisor does not react to anything. Every tick it asks what
+        // is TRUE right now — which cabled device does usbmuxd report, is a port
+        // answering, do we have a listener for it — and makes reality match.
+        // A missed event costs at most one tick; it cannot strand anything,
+        // because nothing is remembered that is not re-derived.
+        supervisor = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.reconcile()
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+        // The event stream is now only a latency optimisation: it wakes the
+        // supervisor early so a plug is noticed instantly rather than within a
+        // tick. If it dies, the supervisor carries on — which is the difference
+        // between a stream that must not fail and one that merely helps.
         watchTask = Task { [weak self] in await self?.watch() }
     }
 
     func stop() {
+        supervisor?.cancel()
+        supervisor = nil
         watchTask?.cancel()
         watchTask = nil
-        reprobeTask?.cancel()
-        reprobeTask = nil
-        // Cleared so an `attached` still suspended mid-probe fails its
-        // `isStillCurrent` check and cannot publish `.ready` after teardown.
         device = nil
         answeringPort = nil
         teardown()
         state = .noDevice
     }
 
-    // MARK: - Device watch
+    // MARK: - The supervisor
 
-    private func watch() async {
-        // The stream replays devices already attached before it goes live, so a
-        // phone plugged in before the app launched still arrives.
+    /// Makes the relay match what is actually attached and answering.
+    ///
+    /// Idempotent and safe to run at any time: it is the only thing that
+    /// changes `state`, so there is no ordering to get wrong between it and an
+    /// event handler.
+    /// True while a reconcile is in flight.
+    ///
+    /// `reconcile` has `await` points — enumerating, probing, binding — and TWO
+    /// callers: the supervisor's timer and the event stream. Without this they
+    /// interleave, both conclude "no relay for this device", and both open a
+    /// listener. Observed: two announcements in the same millisecond, on ports
+    /// 54646 and 54647, with the first orphaned the moment the second replaced
+    /// it — so the extension was told about a port whose listener had already
+    /// been dropped.
+    ///
+    /// Skipping rather than queueing is deliberate: the next tick is two
+    /// seconds away and re-derives everything, so a dropped overlap costs
+    /// nothing, while a queue of stale reconciles would each act on facts that
+    /// were true when they were scheduled.
+    private var isReconciling = false
+
+    private func reconcile() async {
+        // Checked and set with no await between, so it is a real mutex.
+        guard !isReconciling else { return }
+        isReconciling = true
+        defer { isReconciling = false }
+
+        // The DECISION lives in `RelayReconciler`, in the kit, so every
+        // transition below is provable without a cable. This function only
+        // gathers the facts and carries the decision out.
+        let attached: [USBDevice]?
         do {
-            for try await event in client.listen() {
-                guard !Task.isCancelled else { return }
-                switch event {
-                case let .attached(device):
-                    await attached(device)
-                case let .detached(deviceID):
-                    detached(deviceID)
-                }
-            }
-            // The daemon is not supposed to end this stream. If it does, the
-            // only honest state is "we no longer know", and retrying is right —
-            // usbmuxd restarts across OS updates.
-            log.error("usbmux event stream ended — restarting in 2s")
-            try? await Task.sleep(for: .seconds(2))
-            if !Task.isCancelled { watchTask = Task { [weak self] in await self?.watch() } }
+            attached = try await client.listDevices()
         } catch {
-            log.error("usbmux listen failed: \(String(describing: error), privacy: .public)")
-            state = .failed(Self.explain(error))
-            try? await Task.sleep(for: .seconds(2))
-            if !Task.isCancelled { watchTask = Task { [weak self] in await self?.watch() } }
+            log.error("usb: could not enumerate devices: \(String(describing: error), privacy: .public)")
+            attached = nil      // "I could not ask", NOT "nothing is attached"
         }
-    }
 
-    private func attached(_ device: USBDevice) async {
-        // `USBMuxClient` already discards devices usbmuxd reaches over the
-        // network rather than the cable, so anything arriving here is wired.
-        log.error("usb: attached \(device.udid, privacy: .public)")
-        self.device = device
+        // Probing costs a usbmux round trip, so only do it when the answer can
+        // change the outcome.
+        var answering: UInt16?
+        if let device = attached?.first {
+            if case let .ready(udid, _, port) = state, udid == device.udid, listener != nil {
+                answering = port            // already known good
+            } else {
+                answering = await probePorts(of: device)
+            }
+        }
 
-        // NO PAIRING CHECK HERE, deliberately.
-        //
-        // The relay is a dumb pipe and must come up for any cabled device,
-        // because PAIRING ITSELF RUNS OVER IT: the Mac dials the phone with the
-        // code, so refusing to relay until a pairing exists would make a first
-        // pairing impossible. Whether to actually bridge is decided one layer
-        // up by the TLS-PSK handshake, which refuses a peer this Mac holds no
-        // key for — and that is a decision the relay could not make correctly
-        // anyway, since it cannot read the traffic.
-        //
-        // Find which port the phone is listening on before claiming to be
-        // ready. Doing it now rather than on first use means the UI can
-        // distinguish "not plugged in" from "plugged in, app not running",
-        // which are the two states with completely different remedies.
-        guard let answering = await probePorts(of: device) else {
-            guard isStillCurrent(device) else { return }
+        let holding = RelayHolding(
+            udid: { if case let .ready(udid, _, _) = state { return udid } else { return nil } }(),
+            listenerPort: listener?.port?.rawValue
+        )
+
+        switch RelayReconciler.next(attached: attached, holding: holding, answeringPort: answering) {
+        case .hold:
+            return
+
+        case .standDown:
+            guard state != .noDevice else { return }
+            log.error("usb: no cabled device")
+            device = nil
+            answeringPort = nil
+            teardown()
+            state = .noDevice
+
+        case let .waitForPhone(udid):
+            guard state != .attachedNotAnswering else { return }
+            log.error("usb: \(udid, privacy: .public) attached but answering on neither port")
             teardown()
             state = .attachedNotAnswering
-            // KEEP TRYING while the cable is in.
-            //
-            // The probe happens once per attach event, and usbmuxd sends one
-            // attach per plug — so a phone whose extension had not finished
-            // binding when we looked stayed "not answering" forever, with no
-            // further event to trigger another look. Unplugging and replugging
-            // was the only way out, which is not something a user should have
-            // to discover.
-            scheduleReprobe(of: device)
-            return
-        }
-        guard isStillCurrent(device) else { return }
-        answeringPort = answering
 
+        case let .openRelay(found, port):
+            device = found
+            answeringPort = port
+            do {
+                let local = try await startListener()
+                state = .ready(udid: found.udid, port: local, answeringPort: port)
+                log.error("usb: relaying 127.0.0.1:\(local, privacy: .public) → \(UpLinkUSB.describe(port: port), privacy: .public)")
+            } catch {
+                log.error("usb: could not open the relay listener: \(String(describing: error), privacy: .public)")
+                state = .failed("could not open a local relay port: \(error)")
+            }
+        }
+    }
+
+    // MARK: - Device events (latency only)
+
+    private func watch() async {
         do {
-            let port = try await startListener()
-            // Re-checked after every suspension. `startListener` now awaits the
-            // bind (it used to block the main thread), and `stop()` can land in
-            // that window during quit — leaving this to resume afterwards and
-            // publish `.ready`, re-announcing a relay port on the way out.
-            guard isStillCurrent(device) else { return }
-            state = .ready(udid: device.udid, port: port, answeringPort: answering)
-            log.error("usb: relaying 127.0.0.1:\(port, privacy: .public) → \(UpLinkUSB.describe(port: answering), privacy: .public)")
+            for try await _ in client.listen() {
+                guard !Task.isCancelled else { return }
+                // Deliberately ignores WHICH event it was. The supervisor is
+                // the only thing that decides anything; this just makes it
+                // decide sooner.
+                await reconcile()
+            }
         } catch {
-            log.error("usb: could not open the relay listener: \(String(describing: error), privacy: .public)")
-            // Checked here too: a throw during quit would otherwise publish
-            // `.failed` after teardown had already settled on `.noDevice`.
-            guard isStillCurrent(device) else { return }
-            state = .failed("could not open a local relay port: \(error)")
+            log.error("usbmux listen failed: \(String(describing: error), privacy: .public)")
         }
-    }
-
-    /// Whether this attach is still the one we care about.
-    ///
-    /// `attached` suspends twice — probing the ports and awaiting the bind — so
-    /// the device can be unplugged, or the relay stopped, underneath it.
-    private func isStillCurrent(_ device: USBDevice) -> Bool {
-        guard !Task.isCancelled, self.device?.deviceID == device.deviceID else { return false }
-        return true
-    }
-
-    private func detached(_ deviceID: UInt32) {
-        guard device?.deviceID == deviceID else { return }
-        reprobeTask?.cancel()
-        reprobeTask = nil
-        log.error("usb: detached \(self.device?.udid ?? "?", privacy: .public)")
-        device = nil
-        answeringPort = nil
-        teardown()
-        state = .noDevice
+        // No self-restart chain here either. If the stream ends, the supervisor
+        // keeps reconciling on its timer, and the next `start()` re-arms this.
+        guard !Task.isCancelled else { return }
+        try? await Task.sleep(for: .seconds(2))
+        if !Task.isCancelled { watchTask = Task { [weak self] in await self?.watch() } }
     }
 
     /// Tries the extension's port, then the app's.
     ///
     /// The extension is preferred because it keeps running while the phone is
-    /// locked. Falling through to the app's port is the insurance against the
-    /// one assumption this transport rests on — that `usbmux Connect` can reach
-    /// a listener inside a Network Extension at all.
+    /// locked. The app port is the fallback, and which one answered is reported
+    /// so a degraded setup is visible rather than merely working badly.
     private func probePorts(of device: USBDevice) async -> UInt16? {
         for port in UpLinkUSB.ports {
             do {
@@ -204,27 +229,7 @@ final class USBRelay {
                 continue
             }
         }
-        log.error("usb: \(device.udid, privacy: .public) answered on neither port — is UpLink running on the phone?")
         return nil
-    }
-
-    /// Re-probes a device that is attached but was not answering.
-    ///
-    /// Stops as soon as it answers, the device goes away, or the relay is torn
-    /// down — `attached` re-runs the whole path, so a success installs the
-    /// listener and announces it exactly as a fresh attach would.
-    private func scheduleReprobe(of device: USBDevice) {
-        reprobeTask?.cancel()
-        reprobeTask = Task { [weak self] () -> Void in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(5))
-                guard !Task.isCancelled, let self else { return }
-                guard self.isStillCurrent(device) else { return }
-                if case .ready = self.state { return }
-                await self.attached(device)
-                if case .ready = self.state { return }
-            }
-        }
     }
 
     // MARK: - Loopback listener

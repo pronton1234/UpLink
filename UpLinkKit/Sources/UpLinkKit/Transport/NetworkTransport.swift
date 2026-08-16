@@ -396,9 +396,7 @@ public actor NWConnectionChannel: FrameChannel {
                             "TLS rejected: \(error)"
                         ))
                     case let .posix(code) where code == .ECONNREFUSED:
-                        once.resume(throwing: ChannelError.handshakeFailed(
-                            "connection refused — nothing is listening there"
-                        ))
+                        once.resume(throwing: ChannelError.connectionRefused)
                     default:
                         break
                     }

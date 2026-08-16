@@ -29,6 +29,10 @@ public enum LinkStatus: Sendable, Equatable {
     case deviceNotResponding
     case deviceNotPaired
     case connecting
+    /// The phone answers and refuses this Mac's key — its side of the pairing
+    /// is gone. Distinct from `deviceNotPaired`, which is a Mac that never had
+    /// one: here BOTH sides think differently, and only re-pairing fixes it.
+    case pairingLost
     case switchedOff
     case failed(String)
 
@@ -38,15 +42,21 @@ public enum LinkStatus: Sendable, Equatable {
     ///     A record with no UDID counts, because it adopts the first device it
     ///     sessions with — refusing it would make that migration impossible.
     ///   - userDisconnected: whether the user switched the bridge off by hand.
+    /// - Parameter pairingRefused: the phone answered and rejected our key on
+    ///   several consecutive dials. Checked ahead of everything except an
+    ///   explicit switch-off, because retrying cannot fix it and "Connecting…"
+    ///   forever gives the user nothing to act on.
     public static func resolve(
         presence: LinkPresence,
         isPaired: Bool,
-        userDisconnected: Bool
+        userDisconnected: Bool,
+        pairingRefused: Bool = false
     ) -> LinkStatus {
         // Checked first, and only when a cable is actually answering. Saying
         // "Switched off" with nothing plugged in would be true but useless —
         // the thing to fix is the cable, and that is what should be on screen.
         if userDisconnected, case .answering = presence { return .switchedOff }
+        if pairingRefused, case .answering = presence { return .pairingLost }
 
         switch presence {
         case .noDevice:
@@ -70,6 +80,7 @@ public enum LinkStatus: Sendable, Equatable {
         case .deviceNotResponding: "iPhone connected — not answering"
         case .deviceNotPaired: "iPhone connected — not paired"
         case .connecting: "Connecting…"
+        case .pairingLost: "iPhone no longer recognises this Mac"
         case .switchedOff: "Switched off"
         case .failed: "Something went wrong"
         }
@@ -84,6 +95,7 @@ public enum LinkStatus: Sendable, Equatable {
         case .deviceNotResponding: "Open UpLink on your iPhone and turn the bridge on"
         case .deviceNotPaired: "Show a pairing code, then type it on your iPhone"
         case .connecting: "Opening the link over the cable"
+        case .pairingLost: "Pair again — reinstalling UpLink on iPhone erases its half"
         case .switchedOff: "Choose Reconnect to start bridging again"
         case let .failed(reason): reason
         }

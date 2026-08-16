@@ -180,6 +180,72 @@ struct RelayHandoverRegressionTests {
         #expect(attempts == 3, "expected exactly the probes needed, got \(attempts)")
     }
 
+    // THE FIFTH, and the third time `isCancelled` has been mistaken for
+    // "finished". A Task that returns normally reports `isCancelled == false`
+    // forever, so a guard written as `if let t = task, !t.isCancelled` sees a
+    // loop that exited as still running and refuses to start another.
+    //
+    // Observed end to end on hardware:
+    //
+    //     16:54:51  no pairing for <udid> — not dialling   (loop returns)
+    //     16:55:14  ipc: paired <fingerprint>              (user pairs)
+    //     …         no session, ever
+    //
+    // The pairing succeeded and the bridge stayed dead, because nothing could
+    // restart the loop. The marker is now cleared by the loop itself on the way
+    // out, so "am I dialling?" is answered by state the loop maintains rather
+    // than by asking a Task a question it cannot answer.
+    @Test("A redial loop that exited can be started again")
+    func exitedLoopCanRestart() {
+        var dialingPort: UInt16?
+        var dialingUDID: String?
+        var starts = 0
+
+        // Mirrors `ProxyState.startRedialing`'s guard.
+        func announce(port: UInt16, udid: String) {
+            if dialingPort == port, dialingUDID == udid { return }
+            dialingPort = port
+            dialingUDID = udid
+            starts += 1
+        }
+        // Mirrors the loop's `defer`.
+        func loopExited(port: UInt16, udid: String) {
+            guard dialingPort == port, dialingUDID == udid else { return }
+            dialingPort = nil
+            dialingUDID = nil
+        }
+
+        announce(port: 54643, udid: "UDID-A")
+        #expect(starts == 1)
+
+        // The loop finds no pairing and returns.
+        loopExited(port: 54643, udid: "UDID-A")
+
+        // The user pairs; the next announcement must start a fresh loop.
+        announce(port: 54643, udid: "UDID-A")
+        #expect(
+            starts == 2,
+            "a loop that had already exited blocked every restart — the pairing succeeds and the bridge stays dead"
+        )
+    }
+
+    // The other half: while a loop IS running, repeated announcements must not
+    // restart it, or the per-second re-announce would cancel the dial it is
+    // waiting on.
+    @Test("A running loop is not restarted by repeated announcements")
+    func runningLoopIsNotRestarted() {
+        var dialingPort: UInt16?
+        var dialingUDID: String?
+        var starts = 0
+        func announce(port: UInt16, udid: String) {
+            if dialingPort == port, dialingUDID == udid { return }
+            dialingPort = port; dialingUDID = udid; starts += 1
+        }
+        announce(port: 54643, udid: "UDID-A")
+        for _ in 0 ..< 30 { announce(port: 54643, udid: "UDID-A") }
+        #expect(starts == 1)
+    }
+
     // A different phone on the same port number must also take effect.
     @Test("A different device on the same port still restarts the loop")
     func differentDeviceRestarts() {

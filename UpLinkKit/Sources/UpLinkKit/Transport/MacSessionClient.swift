@@ -187,6 +187,44 @@ public actor MacSessionClient {
         await initiator.announceUnpaired()
     }
 
+    /// Dials a phone we have just unpaired, purely to tell it so.
+    ///
+    /// **The mirror of the phone's tombstone, and it has to exist on this side
+    /// too.** Removing a phone that is not currently connected used to be
+    /// silent: this Mac forgot the key and stopped dialling, and the phone kept
+    /// a pairing for a Mac that had forgotten it — for good, because the phone
+    /// never dials and so never finds out. The user would then see a paired Mac
+    /// on the phone that could never connect, with no way to tell why.
+    ///
+    /// So the key is kept just long enough for one more dial, exactly as the
+    /// phone keeps a revoked Mac's key on the air long enough to answer it once.
+    /// Returns whether the notice was delivered.
+    public func deliverUnpairNotice(relayPort: UInt16, to device: PairedDevice) async -> Bool {
+        do {
+            let key = try sessionKey(for: device)
+            let channel = try await dial(port: relayPort, psk: key, identity: fingerprint)
+            defer { Task { await channel.close() } }
+
+            // The phone dispatches on the first frame, so this has to look like
+            // a session opening: HELLO first, with the proof, then the notice.
+            var mux = Multiplexer(role: .initiator)
+            let proof = HelloProof.tag(
+                sessionKey: key,
+                dialerFingerprint: fingerprint,
+                listenerFingerprint: device.fingerprint
+            )
+            try await channel.send(
+                FrameEncoder.encode(mux.makeHello(identity: fingerprint, proof: proof))
+            )
+            try await channel.send(FrameEncoder.encode(Multiplexer.unpairedFrame()))
+            log.error("told \(device.fingerprint, privacy: .public) it is no longer paired")
+            return true
+        } catch {
+            log.error("could not tell \(device.fingerprint, privacy: .public) it is unpaired: \(String(describing: error), privacy: .public)")
+            return false
+        }
+    }
+
     // MARK: - Pairing
 
     /// Dials the relay with the six-digit code and completes pairing.

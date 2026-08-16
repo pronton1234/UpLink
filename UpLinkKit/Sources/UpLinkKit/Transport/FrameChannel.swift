@@ -104,6 +104,18 @@ public actor InMemoryFrameChannel: FrameChannel {
 public enum ChannelError: Error, Equatable, Sendable {
     case notConnected
     case peerClosed
+    /// The peer answered and REJECTED us. Over the cable this means one thing
+    /// in practice: it holds no key for the identity we offered, i.e. the
+    /// pairing is gone from its side.
+    ///
+    /// Distinct from ``connectionRefused`` because the two need opposite
+    /// responses, and conflating them is what made a broken pairing look like
+    /// an ordinary retry: nothing on the phone → keep trying, it will come up;
+    /// something on the phone that refuses us → stop, and tell the user to pair
+    /// again, because no amount of retrying will fix it.
     case handshakeFailed(String)
+    /// Nothing is listening on that port. The ordinary "UpLink is not running
+    /// on the phone yet" case, and worth retrying indefinitely.
+    case connectionRefused
     case versionMismatch(UInt16)
 }

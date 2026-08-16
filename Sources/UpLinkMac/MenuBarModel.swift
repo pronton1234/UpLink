@@ -26,6 +26,8 @@ enum MacBridgeStatus: Equatable {
     case deviceNotPaired
     /// Attached, paired, dialling.
     case connecting
+    /// The phone answers and refuses this Mac's key.
+    case pairingLost
     /// The user switched the bridge off by hand. Not a fault, and not
     /// something to keep retrying — but it needs saying, or the menu bar looks
     /// identical to a bridge that is failing to connect.
@@ -139,6 +141,9 @@ final class MenuBarModel {
     /// Non-zero for long is the signal that NE will not run a packet tunnel in
     /// this configuration at all.
     private var failedStarts = 0
+    /// Set when a start fails with `configurationInvalid`, so the next pass
+    /// rebuilds rather than retries. See `reconcileRouteTunnel`.
+    private var routeManagerNeedsRebuild = false
 
     /// Remembers deliberate removals so the device poll cannot re-learn them.
     /// See ``PairedDeviceMerge`` for the two ways that used to undo a removal.
@@ -164,6 +169,7 @@ final class MenuBarModel {
         case .deviceNotResponding: LinkStatus.deviceNotResponding.headline
         case .deviceNotPaired: LinkStatus.deviceNotPaired.headline
         case .connecting: LinkStatus.connecting.headline
+        case .pairingLost: LinkStatus.pairingLost.headline
         case .switchedOff: LinkStatus.switchedOff.headline
         case let .connected(peer, .cellular): "Connected — \(peer) · Cellular ✓"
         case let .connected(peer, egress): "⚠ \(peer) — via \(egress.displayName), not cellular"
@@ -181,6 +187,7 @@ final class MenuBarModel {
         case .deviceNotResponding: LinkStatus.deviceNotResponding.detail
         case .deviceNotPaired: LinkStatus.deviceNotPaired.detail
         case .connecting: LinkStatus.connecting.detail
+        case .pairingLost: LinkStatus.pairingLost.detail
         case .switchedOff: LinkStatus.switchedOff.detail
         case .connected(_, .cellular):
             "All apps routed — TCP and UDP"
@@ -558,11 +565,13 @@ final class MenuBarModel {
 
         switch BridgeStatusReply.parse(response) {
         case let .connected(peer, egress):
+            pairingRefused = false
             let name = pairedDevices.first?.name ?? "iPhone"
             let new = MacBridgeStatus.connected(peer: name, egress: egress)
             if new != status { status = new; notifyObservers() }
             await reconcileRouteTunnel(sessionLive: true)
         case .disconnected:
+            pairingRefused = false
             // The extension has no relay to dial. If the app can see a ready
             // cable, the extension missed the handover — it may have restarted,
             // or not been up when the device attached. Re-announce rather than
@@ -591,6 +600,7 @@ final class MenuBarModel {
             setIdleStatus()
             await reconcileRouteTunnel(sessionLive: false)
         case .connecting:
+            pairingRefused = false
             // RE-ANNOUNCED HERE TOO, not only on `.disconnected`.
             //
             // FOUND ON HARDWARE. The relay announces its port once, as soon as
@@ -616,6 +626,9 @@ final class MenuBarModel {
             await reconcileRouteTunnel(sessionLive: false)
 
         case .refused:
+            // The phone answered and refused our key on several dials running.
+            // Retrying cannot fix it; the user has to pair again.
+            pairingRefused = true
             // The Mac's own extension does not send this — it is the phone's
             // vocabulary, for a Mac that refuses its key. Handled so the switch
             // stays exhaustive and a future sender is not silently ignored.
@@ -729,6 +742,15 @@ final class MenuBarModel {
             // Never configured, or the configuration was removed.
             await enableRouteConfiguration()
         case .disconnected, .disconnecting:
+            // A configuration we already know is bad gets rebuilt rather than
+            // restarted. See the catch below.
+            if routeManagerNeedsRebuild {
+                routeManagerNeedsRebuild = false
+                self.routeManager = nil
+                failedStarts = 0
+                await enableRouteConfiguration()
+                return
+            }
             // Includes the case that broke: a start swallowed because teardown
             // was still in flight. Trying again next tick is the fix.
             guard let routeManager else { return }
@@ -742,6 +764,42 @@ final class MenuBarModel {
                 }
             } catch {
                 log.error("route: start threw: \(error.localizedDescription, privacy: .public)")
+                // AN INVALID CONFIGURATION IS NOT WORTH RETRYING.
+                //
+                // `NEVPNErrorConfigurationInvalid` means the saved
+                // configuration is bad, and starting it again cannot make it
+                // good. This became reachable when the app started ADOPTING a
+                // route manager left by a previous launch: before that,
+                // `routeManager` was only ever set by `enableRouteConfiguration`,
+                // which always writes a fresh, valid config. An adopted one can
+                // be stale — and a stale manager reports `.disconnected`, not
+                // `.invalid`, so the rebuild arm above never fires and this
+                // retried a broken config once a second, forever, while the
+                // bridge sat there working.
+                //
+                // Rebuilding is the only thing that clears it.
+                // THE CODE MATTERS, and I checked the wrong one first.
+                //
+                // `NEVPNErrorDomain error 2` is `configurationDisabled`, not
+                // `configurationInvalid` (which is 1). The saved configuration
+                // was DISABLED — `isEnabled == false` — and starting a disabled
+                // configuration throws every time, forever. Checking only for
+                // `invalid` meant the rebuild never fired and this retried a
+                // config that could not possibly start.
+                //
+                // All three of these mean "the saved configuration is not
+                // usable as it stands", and the answer to all three is the same:
+                // write a fresh one, which sets `isEnabled` and saves.
+                let ns = error as NSError
+                let unusable: Set<Int> = [
+                    NEVPNError.configurationInvalid.rawValue,
+                    NEVPNError.configurationDisabled.rawValue,
+                    NEVPNError.configurationStale.rawValue,
+                ]
+                if ns.domain == NEVPNErrorDomain, unusable.contains(ns.code) {
+                    log.error("route: saved configuration is unusable (code \(ns.code, privacy: .public)) — rebuilding it")
+                    routeManagerNeedsRebuild = true
+                }
             }
             // The question this whole design rests on, made answerable in one
             // test run: does NetworkExtension keep a packet tunnel alive when
@@ -749,7 +807,20 @@ final class MenuBarModel {
             // line is what says so, unambiguously, instead of the user seeing
             // "it just does not work".
             if failedStarts == 20 {
-                log.error("route: THE TUNNEL WILL NOT START — 20 attempts with a live session. NetworkExtension is refusing to run a packet tunnel with no underlying network, which is the architecture's load-bearing assumption. Route and DNS must come from somewhere else.")
+                // Reports what is TRUE rather than what was assumed. This line
+                // used to assert "NetworkExtension is refusing to run a packet
+                // tunnel with no underlying network" — and it fired while Wi-Fi
+                // was up with a working default route, sending the reader after
+                // an architectural problem that did not exist. The actual cause
+                // was an invalid saved configuration.
+                let hasNetwork = Self.hasAlternativeNetwork()
+                log.error("""
+                    route: THE TUNNEL WILL NOT START — 20 attempts with a live \
+                    session. Another network present: \(hasNetwork, privacy: .public). \
+                    If that is true, this is NOT NetworkExtension refusing to run \
+                    without an underlying network — read the "start threw" line \
+                    above for the real error.
+                    """)
             }
         @unknown default:
             return
@@ -914,6 +985,9 @@ final class MenuBarModel {
     /// Told when the cable is pulled mid-session, so the app can notify.
     var onCableRemoved: (() -> Void)?
     private(set) var relayState: USBRelayState = .noDevice
+    /// Set when the extension reports the phone refusing our key, cleared the
+    /// moment anything else is reported.
+    private var pairingRefused = false
     private var relayFeed: AsyncStream<USBRelayState>.Continuation?
     private var relayConsumer: Task<Void, Never>?
 
@@ -986,12 +1060,16 @@ final class MenuBarModel {
 
         let new: MacBridgeStatus
         switch LinkStatus.resolve(
-            presence: presence, isPaired: paired, userDisconnected: userDisconnected
+            presence: presence,
+            isPaired: paired,
+            userDisconnected: userDisconnected,
+            pairingRefused: pairingRefused
         ) {
         case .waitingForCable: new = .waitingForCable
         case .deviceNotResponding: new = .deviceNotResponding
         case .deviceNotPaired: new = .deviceNotPaired
         case .connecting: new = .connecting
+        case .pairingLost: new = .pairingLost
         case .switchedOff: new = .switchedOff
         case let .failed(reason): new = .failed(reason)
         }
