@@ -53,14 +53,6 @@ struct ContentView: View {
                     }
                     .accessibilityLabel("Paired Macs")
                 }
-                ToolbarItem(placement: .topBarLeading) {
-                    NavigationLink {
-                        DiagnosticsView(controller: controller)
-                    } label: {
-                        Image(systemName: "stethoscope")
-                    }
-                    .accessibilityLabel("Diagnostics")
-                }
             }
         }
         .task {
@@ -86,41 +78,41 @@ struct ContentView: View {
         )
     }
 
+    /// ONE SWITCH, TWO WORDS.
+    ///
+    /// This used to be three branches with three labels, and the first two were
+    /// the same action: "Stop Bridging" while a Mac was connected, "Turn Off"
+    /// while merely listening, both calling `disconnect()`. Worse, the second
+    /// branch was keyed on the tunnel's `NEVPNStatus` rather than on `state`, so
+    /// tapping "Stop Bridging" flipped the label to "Turn Off" for the second or
+    /// two the tunnel took to actually stop — making one action look like two
+    /// presses of two different buttons.
+    ///
+    /// Whether a Mac is connected is status. It is on the dial. It is not a
+    /// second mode needing its own verb.
     @ViewBuilder
     private var primaryControl: some View {
-        if controller.state.isConnected {
-            Button(role: .destructive) {
-                controller.disconnect()
-            } label: {
-                Text("Stop Bridging")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.red)
-        } else if controller.isRunning {
-            // Listening. Nothing left to do but plug the cable in — so the
-            // control stops being a button and starts being an instruction.
-            Button(role: .destructive) {
-                controller.disconnect()
-            } label: {
-                Text("Turn Off")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-            }
-            .buttonStyle(.bordered)
-        } else {
-            Button {
+        let control = controller.control
+        let button = Button(role: control.isDestructive ? .destructive : nil) {
+            if control.switchesOn {
                 Task { await controller.startBridge() }
-            } label: {
-                Text("Turn On")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
+            } else {
+                controller.disconnect()
             }
-            .buttonStyle(.borderedProminent)
+        } label: {
+            Text(control.label)
+                .font(.headline)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+        }
+        // The ONLY thing branched on here is styling. The label and the action
+        // both come from `PhoneControl`, so they cannot drift apart — one
+        // action acquiring three different labels across three duplicated
+        // branches is precisely what went wrong.
+        if control.isDestructive {
+            button.buttonStyle(.bordered)
+        } else {
+            button.buttonStyle(.borderedProminent)
         }
     }
 
