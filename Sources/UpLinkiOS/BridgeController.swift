@@ -216,7 +216,44 @@ final class BridgeController {
             """)
     }
 
+    /// Whether the user has UpLink switched on.
+    ///
+    /// **Intent, not machinery, and that distinction was the bug.** The one
+    /// button on this screen used to be driven by `state` for its first branch
+    /// and by the tunnel's `NEVPNStatus` for its second, so a single tap walked
+    /// it through three different words: "Stop Bridging" became "Turn Off"
+    /// — because `disconnect()` sets `state` immediately while the tunnel takes
+    /// a moment to actually stop — and only then "Turn On". It read as though
+    /// switching UpLink off took two presses and two different verbs.
+    ///
+    /// There is only one switch here, so it is derived from one thing. Whether
+    /// a Mac happens to be connected right now is status, and belongs on the
+    /// dial above; it is not a different mode with a different verb.
+    var isOn: Bool { condition != .off && condition != .needsPermission }
+
+    /// The phone's state as the switch sees it — coarser than ``BridgeState``,
+    /// because the switch does not care which Mac is on the other end.
+    ///
+    /// The decision itself lives in ``PhoneControlResolver``, in the kit, so it
+    /// is provable without a device. It used to be inline in the SwiftUI view,
+    /// where nothing could reach it.
+    var condition: PhoneBridgeCondition {
+        switch state {
+        case .needsPermission: .needsPermission
+        case .idle: .off
+        case .waitingForMac: .listening
+        case .connected: .bridging
+        case .failed: .failed
+        }
+    }
+
+    /// What the one control on the screen should offer.
+    var control: PhoneControl { PhoneControlResolver.control(for: condition) }
+
     /// Whether the tunnel is up, which is what puts the listener on the air.
+    ///
+    /// Machinery, for the pairing and autoconnect paths. **Not for the button**
+    /// — see ``isOn``.
     var isRunning: Bool {
         switch manager?.connection.status {
         case .connected, .connecting: true
@@ -307,21 +344,63 @@ final class BridgeController {
     /// the device ("Device not configured"), so on the one configuration this
     /// product exists for there was no way to read the phone's side at all.
     /// Reading it on the phone itself needs neither.
-    func fetchDiagnostics() async -> String {
-        guard let session = manager?.connection as? NETunnelProviderSession else {
-            return "The tunnel is not running, so it has nothing to report.\n\nConnect first, then come back."
-        }
-        let reply: String? = await withCheckedContinuation { continuation in
+    ///
+    /// **No longer a screen.** It was a stethoscope button in the toolbar, which
+    /// put a wall of extension log in front of a user who has no use for it. The
+    /// report is still fetched — it just informs the app instead of the user,
+    /// which is the only thing it was ever good for. See ``diagnoseSilence()``.
+    private func fetchDiagnostics() async -> String? {
+        guard let session = manager?.connection as? NETunnelProviderSession else { return nil }
+        return await withCheckedContinuation { continuation in
             do {
                 try session.sendProviderMessage(Data("diagnostics".utf8)) { data in
                     continuation.resume(returning: data.flatMap { String(data: $0, encoding: .utf8) })
                 }
             } catch {
-                continuation.resume(returning: "Could not ask the extension: \(error)")
+                continuation.resume(returning: nil)
             }
         }
-        return reply ?? "The extension did not answer."
     }
+
+    /// Works out what the extension going quiet actually means, by asking it.
+    ///
+    /// **Two very different faults look identical from here.** The extension not
+    /// answering `status` can mean it is healthy and simply has no session to
+    /// report — a cable or Mac problem, nothing for this phone to do — or that
+    /// the extension is wedged or gone, which is a phone problem and the user's
+    /// to act on. Guessing between them is what produced "Waiting for your Mac"
+    /// at a user whose phone was the thing at fault.
+    ///
+    /// `diagnostics` is answered synchronously from a file read rather than from
+    /// the session machinery, precisely so it still comes back when `status`
+    /// does not. That is what makes it able to tell these apart.
+    private func diagnoseSilence() async {
+        guard !hasDiagnosedSilence else { return }
+        hasDiagnosedSilence = true
+
+        guard let report = await fetchDiagnostics() else {
+            log.error("status has gone quiet AND diagnostics did not answer — the extension is not running")
+            state = .failed("UpLink's background service stopped. Turn it off and on again.")
+            return
+        }
+
+        // Logged whole, at error level, because this is the report that used to
+        // require a cable and root to obtain.
+        log.error("status quiet; phone-side report follows:\n\(report, privacy: .public)")
+
+        if report.contains("extension running"), report.contains("listening on") {
+            // The phone is fine and on the air. The gap is on the other side of
+            // the cable, so say the true thing rather than blaming this device.
+            log.error("the extension is up and listening — treating this as a cable or Mac problem")
+            if state.isConnected { state = .waitingForMac }
+        } else {
+            state = .failed("UpLink's background service is not listening. Turn it off and on again.")
+        }
+    }
+
+    /// Set while an outage is being explained, so the report is fetched once per
+    /// outage rather than once a second for the length of it.
+    private var hasDiagnosedSilence = false
 
     private func refreshStatus() async {
         guard let session = manager?.connection as? NETunnelProviderSession else { return }
@@ -337,15 +416,28 @@ final class BridgeController {
         }
 
         // A missing reply is not proof of anything on its own — the extension
-        // may simply be busy — but several in a row means it is gone.
+        // may simply be busy — but several in a row means something is wrong.
+        //
+        // WHICH thing is wrong is not guessable from here, and this used to
+        // guess: it assumed a healthy extension with no session and showed
+        // "Waiting for your Mac", which is a lie when the extension is the thing
+        // that died. `diagnoseSilence()` asks the extension directly, on the
+        // path that still answers when this one does not.
         guard let response else {
             missedStatusReplies += 1
-            if missedStatusReplies >= 3, state.isConnected {
-                state = .waitingForMac
+            // ONLY ONCE THE TUNNEL IS FULLY UP. While it is `.connecting` the
+            // extension legitimately has not started answering yet, and three
+            // seconds of that is normal startup — the old code was accidentally
+            // safe here because it only acted when a session was already live,
+            // and moving the decision without moving that guard would turn every
+            // launch into a reported failure.
+            if missedStatusReplies >= 3, manager?.connection.status == .connected {
+                await diagnoseSilence()
             }
             return
         }
         missedStatusReplies = 0
+        hasDiagnosedSilence = false
 
         // Shared parser: this used to `return` on anything but "connected",
         // so a "disconnected" reply left the UI showing a connection that had
