@@ -240,7 +240,21 @@ public actor PhoneSessionHost {
             bearer: bearer
         )
 
-        let listener = try NWListener(using: parameters)
+        // THE PORT HAS TO BE SAID OUT LOUD HERE.
+        //
+        // Over the cable it arrived inside `requiredLocalEndpoint`, which
+        // carried two things at once: bind to loopback, and bind to THIS port.
+        // Dropping that endpoint for the wireless bearer — which was right, it
+        // is what made the listener unreachable from the network the Mac hosts
+        // — took the port with it, and `NWListener(using:)` with no port picks
+        // an ephemeral one.
+        //
+        // The result was a listener that came up perfectly, on a port nobody
+        // was dialling: the Mac dialled 50505 and got "no connection within
+        // 12s" for as long as anyone cared to watch, with both sides healthy.
+        let listener = try bearer == .usbmux
+            ? NWListener(using: parameters)
+            : NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
 
         // The phone announces itself and the Mac browses. Over the cable this
         // was usbmuxd's job — the Mac dialled a fixed loopback port and the

@@ -1004,3 +1004,35 @@ the exact name never has to travel between the two devices.
 is the platform declining to have the conversation. Design so the value is not
 needed, rather than looking for a way to extract it — the extraction is the part
 that breaks on the next OS release.
+
+## Wireless bearer, 2026-08-20 — both sides healthy, disagreeing about the port
+
+The Mac hosted its access point, found the phone through its own DHCP lease,
+announced `peer:192.168.2.2:50505`, and dialled it. The phone's listener was up
+and the tunnel extension was running the current build. For several minutes the
+log read, every twelve seconds:
+
+```
+ipc: peer at 192.168.2.2:50505
+dial failed: handshakeFailed("no connection within 12s")
+```
+
+Nothing was broken on either side. They had stopped agreeing about the port.
+
+Over the cable the port arrived inside `requiredLocalEndpoint`, which carried
+**two facts in one value**: bind to loopback, and bind to *this* port. Removing
+that endpoint for the wireless bearer was correct — loopback is unreachable from
+the network the Mac hosts — and silently took the port with it, so
+`NWListener(using:)` chose an ephemeral one. The listener then came up perfectly,
+on a port nobody was dialling.
+
+The port is passed to `NWListener(using:on:)` explicitly now.
+
+| Test | Guards against |
+| --- | --- |
+| `ListenerPortRegressionTests` | The two sides drifting apart on the port. Pins that the wireless listener carries no `requiredLocalEndpoint` to silently re-pin it to loopback, that the cable's still names the same constant, and that the constant is what the Mac announces. |
+
+**Rule this encodes.** A value that carries two facts will lose one of them when
+it is removed for the sake of the other. `requiredLocalEndpoint` meant "loopback"
+and "port 50505" at once; only the first was unwanted. Where a change deletes a
+compound value, name each fact it was carrying and decide about each one.
