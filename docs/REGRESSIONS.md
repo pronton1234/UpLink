@@ -1203,3 +1203,37 @@ session arrives.
 **Rule this encodes.** Two correct mechanisms can compose into a loop. When one
 supplies the other's foundation, the supplier must be stable for as long as the
 consumer is up, whatever its own logic would otherwise prefer.
+
+## One radio, two claimants, 2026-08-21
+
+Every wireless run so far has had an access point that would not stay up. The
+recorder shows why in a single pair of columns:
+
+```
+bridge100: inet 192.168.2.1  |  en0: status: inactive   ← AP up, radio given over
+bridge100: absent            |  en0: status: active     ← en0 back on home Wi-Fi
+```
+
+They alternate. macOS auto-joins a known Wi-Fi network, hosting an access point
+needs that same radio exclusively, and neither side yields. The Mac spends its
+time oscillating between being a client and being a host.
+
+**This is a property of testing beside a known network**, and the deployment it
+is for has none: a Mac in a car has no remembered Wi-Fi in range, so nothing
+competes for the radio. It still has to be understood, because at a desk it
+makes everything above it look broken — the phone joins and is dropped, the
+dial reports ETIMEDOUT, the session dies after seconds, and each of those has a
+plausible wrong explanation.
+
+A second, self-inflicted half made it worse. Raising is **not idempotent**: it
+re-applies the sharing configuration and macOS rebuilds the access point from
+scratch, dropping every client. Three callers could each ask — the launch, the
+thirty-second timer, and the phone's Bluetooth doorbell — and two raises four
+seconds apart were observed at 00:14:33 and 00:14:37, so the access point was
+being restarted before it had finished coming up. Raises are now debounced with
+a cooldown longer than a raise takes to complete.
+
+**Rule this encodes.** An operation that rebuilds shared state is not made safer
+by being called more often. Before adding a caller to one, ask what happens when
+every caller fires at once — and if the answer is "it restarts", it needs a
+cooldown, not another guard.

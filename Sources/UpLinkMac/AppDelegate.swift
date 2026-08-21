@@ -151,6 +151,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             accessPointDownChecks = 0
             return
         }
+        if let lastRaise, Date().timeIntervalSince(lastRaise) < Self.raiseCooldown {
+            // Observed 00:14:33 and 00:14:37 — two raises four seconds apart,
+            // each restarting sharing, so the access point never had time to
+            // finish coming up before it was torn down again.
+            logAccessPoint.error("access point was raised recently — not raising again yet")
+            return
+        }
         Task { @MainActor in
             guard await !accessPoint.isUp() else {
                 accessPointDownChecks = 0
@@ -175,6 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             accessPointDownChecks = 0
             accessPointBusy = true
+            lastRaise = Date()
             refreshStatusItem()
             let failure = await accessPoint.raise()
             accessPointBusy = false
@@ -193,6 +201,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var accessPointStoppedByUser = false
     /// Consecutive checks that saw no access point. See ``hostAccessPointIfNeeded``.
     private var accessPointDownChecks = 0
+    /// When the access point was last asked to come up.
+    ///
+    /// Raising is not idempotent: it re-applies the sharing configuration and
+    /// macOS rebuilds the access point from scratch, dropping every client. So
+    /// two raises close together are strictly worse than one, and there are now
+    /// three callers — the launch, the timer, and the phone's doorbell — that
+    /// can all fire within seconds of each other.
+    private var lastRaise: Date?
+    /// Long enough to cover a raise actually completing: measured at about ten
+    /// seconds from the helper being asked to `bridge100` appearing, with the
+    /// interface settling for a few seconds after that.
+    private static let raiseCooldown: TimeInterval = 45
 
     /// Raises or lowers the Mac's network.
     ///
