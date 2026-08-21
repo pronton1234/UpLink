@@ -169,6 +169,9 @@ public enum TransportParameters {
         return parameters
     }
 
+    /// Whether this Mac is hosting right now.
+    public static var hostedNetworkAddressExists: Bool { hostedNetworkAddress() != nil }
+
     /// The Mac's own address on the network it hosts, or nil when not hosting.
     ///
     /// Read from the interfaces every time rather than remembered: the bridge

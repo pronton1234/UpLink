@@ -1472,3 +1472,35 @@ with no pulsing for the whole session.
 connections before suspecting the transport. An application with a single
 long-lived connection is a different test from one that opens hundreds, and only
 the first can see a transition at all.
+
+## It worked at a desk and failed in the car, 2026-08-21
+
+Reported from a real trip. At a desk, with the office internet switched off, the
+bridge came up. With the Mac in the boot of a car, it did not.
+
+The access point was raised in exactly two places: app launch, and the Bluetooth
+doorbell. Nothing else. So a Mac that had been switched off at a desk hours
+earlier — the phone's Turn Off sends `lowerAccessPoint` — arrived in the car with
+its access point down and **one** way left to raise it: BLE, from the front seat,
+into a metal box, through a seat back. That is precisely where Bluetooth gives
+up, and there was no second route.
+
+Three things were wrong, and each alone was enough:
+
+- **No way to host unasked.** Waiting to be asked is correct at a desk, where
+  the radio is carrying the user's own Wi-Fi and seizing it would be rude. In a
+  car it is nothing but a single point of failure: there is no other network, so
+  hosting costs the user nothing. The Mac now hosts on its own whenever it has
+  **no network of its own to lose**, and keeps waiting to be asked when it has.
+- **A Stop that outlived its situation.** "Stop" means *give me my network
+  back*. With no network to give back it means nothing — but it was still in
+  force, made about a different place hours earlier, stranding the machine. It
+  is now cleared when the Mac is alone.
+- **Not launching at login.** A laptop that is moved, jostled and left for days
+  will reboot, and nothing here ran afterwards. `SMAppService.mainApp` now
+  registers it.
+
+**Rule this encodes.** A remote-control channel needs a second way in, or it is
+a single point of failure wherever it is weakest — and the place it is weakest is
+exactly where the product is meant to be used. Prefer behaviour that needs no
+channel at all when it costs nothing.

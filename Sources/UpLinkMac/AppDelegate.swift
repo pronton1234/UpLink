@@ -3,6 +3,7 @@ import SwiftUI
 import Network
 import UserNotifications
 import OSLog
+import ServiceManagement
 import UpLinkKit
 
 /// The Mac's entry point.
@@ -47,6 +48,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         //
         // Registering does not raise the access point. That is deliberate:
         // installing the app should not silently take over the Wi-Fi radio.
+        // Launch with the machine.
+        //
+        // The Mac in the boot of a car cannot be asked to open an app. If it
+        // reboots — and a laptop that is moved, jostled and left for days will
+        // — nothing here runs, no access point is hosted, and the phone's only
+        // remaining route in is a Bluetooth doorbell nobody is listening for.
+        //
+        // Idempotent, and it asks for nothing: this is the same Login Items
+        // approval the helper already needs.
+        do {
+            if SMAppService.mainApp.status != .enabled { try SMAppService.mainApp.register() }
+        } catch {
+            logAccessPoint.error("could not register for launch at login: \(error.localizedDescription, privacy: .public)")
+        }
+
         accessPoint.register()
         // Report — never fix — a helper left over from an older build. See
         // `reportIfStale`: the only restart an app can perform also returns the
@@ -73,6 +89,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // The doorbell the phone rings to start us. The phone cannot ask over
         // the access point, because asking is what raises it.
         startBeaconUnlessItCrashedLastTime()
+
+        // THE FAILSAFE, and it is what makes the car work.
+        //
+        // Reported from a real trip: it worked at a desk and did not work with
+        // the Mac in the boot. Everything rested on the Bluetooth doorbell
+        // reaching from the front seat into a metal box through a seat back,
+        // which is exactly where BLE gives up — and if it does not arrive, the
+        // access point is never raised and there is no second way to ask.
+        //
+        // So the Mac hosts on its own whenever it has NOTHING TO LOSE by doing
+        // so. With no other network there is no radio being taken from the
+        // user, nothing is being interrupted, and hosting unasked cannot be
+        // wrong. With a network of its own it keeps waiting to be asked, which
+        // is the desk behaviour and stays unchanged.
+        //
+        // This is not the timer that was deleted. That one re-raised on a blip
+        // during the access point's own startup and tore it down; this one is
+        // gated on a live session, on the raise cooldown, and on the Mac being
+        // genuinely alone.
+        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, !self.macHasAnotherNetwork() else { return }
+                guard !TransportParameters.hostedNetworkAddressExists else { return }
+                guard !self.model.status.isConnected else { return }
+
+                // A Stop means "give me my network back". With no network to
+                // give back it means nothing, so it is not allowed to strand
+                // the Mac — which is exactly what it did in the car: the access
+                // point was switched off at a desk hours earlier and that
+                // decision, made about a completely different situation, was
+                // still in force in the boot with no way to reach the machine.
+                self.accessPointStoppedByUser = false
+                self.logAccessPoint.error("no network of our own — hosting without being asked")
+                self.hostAccessPointIfNeeded()
+            }
+        }
 
         // TELLING THE EXTENSION WHERE THE PHONE IS, which is a different job
         // from hosting and must not share a timer with it again.
@@ -182,6 +234,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Deliberately not the same thing as `toggleAccessPoint`: this one never
     /// takes the radio back from a user who asked for it, which is the
     /// difference between a product that heals itself and one that fights you.
+    /// Whether this Mac has some network of its own besides the one it hosts.
+    ///
+    /// Decides whether hosting costs the user anything. At a desk it does — the
+    /// radio is carrying their Wi-Fi, and seizing it unasked would be rude. In
+    /// a car it costs nothing, because there is nothing else there.
+    ///
+    /// Tunnels are excluded because the product's own route tunnel is always up
+    /// and would otherwise look like a working network. Link-local is excluded
+    /// because a self-assigned 169.254 address means DHCP failed, which is the
+    /// opposite of having a network.
+    private func macHasAnotherNetwork() -> Bool {
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let first = addresses else { return false }
+        defer { freeifaddrs(addresses) }
+
+        for pointer in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let name = String(cString: pointer.pointee.ifa_name)
+            guard !name.hasPrefix("lo"), !name.hasPrefix("utun"),
+                  !name.hasPrefix("bridge"), !name.hasPrefix("ap"),
+                  pointer.pointee.ifa_flags & UInt32(IFF_UP) != 0,
+                  let socketAddress = pointer.pointee.ifa_addr,
+                  socketAddress.pointee.sa_family == UInt8(AF_INET)
+            else { continue }
+
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(
+                socketAddress, socklen_t(socketAddress.pointee.sa_len),
+                &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST
+            ) == 0 else { continue }
+            let address = String(cString: host)
+            if address.hasPrefix("169.254") { continue }
+            return true
+        }
+        return false
+    }
+
     private func hostAccessPointIfNeeded() {
         guard !accessPointStoppedByUser, !accessPointBusy else { return }
         // NEVER while a session is live. Raising re-applies the Internet
