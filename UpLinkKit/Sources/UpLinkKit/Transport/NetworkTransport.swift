@@ -172,10 +172,15 @@ public enum TransportParameters {
     /// dialling a non-loopback address instead, this is the one line to change
     /// — and the trade being made is stated here so that change is a decision
     /// rather than a shrug.
+    /// - Parameter bearer: deliberately has no default. Getting this wrong
+    ///   binds the listener somewhere the Mac cannot reach it, and the symptom
+    ///   — a phone that is running perfectly and simply never answers — is one
+    ///   this project has already chased once. Every call site states it.
     public static func listener(
         sessionKeys: [(identity: String, key: SymmetricKey)],
         pairingKey: (identity: String, key: SymmetricKey)?,
-        port: UInt16
+        port: UInt16,
+        bearer: WirelessBearer
     ) -> NWParameters {
         let tls = NWProtocolTLS.Options()
 
@@ -187,7 +192,9 @@ public enum TransportParameters {
         applyPSKCiphersuite(tls)
 
         let parameters = NWParameters(tls: tls, tcp: Self.tcpOptions())
-        // BOTH lines are required, and that is measured, not assumed.
+
+        // OVER THE CABLE BOTH LINES ARE REQUIRED, and that is measured, not
+        // assumed.
         //
         // `requiredLocalEndpoint` pins the bind to loopback and the fixed port.
         // `acceptLocalOnly` reads like it means the same thing and its
@@ -196,11 +203,19 @@ public enum TransportParameters {
         // stopped establishing a session at all. Whatever it does here, the
         // listener does not accept the loopback connection without it.
         //
-        // Left in with the evidence attached rather than reasoned away again.
-        parameters.requiredLocalEndpoint = .hostPort(
-            host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port)!
-        )
-        parameters.acceptLocalOnly = true
+        // OVER THE ACCESS POINT BOTH ARE WRONG. The Mac dials the phone's
+        // address on the shared link, so a listener pinned to loopback is
+        // unreachable and one accepting local connections only refuses it.
+        // This is the change the note above anticipated — "if a device run ever
+        // shows the muxer dialling a non-loopback address instead, this is the
+        // one line to change" — reached because the muxer is no longer what
+        // dials, not because the redundancy argument was made a second time.
+        if bearer == .usbmux {
+            parameters.requiredLocalEndpoint = .hostPort(
+                host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port)!
+            )
+            parameters.acceptLocalOnly = true
+        }
         // The extension can be restarted while the old socket is still in
         // TIME_WAIT, and a fixed port cannot simply move to another number the
         // way the old ephemeral listener did.

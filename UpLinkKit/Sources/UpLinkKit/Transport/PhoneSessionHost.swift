@@ -38,6 +38,9 @@ public actor PhoneSessionHost {
     private let queue: DispatchQueue
     private let dialer: DestinationDialer
     private let port: UInt16
+    /// Which link the Mac will reach this listener over. Decides whether the
+    /// bind is pinned to loopback; see ``TransportParameters/listener(sessionKeys:pairingKey:port:bearer:)``.
+    private let bearer: WirelessBearer
     /// Durable home for tombstones. Nil in tests, which have no app group.
     private let tombstoneStore: TombstoneStore?
 
@@ -85,7 +88,8 @@ public actor PhoneSessionHost {
         dialer: DestinationDialer,
         queue: DispatchQueue,
         port: UInt16 = UpLinkUSB.extensionPort,
-        tombstoneStore: TombstoneStore? = nil
+        tombstoneStore: TombstoneStore? = nil,
+        bearer: WirelessBearer = .usbmux
     ) {
         self.identity = identity
         self.deviceName = deviceName
@@ -94,6 +98,7 @@ public actor PhoneSessionHost {
         self.queue = queue
         self.port = port
         self.tombstoneStore = tombstoneStore
+        self.bearer = bearer
         if let tombstoneStore {
             tombstones = tombstoneStore.load()
         }
@@ -231,7 +236,8 @@ public actor PhoneSessionHost {
         let parameters = TransportParameters.listener(
             sessionKeys: sessionKeys,
             pairingKey: pairingKey,
-            port: port
+            port: port,
+            bearer: bearer
         )
 
         let listener = try NWListener(using: parameters)
