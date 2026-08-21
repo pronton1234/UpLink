@@ -56,7 +56,10 @@ enum AccessPointControl {
         )
 
         log.info("raising access point on \(device, privacy: .public) from \(service, privacy: .public)")
-        try apply(configuration.natPreferences())
+        // Merged onto what is already there. Replacing it drops keys we do not
+        // know the purpose of — PrimaryInterface among them — and configd then
+        // reports "external interface: (null)" with a file that reads correctly.
+        try apply(configuration.natPreferences(mergedOnto: currentPreferences() ?? [:]))
         holdAwake(true)
     }
 

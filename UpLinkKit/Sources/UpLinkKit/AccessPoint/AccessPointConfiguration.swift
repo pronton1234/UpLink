@@ -52,26 +52,46 @@ public struct AccessPointConfiguration: Sendable, Equatable {
         self.sharingDeviceKey = sharingDeviceKey
     }
 
-    /// The dictionary written to ``preferencesPath``.
+    /// The configuration **merged onto** whatever is already there.
     ///
-    /// Keys and nesting mirror what this Mac already holds, captured
-    /// 2026-08-20 while sharing was off and already configured to share from
-    /// `UpLink Route`.
-    public func natPreferences() -> [String: Any] {
-        let airport: [String: Any] = [
-            "Enabled": 1,
-            "NetworkName": ssid,
-            "NetworkPassword": Data(passphrase.utf8),
-            "40BitEncrypt": 1,
-            "Channel": 0,
-        ]
-        let nat: [String: Any] = [
-            "Enabled": 1,
-            "AirPort": airport,
-            "PrimaryService": sourceServiceID,
-            "SharingDevices": [sharingDeviceKey],
-            "NatPortMapDisabled": false,
-        ]
-        return ["NAT": nat]
+    /// MEASURED 2026-08-20, and the reason this takes an argument at all.
+    /// Building a fresh dictionary looked complete — every field a reader would
+    /// think of was present and correct — and configd answered:
+    ///
+    ///     [com.apple.NetworkSharing:preference] no external service id
+    ///     [com.apple.NetworkSharing:preference] external interface: (null)
+    ///     [com.apple.NetworkSharing:preference] sharing started on 0 interfaces
+    ///
+    /// The replacement had silently dropped `PrimaryInterface`, the sub-
+    /// dictionary naming the source being shared. Nothing in the written file
+    /// looked wrong; the fault was entirely in what was missing.
+    ///
+    /// So this never replaces. Unknown keys are carried through untouched,
+    /// because a system preference is not ours to rewrite from first principles
+    /// — we do not know what every key is for, and that is exactly the point.
+    public func natPreferences(mergedOnto existing: [String: Any] = [:]) -> [String: Any] {
+        var nat = existing["NAT"] as? [String: Any] ?? [:]
+
+        var airport = nat["AirPort"] as? [String: Any] ?? [:]
+        airport["Enabled"] = 1
+        airport["NetworkName"] = ssid
+        airport["NetworkPassword"] = Data(passphrase.utf8)
+        nat["AirPort"] = airport
+
+        // The source. Carried through rather than invented: it names the
+        // service being shared, and pointing it at a real network instead of
+        // the dead-end tunnel would put internet behind the access point.
+        var primary = nat["PrimaryInterface"] as? [String: Any] ?? [:]
+        primary["Enabled"] = 1
+        nat["PrimaryInterface"] = primary
+
+        nat["Enabled"] = 1
+        nat["PrimaryService"] = sourceServiceID
+        nat["SharingDevices"] = [sharingDeviceKey]
+
+        var merged = existing
+        merged["NAT"] = nat
+        return merged
     }
+
 }

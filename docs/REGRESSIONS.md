@@ -909,3 +909,35 @@ is a dead end.
 naming the supported API, not an obstacle to route around. Every "run the tool
 by hand" approach here — `launchctl kickstart`, writing the plist, `defaults
 write` — fails or lies. The framework call works and is shorter.
+
+### The same run, one layer down — a correct file that says nothing
+
+With the SIP problem understood, the access point still did not come up, and
+configd said why:
+
+```
+[com.apple.NetworkSharing:preference] store changed
+[com.apple.NetworkSharing:preference] no external service id
+[com.apple.NetworkSharing:preference] external interface: (null)
+[com.apple.NetworkSharing:preference] sharing started on 0 interfaces
+```
+
+`store changed` means the plugin *did* see the write. It could not resolve the
+source being shared, because the configuration was built from scratch and had
+silently dropped `PrimaryInterface` — the sub-dictionary naming that source.
+Every field a reader would think to check was present and correct. The fault was
+entirely in what was missing, which is why reading the written file proved
+nothing and why the earlier "the write worked" conclusion was only half true.
+
+`AccessPointConfiguration.natPreferences(mergedOnto:)` merges now, and never
+replaces. Unknown keys are carried through untouched: a system preference is not
+ours to rewrite from first principles, and not knowing what every key is for is
+precisely what made this defect possible.
+
+| Test | Guards against |
+| --- | --- |
+| `SharingMergeRegressionTests` | Rebuilding the sharing configuration from scratch. Pins `PrimaryInterface` surviving and being enabled, unknown keys inside `NAT` surviving, and sibling top-level keys surviving — against this Mac's real captured off-state, so the fixture is the thing that actually failed. |
+
+**Rule this encodes.** Two failures in one run both took the shape "the artefact
+looks right and the system disagrees". Confirm a system change by asking the
+system, never by reading back the file you wrote.
