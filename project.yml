@@ -56,6 +56,10 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.uplink.app
         PRODUCT_NAME: UpLink
         INFOPLIST_FILE: Sources/UpLinkMac/Info.plist
+        # Names the icon set inside Sources/UpLinkMac/Assets.xcassets. Same trap
+        # as the iOS target: without it the catalog compiles, the build stays
+        # green, and only the Dock tells you the icon is missing.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_ENTITLEMENTS: Sources/UpLinkMac/UpLinkMac.entitlements
         # Off deliberately — a sandboxed app cannot install a system extension.
         # See UpLinkMac.entitlements.
