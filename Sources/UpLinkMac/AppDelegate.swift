@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var devicesWindow: NSWindow?
 
     private let model = MenuBarModel()
+    private let accessPoint = AccessPointHost()
 
     static func main() {
         let delegate = AppDelegate()
@@ -32,6 +33,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         installStatusItem()
         requestNotificationPermission()
+
+        // Idempotent, so it is safe on every launch. The user approves the
+        // helper once, in the same System Settings panel that already approves
+        // the network extension — one more switch in a flow that already has
+        // one, rather than a new kind of ceremony.
+        //
+        // Registering does not raise the access point. That is deliberate:
+        // installing the app should not silently take over the Wi-Fi radio.
+        accessPoint.register()
 
         model.onCableRemoved = { [weak self] in
             self?.notifyCableRemoved()
