@@ -36,10 +36,12 @@ the reverse, so the laptop is never opened and the carrier never sees a tethered
 client — the phone's own app socket originates every flow, exactly as it does
 over the cable today.
 
-Internet Sharing is enabled **once, by hand, at setup** and left on. That is
-within the stated budget of "a one time set-up for the mac app," and it is the
-only part of the system that touches System Settings. Because the Mac never
-sleeps and has no other network to return to, there is nothing to toggle.
+Internet Sharing is owned by a **privileged helper the app installs once**, so
+the access point is asserted by the product rather than left to the user or to
+whatever macOS chooses to restore. See "The access point is owned by a helper"
+below. If that mechanism turns out not to work on macOS 26, the fallback is to
+enable Internet Sharing once by hand and leave it on, which is still within the
+stated budget of "a one time set-up for the mac app."
 
 The access point is sourced from `RouteProvider` — the product's own always-up
 dead-end tunnel — so it comes up with **no internet behind it**. The Mac's live
@@ -95,6 +97,50 @@ Nothing off the shelf meets the speed bar in that form factor — the thumb-driv
 OpenWrt sticks are 802.11n at roughly 50 Mbps real, well under the cable's 116
 Mbps — so it means a custom build. Held in reserve; unnecessary if the hosted
 access point survives reboot.
+
+## The access point is owned by a helper
+
+Internet Sharing has no public API and **cannot be toggled from an app**. That
+is a real constraint and it is what rules out any per-session toggle. It does
+not rule out a root daemon.
+
+`com.apple.NetworkSharing` is Mach-activated, running `/usr/libexec/InternetSharing`
+with no `RunAtLoad` and no `KeepAlive`. Its configuration comes from
+`/Library/Preferences/SystemConfiguration/com.apple.nat.plist`. So the mechanism
+is a root process writing that file and kickstarting the job:
+
+```
+NAT -dict-add Enabled -int 1
+launchctl kickstart -k system/com.apple.NetworkSharing
+```
+
+**Why the earlier finding does not forbid this.** A prior run recorded
+`:NAT:AirPort:Enabled` reading `0` with the access point fully up, and concluded
+"never test that field." That conclusion is correct and it is about *reading*.
+The plist is **input, not output**: configd consumes it into live state and does
+not write back. Nothing in that observation says a write is ignored — only that
+a read proves nothing. This is the single most likely place for this design to
+be wrong, which is why it is Phase 0's first question and not an assumption.
+
+The helper is installed once with `SMAppService.daemon(plistName:)` (macOS 13+).
+This is not new privilege surface: the app is already unsandboxed, already
+installs a system extension, and the user already approves it in System Settings
+— `com.uplink.app.proxy` is `[activated enabled]` on this Mac today. The helper
+adds one approval to a flow that already has one.
+
+What it buys, beyond the toggle:
+
+- **Boot independence.** With `RunAtLoad`, the access point is re-asserted at
+  every boot whether or not macOS restores Internet Sharing itself. The reboot
+  question stops being a risk and becomes an implementation detail.
+- **A real off switch.** Sharing can be dropped when the user quits, rather than
+  leaving the Mac permanently hosting a network.
+- **Sleep policy.** `pmset disablesleep` is root-only and belongs here too,
+  covering the battery case where Internet Sharing does not set it.
+
+If the write-and-kickstart mechanism does not work on macOS 26, the helper still
+earns its place by handling sleep policy, and the access point falls back to
+being enabled once by hand.
 
 ## Architecture
 
@@ -210,13 +256,18 @@ driving the test.
 
 ## Phases
 
-**Phase 0 — the two measurements that gate everything.** Does Internet Sharing
-survive a reboot with `Enabled` restored, and does an iOS device stay associated
-to a no-internet network for hours rather than minutes? Both need the operator
-present. Output is an answer in `docs/device-test-log.md`, not code.
+**Phase 0 — the measurements that gate everything.** Does writing
+`com.apple.nat.plist` and kickstarting `com.apple.NetworkSharing` actually raise
+the access point on macOS 26? Does it survive a reboot? Does an iOS device stay
+associated to a no-internet network for hours rather than minutes? All need the
+operator present, because hosting the access point seizes the Mac's only radio.
+Output is an answer in `docs/device-test-log.md`, not code.
 
-**Phase 1 — bearer.** `TransportProfile`, the three sites above, and the `.wifi`
-prohibition.
+**Phase 1 — the helper.** `SMAppService` daemon, the access-point lifecycle, and
+sleep policy.
+
+**Phase 1b — bearer.** `TransportProfile`, the three sites above, and the
+`.wifi` prohibition.
 
 **Phase 2 — the phone's join.** `NEHotspotConfiguration`, the
 `com.apple.developer.networking.HotspotConfiguration` entitlement, and the
@@ -235,10 +286,12 @@ phase runs unattended.
 
 ## Risks
 
-- **Reboot persistence is unmeasured.** If Internet Sharing does not come back
-  automatically, the Mac needs one visit to System Settings per reboot. That is
-  the difference between this design meeting the requirement and merely
-  approaching it, and it is Phase 0's first question.
+- **The write-and-kickstart mechanism is unverified on macOS 26.** This is the
+  design's load-bearing assumption. If it fails, the helper cannot raise the
+  access point and the Mac needs Internet Sharing enabled by hand — once at
+  setup if macOS restores it at boot, once per reboot if it does not. The
+  degradation is graceful but it is the difference between meeting the
+  requirement and approaching it.
 - **iOS may not hold a no-internet association indefinitely.** It joined on
   2026-08-15; that it *stays* for hours is unproven.
 - **The machine under test is the machine driving the test.**
