@@ -34,10 +34,10 @@ public struct AccessPointConfiguration: Sendable, Equatable {
 
     /// BSD name of the interface hosting the radio.
     ///
-    /// UNVERIFIED against a live access point. This Mac reads
-    /// `SharingDevices => []` with sharing off, so the on-state form is a
-    /// Phase 0 capture. If a measurement shows the daemon expects a hardware
-    /// key rather than a BSD name, this is the field that changes.
+    /// Supplied by ``HardwarePorts/wifiDevice(in:)`` rather than hardcoded, so
+    /// this needs no measurement to be correct — it is whatever this Mac says
+    /// its Wi-Fi interface is at the moment the helper asks. That also makes it
+    /// right on a Mac that is not this one.
     public let sharingDeviceKey: String
 
     public init(
