@@ -49,6 +49,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         accessPoint.register()
         refreshAccessPointState()
 
+        // THE NETWORK IS ALWAYS UP, and that is the design rather than a
+        // convenience. The phone cannot ask the Mac to start hosting, because
+        // asking requires the very network that is not up yet — so a Mac that
+        // waits to be asked can never be reached, and every session begins with
+        // the user walking to the laptop, which is the friction this product
+        // exists to remove.
+        //
+        // The Mac does not sleep and has no other network to return to, so
+        // there is nothing being taken away by hosting continuously. Stopping
+        // stays available in the menu for when the user genuinely wants the
+        // radio back.
+        hostAccessPointIfNeeded()
+
+        // Also on a timer: the access point can go down for reasons of its own
+        // — a reboot, a network change, someone switching it off in System
+        // Settings — and a Mac in the back of a car cannot be asked to notice.
+        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.hostAccessPointIfNeeded() }
+        }
+
         model.onCableRemoved = { [weak self] in
             self?.notifyCableRemoved()
         }
@@ -75,6 +95,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: The access point
 
+    /// Brings the network up unless the user switched it off by hand.
+    ///
+    /// Deliberately not the same thing as `toggleAccessPoint`: this one never
+    /// takes the radio back from a user who asked for it, which is the
+    /// difference between a product that heals itself and one that fights you.
+    private func hostAccessPointIfNeeded() {
+        guard !accessPointStoppedByUser, !accessPointBusy else { return }
+        Task { @MainActor in
+            guard await !accessPoint.isUp() else {
+                if !accessPointIsUp { accessPointIsUp = true; refreshStatusItem() }
+                return
+            }
+            accessPointBusy = true
+            refreshStatusItem()
+            let failure = await accessPoint.raise()
+            accessPointBusy = false
+            if let failure {
+                // Not an alert. This runs unattended and on a timer; a modal
+                // every thirty seconds would be worse than the fault.
+                logAccessPoint.error("auto-host failed: \(failure, privacy: .public)")
+            }
+            await settle(expecting: true)
+        }
+    }
+
+    private let logAccessPoint = Logger(subsystem: UpLinkIdentifiers.logSubsystem, category: "ap")
+    /// Set only by an explicit Stop, so automatic hosting never overrides a
+    /// deliberate choice.
+    private var accessPointStoppedByUser = false
+
     /// Raises or lowers the Mac's network.
     ///
     /// Hosting takes the Wi-Fi radio, so this is never done implicitly — not on
@@ -84,6 +134,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleAccessPoint() {
         guard !accessPointBusy else { return }
         let wasUp = accessPointIsUp
+        // Remembered, so the thirty-second re-host does not undo a Stop the
+        // user just asked for.
+        accessPointStoppedByUser = wasUp
         accessPointBusy = true
         refreshStatusItem()
 
