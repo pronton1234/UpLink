@@ -20,6 +20,16 @@ public struct AccessPointCredentials: Sendable, Equatable, Codable {
         self.passphrase = passphrase
     }
 
+    /// The prefix the phone matches on when joining.
+    ///
+    /// The Mac cannot tell the phone its network's exact name: that name is set
+    /// in System Settings and stored where SIP forbids reading it, even as
+    /// root. So the phone matches a prefix instead, and the only rule the user
+    /// has to follow when naming the network is that it starts with this.
+    public static let ssidPrefix = "UpLink"
+
+    public var ssidPrefix: String { Self.ssidPrefix }
+
     /// The network name for a Mac with this fingerprint.
     ///
     /// Derived rather than fixed, for two reasons that pull the same way. Two

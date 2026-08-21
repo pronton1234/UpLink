@@ -37,8 +37,22 @@ enum AccessPointJoin {
     /// should require no interaction at all, and a join that had to be repeated
     /// by hand would put the friction straight back.
     static func join(_ credentials: AccessPointCredentials) async throws {
+        // JOINED BY PREFIX, NOT BY EXACT NAME, and that is forced rather than
+        // preferred.
+        //
+        // MEASURED 2026-08-20: the Mac's hosted network name cannot be set
+        // programmatically. Writing NAT:AirPort:NetworkName is accepted and
+        // ignored — the field read "UpLink-c743de63" while the radio broadcast
+        // "UpLink-Spike" — and the live software-AP configuration lives in
+        // com.apple.airport.preferences.plist, which SIP makes unreadable even
+        // to root. So no amount of privilege lets the Mac tell the phone what
+        // it is called.
+        //
+        // Prefix matching sidesteps the whole problem: the user names the
+        // network once in System Settings, anything beginning with "UpLink"
+        // matches, and the exact name never has to travel between the devices.
         let configuration = NEHotspotConfiguration(
-            ssid: credentials.ssid,
+            ssidPrefix: credentials.ssidPrefix,
             passphrase: credentials.passphrase,
             isWEP: false
         )

@@ -974,3 +974,33 @@ exist until the tunnel is running. The live value is in the dynamic store, at
 last, and all three looked correct from the artefact. Preferences describe
 configuration; only the dynamic store describes what is *running*. Anything
 naming a live interface has to come from the latter.
+
+## The hosted network's name cannot be set, 2026-08-20
+
+The Mac brought its access point up correctly and broadcast the wrong name. The
+preference read `UpLink-c743de63`; the radio was on the air as `UpLink-Spike`,
+a name left over from an earlier spike and present nowhere in this repository.
+
+`NAT:AirPort:NetworkName` is written, accepted, and ignored. This is the third
+field in this one plist to behave that way, after `:NAT:AirPort:Enabled` reading
+`0` with the access point fully up and `PrimaryInterface.Device` being empty for
+a VPN source. The pattern is now unmistakable: **`com.apple.nat.plist` records
+intent, and a good deal of it is vestigial.**
+
+Where the live configuration actually lives is
+`com.apple.airport.preferences.plist`, and with SIP enabled that file cannot be
+read **even by root** — `sudo plutil -p` returns "you don't have permission to
+view it" on a file whose mode is `rw-r--r-- root:wheel`. Searching by the name
+on the air found it only inside `/var/db/diagnostics/*.tracev3`, which are log
+files, not configuration. So the name can be neither read nor written, at any
+privilege level, by us.
+
+**The fix is to stop needing it.** `NEHotspotConfiguration(ssidPrefix:passphrase:isWEP:)`
+(iOS 13+) joins any network whose name begins with a prefix. The user names the
+network once in System Settings, anything starting with `UpLink` matches, and
+the exact name never has to travel between the two devices.
+
+**Rule this encodes.** When a value cannot be read at any privilege level, that
+is the platform declining to have the conversation. Design so the value is not
+needed, rather than looking for a way to extract it — the extraction is the part
+that breaks on the next OS release.
