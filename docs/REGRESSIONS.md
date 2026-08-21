@@ -1124,3 +1124,44 @@ needs no help.
 **Rule this encodes.** ETIMEDOUT names a destination that did not answer, never
 the path taken to it. When it appears against a host that is provably reachable,
 the question is which interface the packets left on.
+
+## The bridge came up, and the thing meant to protect it killed it, 2026-08-20
+
+First working wireless session, and the whole chain:
+
+```
+23:36:33.620 join: OK (prefix UpLink)
+23:36:33.827 listening: port=50505 bearer=hostedAP build=1
+23:36:34.297 accept: inbound from 192.168.2.1:63578
+23:36:34.322 accept: TLS ok, first frame = hello
+23:36:34.332 session started with 012ff2a529f58e7a
+23:36:45.572 session ENDED
+```
+
+Eleven seconds. The Mac's side explains it:
+
+```
+23:36:14  bridge100: inet 192.168.2.1     ← access point up
+23:36:36  bridge100: absent                ← two seconds after the session started
+23:36:47  bridge100: inet 192.168.2.1     ← back on its own
+23:36:55  helper: raising access point     ← the re-host, making it worse
+```
+
+**The access point flaps when the first client associates** — Internet Sharing
+reconfigures and `bridge100` briefly disappears. The thirty-second re-host,
+added so a Mac in the back of a car could recover an access point that had gone
+down, read that blip as "down" and raised again. Raising re-applies the sharing
+configuration, which restarts the access point and drops every client, so the
+repair destroyed a session that had just completed its TLS handshake.
+
+Two guards now, and each is necessary on its own:
+
+- **Never re-host while a session is live.** A working bridge needs no repair,
+  and a re-host during one cannot help by construction.
+- **Down must be sustained.** One sample is a blip; two consecutive checks a
+  minute apart is an access point that is genuinely gone.
+
+**Rule this encodes.** Automatic recovery has to be surer of the fault than of
+its remedy. A repair that is destructive when wrong must wait for evidence that
+would be silly to doubt — and must never run while the thing it protects is
+working.

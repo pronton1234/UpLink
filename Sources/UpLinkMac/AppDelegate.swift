@@ -102,11 +102,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// difference between a product that heals itself and one that fights you.
     private func hostAccessPointIfNeeded() {
         guard !accessPointStoppedByUser, !accessPointBusy else { return }
+        // NEVER while a session is live. Raising re-applies the Internet
+        // Sharing configuration, which restarts the access point and drops
+        // every client on it — so a re-host during a working bridge does not
+        // repair anything, it destroys the thing it was meant to protect.
+        guard !model.status.isConnected else {
+            accessPointDownChecks = 0
+            return
+        }
         Task { @MainActor in
             guard await !accessPoint.isUp() else {
+                accessPointDownChecks = 0
                 if !accessPointIsUp { accessPointIsUp = true; refreshStatusItem() }
                 return
             }
+
+            // MEASURED 2026-08-20, and this guard is the whole point of the
+            // counter. The access point FLAPS when the first client associates:
+            // bridge100 vanished two seconds after the phone joined and came
+            // back eleven seconds later. A re-host on that blip restarted
+            // sharing and killed a session that had just completed its TLS
+            // handshake and was carrying traffic.
+            //
+            // So down has to be sustained before it is believed. One sample is
+            // a blip; two in a row, a minute apart, is an access point that is
+            // genuinely gone.
+            accessPointDownChecks += 1
+            guard accessPointDownChecks >= 2 else {
+                logAccessPoint.error("access point looks down — waiting for a second check")
+                return
+            }
+            accessPointDownChecks = 0
             accessPointBusy = true
             refreshStatusItem()
             let failure = await accessPoint.raise()
@@ -124,6 +150,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Set only by an explicit Stop, so automatic hosting never overrides a
     /// deliberate choice.
     private var accessPointStoppedByUser = false
+    /// Consecutive checks that saw no access point. See ``hostAccessPointIfNeeded``.
+    private var accessPointDownChecks = 0
 
     /// Raises or lowers the Mac's network.
     ///
