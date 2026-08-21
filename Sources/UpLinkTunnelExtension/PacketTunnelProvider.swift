@@ -248,7 +248,24 @@ actor PhoneBridge {
             diagnostics.write("listener FAILED to start: \(error)")
             throw error
         }
-        diagnostics.write("listening on 127.0.0.1:\(UpLinkUSB.extensionPort) — waiting for the Mac to dial over the cable")
+        // REPORTS WHAT IS TRUE, not what was intended.
+        //
+        // This line used to be the literal string "listening on 127.0.0.1:50505
+        // — waiting for the Mac to dial over the cable", written whatever the
+        // listener actually did. It went on saying "over the cable" through an
+        // entire evening of wireless debugging, and it said loopback while the
+        // bearer had been changed to bind every interface. A diagnostic that
+        // cannot be wrong is a diagnostic that cannot help.
+        //
+        // The build is here because installing the app does NOT restart a
+        // running Network Extension: the phone can keep an old binary across
+        // any number of installs, and every symptom then points at code that is
+        // not running. That cost several rounds before it was noticed.
+        let bound = await host.listeningPort.map { "\($0.rawValue)" } ?? "NOT BOUND"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        diagnostics.write(
+            "listening: port=\(bound) bearer=\(WirelessBearer.hostedAP.rawValue) build=\(build)"
+        )
     }
 
     func stop() async {

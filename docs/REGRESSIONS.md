@@ -1036,3 +1036,30 @@ The port is passed to `NWListener(using:on:)` explicitly now.
 it is removed for the sake of the other. `requiredLocalEndpoint` meant "loopback"
 and "port 50505" at once; only the first was unwanted. Where a change deletes a
 compound value, name each fact it was carrying and decide about each one.
+
+### The same evening — a diagnostic that could not be wrong
+
+The phone's log said, through every wireless attempt:
+
+```
+listening on 127.0.0.1:50505 — waiting for the Mac to dial over the cable
+```
+
+It was a literal string, written unconditionally after the listener started. It
+said `127.0.0.1` while the bearer had been changed to bind every interface, and
+it said "over the cable" during an evening in which no cable was attached. It
+was read as evidence twice and sent the search in the wrong direction both
+times.
+
+It now reports the port actually bound, the bearer, and the **build**.
+
+The build is there because **installing the app does not restart a running
+Network Extension.** The phone kept an old binary across several installs, so
+fix after fix was shipped to a device that never loaded any of them, and every
+symptom pointed at code that was not running. The proof was that the phone's log
+had not been written to since before the last three installs — identical size
+and mtime — which is a thing nobody thinks to check.
+
+**Rule this encodes.** A diagnostic that cannot be wrong cannot help. If a line
+would print the same text whatever happened, it is decoration. Print the value,
+and print which build printed it.
