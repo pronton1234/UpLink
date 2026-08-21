@@ -22,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let model = MenuBarModel()
     private let accessPoint = AccessPointHost()
+    private var beacon: AccessPointBeacon?
     /// Last known access-point state, refreshed off the main thread. The menu
     /// is rebuilt on every open, and asking the helper synchronously there
     /// would block the menu on an XPC round trip.
@@ -61,6 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // stays available in the menu for when the user genuinely wants the
         // radio back.
         hostAccessPointIfNeeded()
+        startBeacon()
 
         // Also on a timer: the access point can go down for reasons of its own
         // — a reboot, a network change, someone switching it off in System
@@ -89,6 +91,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // signal that it is reachable. Re-announcing is idempotent —
                 // the extension ignores a repeat of what it is already dialling.
                 await self?.model.announcePeerIfPossible()
+            }
+        }
+    }
+
+    // MARK: The doorbell
+
+    /// Publishes the Bluetooth control channel the phone uses to start us.
+    ///
+    /// This is what makes the whole thing work from the phone alone. Everything
+    /// else the phone needs travels over the access point, and the access point
+    /// is the one thing that cannot be asked for that way.
+    private func startBeacon() {
+        let beacon = AccessPointBeacon(
+            onCommand: { [weak self] command in
+                guard let self else { return }
+                switch command {
+                case .raiseAccessPoint:
+                    // Clears an earlier Stop: the phone asking is unambiguously
+                    // "host again", and refusing on the strength of a switch
+                    // flipped hours ago would be the wrong kind of loyalty.
+                    accessPointStoppedByUser = false
+                    accessPointDownChecks = 2
+                    hostAccessPointIfNeeded()
+                case .lowerAccessPoint:
+                    guard accessPointIsUp else { return }
+                    toggleAccessPoint()
+                }
+            },
+            accessPointIsUp: { TransportParameters.hostedNetworkAddress() != nil }
+        )
+        beacon.start()
+        self.beacon = beacon
+
+        // Quiet while a bridge is live. Nothing needs the doorbell once the
+        // door is open.
+        model.observe { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                beacon.setSessionLive(self.model.status.isConnected)
             }
         }
     }

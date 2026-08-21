@@ -50,5 +50,10 @@
 	<array>
 		<string>_uplink._tcp</string>
 	</array>
+	<!-- The phone rings this to bring the access point up while it is down,
+	     which Wi-Fi cannot do: the phone's only path to the Mac is the network
+	     the Mac hosts. Control bytes only — never data. -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>UpLink lets your iPhone start this Mac's network when it is off. Only a start or stop command is sent — never your data.</string>
 </dict>
 </plist>

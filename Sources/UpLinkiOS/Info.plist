@@ -39,5 +39,10 @@
 	<array>
 		<string>_uplink._tcp</string>
 	</array>
+	<!-- Used to ask the Mac to start its network while that network is down,
+	     which is the one thing Wi-Fi cannot do here. One command byte, never
+	     data. -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>UpLink uses Bluetooth to ask your Mac to start its network. Only a start or stop command is sent — never your data.</string>
 </dict>
 </plist>

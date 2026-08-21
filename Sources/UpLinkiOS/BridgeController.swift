@@ -79,6 +79,8 @@ final class BridgeController {
     /// a cable, which is exactly what this bearer removes — so anything worth
     /// knowing after the fact has to go here instead.
     private let diagnostics = PhoneDiagnosticLog.shared
+    /// The Bluetooth doorbell. See ``AccessPointRemote``.
+    private let remote = AccessPointRemote()
 
     private var manager: NETunnelProviderManager?
     private let store = PairedDeviceStore()
@@ -305,9 +307,23 @@ final class BridgeController {
             // This is the step that makes the whole thing one tap. Without it
             // the user joins the network by hand in Settings first, which is
             // the friction the product exists to remove.
+            // RING THE DOORBELL FIRST. The Mac may not be hosting yet, and if it
+            // is not, no amount of joining will find a network. This is the one
+            // request that cannot travel over the access point, because the
+            // access point is what it is asking for.
+            let delivered = await remote.send(.raiseAccessPoint)
+            diagnostics.write(delivered
+                ? "remote: asked the Mac to start its network"
+                : "remote: no Mac answered over Bluetooth — trying the network anyway")
+
             if let password = networkPassword {
                 do {
-                    try await AccessPointJoin.join(passphrase: password)
+                    // Retried, because raising takes several seconds: measured
+                    // 2026-08-20, bridge100 appeared about ten seconds after the
+                    // helper was asked. A single attempt lands in that gap and
+                    // fails with "no network name matched", which reads as a
+                    // wrong password and is not one.
+                    try await joinWithRetry(passphrase: password, attempts: delivered ? 8 : 2)
                     diagnostics.write("join: OK (prefix \(AccessPointCredentials.ssidPrefix))")
                 } catch {
                     // Written where it can be read back. A join that fails
@@ -368,6 +384,19 @@ final class BridgeController {
         activePeerFingerprint = nil
         manager?.connection.stopVPNTunnel()
         state = .idle
+
+        // Give the Mac its own Wi-Fi back.
+        //
+        // Sent over Bluetooth rather than the bridge, deliberately: the bridge
+        // is being torn down as this runs, so a message down it would race the
+        // teardown and lose. The doorbell is still there either way.
+        //
+        // Fire and forget. If the Mac does not hear it the worst case is an
+        // access point left running, which is the state it is designed to sit
+        // in anyway — never a failure the user has to act on.
+        Task { [remote] in
+            _ = await remote.send(.lowerAccessPoint)
+        }
     }
 
     /// Asks the extension what it is actually observing.
@@ -417,6 +446,25 @@ final class BridgeController {
     private var tunnelWatchTask: Task<Void, Never>? {
         get { tunnelWatchTaskStorage }
         set { tunnelWatchTaskStorage?.cancel(); tunnelWatchTaskStorage = newValue }
+    }
+
+    /// Joins, retrying while the Mac's network is still coming up.
+    private func joinWithRetry(passphrase: String, attempts: Int) async throws {
+        var lastError: Error?
+        for attempt in 1 ... max(1, attempts) {
+            do {
+                try await AccessPointJoin.join(passphrase: passphrase)
+                return
+            } catch {
+                lastError = error
+                // Only worth retrying while the network might still be
+                // appearing. A refused password will never become a right one.
+                if case AccessPointJoin.Failure.denied = error { throw error }
+                diagnostics.write("join attempt \(attempt) failed: \(error)")
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+        throw lastError ?? AccessPointJoin.Failure.failed("join did not succeed")
     }
 
     private func startStatusPolling() {
