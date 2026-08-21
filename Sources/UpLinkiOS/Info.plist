@@ -24,5 +24,20 @@
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 	</array>
+	<!-- REQUIRED, and its absence is silent. Since iOS 14 a process that
+	     listens on or reaches the local network is blocked without this key —
+	     the socket binds, the peer's connection is refused by the system, and
+	     nothing anywhere reports why.
+	     Observed on hardware 2026-08-20: the Mac dialled 192.168.2.2:50505 and
+	     got "no connection within 12s" every twelve seconds against a listener
+	     that was running perfectly. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>UpLink connects to your Mac over the network your Mac hosts. Nothing is sent to any server.</string>
+	<!-- The phone advertises this so the Mac can find it; Bonjour is blocked
+	     unless the service is declared here by name. -->
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_uplink._tcp</string>
+	</array>
 </dict>
 </plist>
