@@ -1063,3 +1063,31 @@ and mtime — which is a thing nobody thinks to check.
 **Rule this encodes.** A diagnostic that cannot be wrong cannot help. If a line
 would print the same text whatever happened, it is decoration. Print the value,
 and print which build printed it.
+
+### macOS has local network privacy too, 2026-08-20
+
+After the phone was proven correct — `join: OK`, `listening: port=50505
+bearer=hostedAP`, reachable at 2.7ms with an ARP entry — the Mac's dial still
+timed out at twelve seconds with **nothing arriving at the phone at all**.
+
+The measurement that separated it:
+
+```
+tcp 50505: Connection to 192.168.2.2 port 50505 succeeded!   ← nc, from Terminal
+dial failed: handshakeFailed("no connection within 12s")     ← the extension
+```
+
+Same address, same port, seconds apart. The difference is not the network, it is
+**which binary is asking**. macOS 15 brought iOS's local network privacy to the
+Mac, and neither `UpLinkMac` nor the proxy extension declared
+`NSLocalNetworkUsageDescription`. Terminal had been granted long ago; the
+extension had never asked, and a denial here is silent — the connection simply
+never completes.
+
+This is the same defect as the iOS one recorded above, on the other device, and
+it was not looked for there because the Mac side had been working all evening
+over loopback — where local network privacy does not apply.
+
+**Rule this encodes.** When two processes on one machine get different answers
+from the same address and port, the variable is the process, not the network.
+Look at what the OS grants each of them before looking at anything else.
