@@ -396,6 +396,13 @@ public actor PhoneSessionHost {
 
     private func accept(_ connection: NWConnection) async {
         log.error("accept: inbound connection from \(String(describing: connection.endpoint), privacy: .public)")
+        // ALSO to the readable log. os.Logger cannot be read back off the phone
+        // without a cable, which is the thing this bearer removes — so every
+        // step of the handshake that could be the failure has to be written
+        // where it can be recovered afterwards. An evening was spent reading
+        // "nothing after `listening`" as "no connection arrived", when accepts
+        // simply were not being recorded here.
+        PhoneDiagnosticLog.shared.write("accept: inbound from \(connection.endpoint)")
         let channel = NWConnectionChannel(connection: connection)
         do {
             // A wrong pairing code, or an unpaired Mac, fails the TLS handshake
@@ -415,6 +422,7 @@ public actor PhoneSessionHost {
             guard let first else { throw ChannelError.peerClosed }
 
             log.error("accept: TLS ok, first frame = \(String(describing: first.kind), privacy: .public)")
+            PhoneDiagnosticLog.shared.write("accept: TLS ok, first frame = \(first.kind)")
             switch first.kind {
             case .pairRequest:
                 try await handlePairing(first, on: channel)
@@ -432,8 +440,10 @@ public actor PhoneSessionHost {
             if let refusal = error as? PairingError {
                 try? await channel.send(FrameEncoder.encode(Multiplexer.pairFailureFrame(refusal)))
                 log.error("accept: pairing REFUSED — \(String(describing: refusal), privacy: .public)")
+                PhoneDiagnosticLog.shared.write("accept: pairing REFUSED — \(refusal)")
             } else {
                 log.error("accept: REJECTED \(String(describing: error), privacy: .public)")
+                PhoneDiagnosticLog.shared.write("accept: REJECTED \(error)")
             }
             await channel.close()
         }
