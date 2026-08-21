@@ -63,7 +63,31 @@ else
   red   "    The address above may be the Mac's own network, not the phone's."
 fi
 
-blue "==> 3. Speed, against the cable"
+blue "==> 3. Which traffic classes actually work"
+
+# EACH CLASS SEPARATELY, because "the internet is broken" and "names do not
+# resolve" look identical from a browser and have nothing in common underneath.
+#
+# This exists because of a real report: Chrome worked while everything else
+# failed. Chrome resolves over DNS-over-HTTPS, so it never touches the system
+# resolver — which makes it exactly the wrong thing to test with, and the only
+# thing that had been tested with.
+klass() {
+    printf '    %-22s ' "$1"
+    if eval "$2" >/dev/null 2>&1; then green OK; else red FAILED; fi
+}
+
+klass "DNS (system)"        "dscacheutil -q host -a name example.com | grep -q ip_address"
+klass "DNS (direct 1.1.1.1)" "dig +time=5 +tries=1 @1.1.1.1 example.com +short"
+klass "TCP by name"          "curl -s --max-time 15 -o /dev/null https://example.com"
+klass "TCP by IP (no DNS)"   "curl -s --max-time 15 -o /dev/null https://1.1.1.1"
+klass "IPv6"                 "curl -s --max-time 15 -o /dev/null -6 https://ipv6.google.com"
+klass "QUIC / HTTP-3"        "/opt/homebrew/opt/curl/bin/curl --http3-only -s --max-time 20 -o /dev/null https://dl.google.com"
+echo
+echo "    If DNS (system) fails while TCP by IP passes, names are the fault —"
+echo "    which is exactly the shape of 'Chrome works and nothing else does'."
+
+blue "==> 4. Speed, against the cable"
 
 ./scripts/throughput-test.sh 2>/dev/null | tail -12
 echo
