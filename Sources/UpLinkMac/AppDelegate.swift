@@ -68,6 +68,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch model.status {
         case .connected(_, .cellular): symbol = "personalhotspot"
         case .connected: symbol = "exclamationmark.triangle"
+        case .accessPointDown: symbol = "wifi.slash"
+        case .waitingForPhone: symbol = "wifi"
         case .waitingForCable: symbol = "cable.connector.slash"
         case .deviceNotResponding, .deviceNotPaired: symbol = "cable.connector"
         case .connecting: symbol = "cable.connector"

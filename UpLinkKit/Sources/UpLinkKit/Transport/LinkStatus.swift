@@ -6,6 +6,11 @@ import Foundation
 /// can be made — and tested — without an app, a menu bar, or a cable.
 public enum LinkPresence: Sendable, Equatable {
     case noDevice
+    /// The Mac is not hosting its access point, so there is no link at all.
+    /// The only cause in this whole matrix the user can personally fix.
+    case accessPointDown
+    /// The access point is up and no phone has been discovered on it.
+    case noPeerDiscovered
     case attachedNotAnswering
     /// Attached and answering on one of the UpLink ports.
     case answering(udid: String)
@@ -25,6 +30,8 @@ public enum LinkPresence: Sendable, Equatable {
 /// unverifiable and the only way to see them was to physically arrange each
 /// state. Pulled out here, the whole matrix is provable in milliseconds.
 public enum LinkStatus: Sendable, Equatable {
+    case accessPointDown
+    case waitingForPhone
     case waitingForCable
     case deviceNotResponding
     case deviceNotPaired
@@ -55,10 +62,19 @@ public enum LinkStatus: Sendable, Equatable {
         // Checked first, and only when a cable is actually answering. Saying
         // "Switched off" with nothing plugged in would be true but useless —
         // the thing to fix is the cable, and that is what should be on screen.
+        // Ahead of everything, including an explicit switch-off, and for the
+        // same reason that switch-off is itself gated on something answering:
+        // with no access point there is nothing to switch off, and naming the
+        // wrong cause is what this type exists to stop.
+        if case .accessPointDown = presence { return .accessPointDown }
         if userDisconnected, case .answering = presence { return .switchedOff }
         if pairingRefused, case .answering = presence { return .pairingLost }
 
         switch presence {
+        case .accessPointDown:
+            return .accessPointDown
+        case .noPeerDiscovered:
+            return .waitingForPhone
         case .noDevice:
             return .waitingForCable
         case .attachedNotAnswering:
@@ -76,6 +92,8 @@ public enum LinkStatus: Sendable, Equatable {
     /// be added without a sentence to go with it.
     public var headline: String {
         switch self {
+        case .accessPointDown: "UpLink network is not running"
+        case .waitingForPhone: "Waiting for iPhone to join"
         case .waitingForCable: "Waiting for USB connection"
         case .deviceNotResponding: "iPhone connected — not answering"
         case .deviceNotPaired: "iPhone connected — not paired"
@@ -91,6 +109,8 @@ public enum LinkStatus: Sendable, Equatable {
     /// type was written to replace.
     public var detail: String {
         switch self {
+        case .accessPointDown: "Open UpLink on this Mac and turn the network back on"
+        case .waitingForPhone: "Open UpLink on your iPhone and tap Connect"
         case .waitingForCable: "Connect your iPhone to this Mac with a cable"
         case .deviceNotResponding: "Open UpLink on your iPhone and turn the bridge on"
         case .deviceNotPaired: "Show a pairing code, then type it on your iPhone"

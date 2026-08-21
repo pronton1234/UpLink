@@ -18,6 +18,12 @@ import UpLinkKit
 enum MacBridgeStatus: Equatable {
     case installingExtension
     case needsApproval
+    /// The Mac is not hosting its access point, so there is no link at all.
+    /// The only state here the user can personally fix, which is why it gets
+    /// an action rather than a description.
+    case accessPointDown
+    /// The access point is up and no phone has joined it yet.
+    case waitingForPhone
     /// No cabled iPhone attached.
     case waitingForCable
     /// Attached, but nothing answered on either UpLink port.
@@ -159,6 +165,8 @@ final class MenuBarModel {
         switch status {
         case .installingExtension: "Installing…"
         case .needsApproval: "Approval needed in System Settings"
+        case .accessPointDown: LinkStatus.accessPointDown.headline
+        case .waitingForPhone: LinkStatus.waitingForPhone.headline
         case .waitingForCable: LinkStatus.waitingForCable.headline
         case .deviceNotResponding: LinkStatus.deviceNotResponding.headline
         case .deviceNotPaired: LinkStatus.deviceNotPaired.headline
@@ -177,6 +185,8 @@ final class MenuBarModel {
             "Setting up network routing"
         case .needsApproval:
             "System Settings → General → Login Items & Extensions → Network Extensions"
+        case .accessPointDown: LinkStatus.accessPointDown.detail
+        case .waitingForPhone: LinkStatus.waitingForPhone.detail
         case .waitingForCable: LinkStatus.waitingForCable.detail
         case .deviceNotResponding: LinkStatus.deviceNotResponding.detail
         case .deviceNotPaired: LinkStatus.deviceNotPaired.detail
@@ -1053,6 +1063,8 @@ final class MenuBarModel {
             userDisconnected: userDisconnected,
             pairingRefused: pairingRefused
         ) {
+        case .accessPointDown: new = .accessPointDown
+        case .waitingForPhone: new = .waitingForPhone
         case .waitingForCable: new = .waitingForCable
         case .deviceNotResponding: new = .deviceNotResponding
         case .deviceNotPaired: new = .deviceNotPaired
