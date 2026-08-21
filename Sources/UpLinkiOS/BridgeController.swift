@@ -46,6 +46,22 @@ final class BridgeController {
     /// read off the Mac.
     var isPairing = false
 
+    /// Set when the bridge cannot start because nobody has told this phone the
+    /// Mac network's password yet. Asked once; every start after that is a tap.
+    var needsNetworkPassword = false
+
+    private static let passwordKey = "UpLinkNetworkPassword"
+
+    /// The Mac network's password, as the user typed it once.
+    ///
+    /// It has to be asked for rather than discovered. macOS keeps the hosted
+    /// network's password where SIP forbids reading it even as root, so the Mac
+    /// cannot look it up to send here — see AccessPointJoin.
+    var networkPassword: String? {
+        get { UserDefaults.standard.string(forKey: Self.passwordKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.passwordKey) }
+    }
+
     /// The phone drives every session, and until now it did so in total
     /// silence: 370 lines with not one log call. When autoconnect failed the
     /// only trace was a `state` change nobody could see from a script, so a
@@ -274,6 +290,27 @@ final class BridgeController {
         do {
             await prepare()
             guard let manager else { throw BridgeError.noManager }
+
+            // JOIN FIRST, THEN TUNNEL. The Mac is only reachable over the
+            // network it hosts, so starting the tunnel before joining gives the
+            // extension a listener nothing can dial — which looks exactly like
+            // a Mac that is not running.
+            //
+            // This is the step that makes the whole thing one tap. Without it
+            // the user joins the network by hand in Settings first, which is
+            // the friction the product exists to remove.
+            if let password = networkPassword {
+                do {
+                    try await AccessPointJoin.join(passphrase: password)
+                } catch {
+                    // Reported, not fatal: the phone may already be on the
+                    // network, or on one whose name does not match the prefix.
+                    // The dial below is what actually decides.
+                    log.error("join: \(String(describing: error), privacy: .public)")
+                }
+            } else {
+                needsNetworkPassword = true
+            }
 
             let proto = NETunnelProviderProtocol()
             proto.providerBundleIdentifier = "com.uplink.app.tunnel"

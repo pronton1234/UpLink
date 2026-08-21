@@ -66,7 +66,24 @@ struct ContentView: View {
         .sheet(isPresented: $controller.isPairing) {
             PairingSheet(controller: controller)
         }
+        // Asked once, and only because it cannot be discovered: macOS keeps the
+        // hosted network's password where SIP forbids reading it even as root,
+        // so the Mac has no way to send it here. Every start after this is a
+        // single tap.
+        .alert("UpLink network password", isPresented: $controller.needsNetworkPassword) {
+            SecureField("Password", text: $typedNetworkPassword)
+            Button("Save") {
+                controller.networkPassword = typedNetworkPassword
+                typedNetworkPassword = ""
+                Task { await controller.startBridge() }
+            }
+            Button("Cancel", role: .cancel) { typedNetworkPassword = "" }
+        } message: {
+            Text("Enter the Wi-Fi password you set for Internet Sharing on your Mac. UpLink needs it to join your Mac's network for you.")
+        }
     }
+
+    @State private var typedNetworkPassword = ""
 
     private var backgroundGradient: LinearGradient {
         LinearGradient(

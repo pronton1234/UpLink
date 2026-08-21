@@ -36,6 +36,18 @@ enum AccessPointJoin {
     /// next time the Mac is in range. That is the whole point: in the car this
     /// should require no interaction at all, and a join that had to be repeated
     /// by hand would put the friction straight back.
+    /// Joins using only a passphrase.
+    ///
+    /// There is no SSID parameter because there is no SSID to pass: the match
+    /// is on a fixed prefix, and the exact name is a thing neither device can
+    /// learn. Taking a full credentials value here would mean constructing one
+    /// with an empty name at every call site, which reads like an oversight.
+    static func join(passphrase: String) async throws {
+        try await join(AccessPointCredentials(
+            ssid: AccessPointCredentials.ssidPrefix, passphrase: passphrase
+        ))
+    }
+
     static func join(_ credentials: AccessPointCredentials) async throws {
         // JOINED BY PREFIX, NOT BY EXACT NAME, and that is forced rather than
         // preferred.
