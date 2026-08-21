@@ -67,67 +67,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // there is nothing being taken away by hosting continuously. Stopping
         // stays available in the menu for when the user genuinely wants the
         // radio back.
-        // OFF BY DEFAULT, AND THAT IS NOT CAUTION.
-        //
-        // Creating a CBPeripheralManager here made TCC abort the process on
-        // launch — SIGABRT, "must contain an NSBluetoothAlwaysUsageDescription
-        // key" — with that key present in the installed Info.plist, the bundle
-        // signature valid, and a clean reinstall making no difference. A TCC
-        // abort cannot be caught, so a beacon that trips it does not degrade,
-        // it takes the whole app down: no hosting, no peer announcement, no
-        // menu bar. The Mac app crash-looped for an hour that way while every
-        // symptom looked like a bridge problem.
-        //
-        // So the doorbell is behind a switch until it can be brought up without
-        // risking the app. Everything else works without it; only "start the
-        // Mac from the phone" is lost, and a Mac that runs is worth more than
-        // a feature that stops it running.
-        if UserDefaults.standard.bool(forKey: "UpLinkEnableBeacon") {
-            startBeacon()
-        } else {
-            logAccessPoint.error("beacon disabled — set UpLinkEnableBeacon to turn it on")
-        }
-
-        // NO TIMER HERE, DELIBERATELY, and it was here for four hours.
-        //
-        // It re-raised the access point whenever it looked down, so that a Mac
-        // in the back of a car could recover one that had genuinely failed.
-        // Raising is not idempotent: each one re-applies the sharing
-        // configuration and macOS rebuilds the access point from scratch,
-        // dropping every client. A timer firing on its own schedule therefore
-        // produced exactly what the user reported — Internet Sharing switching
-        // on and off with no discernible cause — and it did that to sessions
-        // that were carrying real traffic.
-        //
-        // It existed only because the phone had no way to ask the Mac to start.
-        // It does now, over Bluetooth, and that is a deterministic request from
-        // a person rather than a guess from a timer. Nothing is lost: an access
-        // point that fails while nobody is asking for it is repaired the moment
-        // somebody does.
-
-        model.onCableRemoved = { [weak self] in
-            self?.notifyCableRemoved()
-        }
-
-        model.observe { [weak self] in
-            Task { @MainActor in self?.refreshStatusItem() }
-        }
-
-        model.start()
-
-        // The access point can be turned on or off in System Settings without
-        // us, and a menu still offering "Start" for a running network is how
-        // the user ends up clicking it five times. Cheap enough to just ask.
-        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.refreshAccessPointState()
-                // The phone can join at any moment, and joining is the only
-                // signal that it is reachable. Re-announcing is idempotent —
-                // the extension ignores a repeat of what it is already dialling.
-                await self?.model.announcePeerIfPossible()
-            }
-        }
+        startBeaconUnlessItCrashedLastTime()
     }
+
+    /// Starts the Bluetooth doorbell, at most once per build if it aborts.
+    ///
+    /// **A TCC abort cannot be caught.** Creating a `CBPeripheralManager` here
+    /// once killed the process at launch — SIGABRT, "must contain an
+    /// NSBluetoothAlwaysUsageDescription key" — with that key present in the
+    /// installed Info.plist, the signature valid, nothing for `tccutil` to
+    /// reset, and a clean reinstall making no difference. Whatever the cause,
+    /// the failure mode is fatal and silent, and an app that dies at launch has
+    /// no menu bar, hosts nothing, and announces no peer: every symptom then
+    /// looks like a bridge fault. An hour was spent there.
+    ///
+    /// So the attempt is recorded before it is made and confirmed after it
+    /// succeeds. A build that crashed on its last attempt does not try again —
+    /// the doorbell is lost, which costs "start the Mac from the phone", and
+    /// the app runs, which costs nothing. One crash is a fact to investigate;
+    /// a crash loop is a machine that cannot be used.
+    private func startBeaconUnlessItCrashedLastTime() {
+        let defaults = UserDefaults.standard
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+
+        if defaults.string(forKey: "UpLinkBeaconAttempted") == build,
+           defaults.string(forKey: "UpLinkBeaconSurvived") != build {
+            logAccessPoint.error("beacon aborted on its last attempt in this build — not retrying")
+            return
+        }
+
+        // Written and flushed BEFORE the risky call, because the process may
+        // not survive to write anything afterwards.
+        defaults.set(build, forKey: "UpLinkBeaconAttempted")
+        defaults.removeObject(forKey: "UpLinkBeaconSurvived")
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication)
+
+        startBeacon()
+
+        // Reaching here means CoreBluetooth was constructed without aborting.
+        defaults.set(build, forKey: "UpLinkBeaconSurvived")
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication)
+    }
+
 
     // MARK: The doorbell
 
