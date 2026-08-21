@@ -61,7 +61,12 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             // See `refreshFromStore`: a launch before the device's first unlock
             // reads an empty keychain and nothing looked again.
-            if phase == .active { controller.refreshFromStore() }
+            if phase == .active {
+                controller.refreshFromStore()
+                // Opening the app IS the request. With a paired Mac and a
+                // stored password there is nothing else it could mean.
+                Task { await controller.connectIfReady() }
+            }
         }
         .sheet(isPresented: $controller.isPairing) {
             PairingSheet(controller: controller)

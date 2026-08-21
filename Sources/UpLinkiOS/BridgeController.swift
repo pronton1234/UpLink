@@ -51,6 +51,36 @@ final class BridgeController {
     var needsNetworkPassword = false
 
     private static let passwordKey = "UpLinkNetworkPassword"
+    private static let turnedOffKey = "UpLinkUserTurnedOff"
+
+    /// Whether the user's last deliberate act was to switch the bridge off.
+    ///
+    /// Remembered so that reconnecting can be automatic without ever overriding
+    /// a choice: an app that switches itself back on after being switched off
+    /// is not convenient, it is disobedient.
+    private var userTurnedOff: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.turnedOffKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.turnedOffKey) }
+    }
+
+    /// Brings the bridge up on launch, without being asked.
+    ///
+    /// The product's whole claim is a Mac in the back of a car and no
+    /// interaction beyond picking up the phone. Two taps was already close;
+    /// this makes it none — open the app and it connects, because there is
+    /// nothing else the user could plausibly want when they open it with a
+    /// paired Mac and a stored password.
+    ///
+    /// Deliberately silent about failure. If the Mac is not there, the ordinary
+    /// waiting state says so, and an alert on launch would be noise every time
+    /// the app is opened out of range.
+    func connectIfReady() async {
+        guard !userTurnedOff else { return }
+        guard !pairedDevices.isEmpty, networkPassword != nil else { return }
+        guard case .idle = state else { return }
+        diagnostics.write("auto-connect: paired Mac and password present")
+        await startBridge()
+    }
 
     /// The Mac network's password, as the user typed it once.
     ///
@@ -295,6 +325,7 @@ final class BridgeController {
     /// something before any pairing exists, so the listener must come up
     /// unpaired and refuse every handshake until a code is typed.
     func startBridge() async {
+        userTurnedOff = false
         do {
             await prepare()
             guard let manager else { throw BridgeError.noManager }
@@ -378,6 +409,7 @@ final class BridgeController {
 
 
     func disconnect() {
+        userTurnedOff = true
         statusTask?.cancel()
         statusTask = nil
         missedStatusReplies = 0
