@@ -22,6 +22,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let model = MenuBarModel()
     private let accessPoint = AccessPointHost()
+    /// Last known access-point state, refreshed off the main thread. The menu
+    /// is rebuilt on every open, and asking the helper synchronously there
+    /// would block the menu on an XPC round trip.
+    private var accessPointIsUp = false
+    private var accessPointBusy = false
 
     static func main() {
         let delegate = AppDelegate()
@@ -42,6 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Registering does not raise the access point. That is deliberate:
         // installing the app should not silently take over the Wi-Fi radio.
         accessPoint.register()
+        refreshAccessPointState()
 
         model.onCableRemoved = { [weak self] in
             self?.notifyCableRemoved()
@@ -52,6 +58,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         model.start()
+    }
+
+    // MARK: The access point
+
+    /// Raises or lowers the Mac's network.
+    ///
+    /// Hosting takes the Wi-Fi radio, so this is never done implicitly — not on
+    /// launch, not on pairing. It is one deliberate action with one obvious
+    /// inverse, which is the same rule Disconnect had to learn: an action with
+    /// no inverse in the UI is a bug, not a missing feature.
+    @objc private func toggleAccessPoint() {
+        guard !accessPointBusy else { return }
+        accessPointBusy = true
+        refreshStatusItem()
+
+        Task { @MainActor in
+            let failure = accessPointIsUp ? await accessPoint.lower() : await accessPoint.raise()
+            accessPointBusy = false
+
+            if let failure {
+                // Said out loud rather than logged and swallowed. "Not
+                // bridging" with no cause is the failure LinkStatus exists to
+                // prevent, and this is the one cause the user can act on.
+                let alert = NSAlert()
+                alert.messageText = accessPointIsUp
+                    ? "Could not stop the UpLink network"
+                    : "Could not start the UpLink network"
+                alert.informativeText = failure
+                alert.runModal()
+            }
+
+            // Read back from the interfaces rather than assuming the call did
+            // what it said. The preference file is input, not output, and has
+            // been observed disagreeing with what is actually running.
+            accessPointIsUp = await accessPoint.isUp()
+            refreshStatusItem()
+        }
+    }
+
+    private func refreshAccessPointState() {
+        Task { @MainActor in
+            let up = await accessPoint.isUp()
+            guard up != accessPointIsUp else { return }
+            accessPointIsUp = up
+            refreshStatusItem()
+        }
     }
 
     // MARK: Status item
@@ -130,6 +182,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSMenuItem(title: "Disconnect", action: #selector(disconnect), keyEquivalent: "")
             )
         }
+
+        // The access point is the one thing in this menu the user can act on
+        // that is not about the phone. It is listed first for that reason:
+        // with the network down, nothing else in here can work.
+        let apTitle: String
+        if accessPointBusy {
+            apTitle = "Working…"
+        } else if accessPointIsUp {
+            apTitle = "Stop “\(accessPoint.credentials.ssid)”"
+        } else {
+            apTitle = "Start “\(accessPoint.credentials.ssid)”"
+        }
+        let apItem = NSMenuItem(
+            title: apTitle, action: #selector(toggleAccessPoint), keyEquivalent: ""
+        )
+        apItem.isEnabled = !accessPointBusy
+        menu.addItem(apItem)
+
+        menu.addItem(.separator())
 
         let codeItem = NSMenuItem(
             title: "Show Pairing Code…", action: #selector(showPairingCode), keyEquivalent: ""

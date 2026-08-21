@@ -16,6 +16,43 @@ final class AccessPointHost {
 
     private var connection: NSXPCConnection?
 
+    private static let ssidKey = "UpLinkAccessPointSSID"
+    private static let passphraseKey = "UpLinkAccessPointPassphrase"
+    private static let identityKey = "UpLinkAccessPointIdentity"
+
+    /// The network this Mac hosts. Generated once and then stable forever.
+    ///
+    /// Stability is the whole point rather than tidiness: iOS keys a saved
+    /// hotspot configuration by SSID, so a name that changed would silently
+    /// stop the phone re-joining on its own — and re-joining on its own is the
+    /// behaviour the product is built around. Regenerating the passphrase would
+    /// break it the same way, from the other end.
+    var credentials: AccessPointCredentials {
+        let defaults = UserDefaults.standard
+        if let ssid = defaults.string(forKey: Self.ssidKey),
+           let passphrase = defaults.string(forKey: Self.passphraseKey) {
+            return AccessPointCredentials(ssid: ssid, passphrase: passphrase)
+        }
+
+        // A stable per-Mac identity, so the SSID is this Mac's and not a
+        // constant two UpLink Macs in range would both answer to.
+        let identity = defaults.string(forKey: Self.identityKey)
+            ?? UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        defaults.set(identity, forKey: Self.identityKey)
+
+        let created = AccessPointCredentials(
+            ssid: AccessPointCredentials.ssid(forFingerprint: identity),
+            passphrase: AccessPointCredentials.generatePassphrase()
+        )
+        defaults.set(created.ssid, forKey: Self.ssidKey)
+        defaults.set(created.passphrase, forKey: Self.passphraseKey)
+        log.info("access point credentials created for \(created.ssid, privacy: .public)")
+        return created
+    }
+
+    /// Raises the access point using this Mac's own credentials.
+    func raise() async -> String? { await raise(credentials) }
+
     /// Whether the helper is installed and approved.
     var isRegistered: Bool {
         SMAppService.daemon(plistName: Self.plistName).status == .enabled
