@@ -11,7 +11,8 @@ struct AccessPointConfigurationTests {
             passphrase: "correct-horse-battery",
             sourceServiceID: "5F2E593C-4D8D-4175-AC49-2A8C56C10587",
             sharingDeviceKey: "en0",
-            sourceName: "UpLink Route"
+            sourceName: "UpLink Route",
+            sourceDevice: "utun5"
         )
     }
 

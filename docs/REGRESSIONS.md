@@ -941,3 +941,36 @@ precisely what made this defect possible.
 **Rule this encodes.** Two failures in one run both took the shape "the artefact
 looks right and the system disagrees". Confirm a system change by asking the
 system, never by reading back the file you wrote.
+
+### The same run, one layer further down — a VPN has no device
+
+With SIP understood and the merge fixed, the access point still did not start —
+and this time it took the Wi-Fi radio on its way to failing, which is the worst
+shape available: from the outside it looks like it is working. The Mac spent the
+whole attempt hunting for networks that no longer existed, because its radio was
+gone and nothing had replaced it.
+
+```
+[com.apple.NetworkSharing:preference] AP stopped
+[com.apple.NetworkSharing:preference] external interface: (null)
+[com.apple.NetworkSharing:preference] sharing started on 0 interfaces
+```
+
+`en0` was `inactive` for 40 of the recorded samples and `InternetSharing` was
+`running` for 50 of them, so every outward sign said the mechanism had engaged.
+
+The source being shared is the product's own route tunnel, which is a **VPN
+service**, and `preferences.plist` records a VPN's interface as
+`Type: VPN, DeviceName: None`. So `PrimaryInterface.Device` cannot be carried
+forward from stored configuration or merged from what is on disk: it does not
+exist until the tunnel is running. The live value is in the dynamic store, at
+`State:/Network/Service/<serviceID>/IPv4` → `InterfaceName` (here `utun5`).
+
+| Test | Guards against |
+| --- | --- |
+| `SharingSourceDeviceRegressionTests` | An empty or stale `PrimaryInterface.Device`. Pins that the live device is always written, that a stored `""` is replaced rather than merged forward, and that a device from a previous tunnel is replaced too — `utun` numbering is not stable across restarts. |
+
+**Rule this encodes.** Three failures in one run, each one layer beneath the
+last, and all three looked correct from the artefact. Preferences describe
+configuration; only the dynamic store describes what is *running*. Anything
+naming a live interface has to come from the latter.

@@ -16,6 +16,7 @@ enum AccessPointControl {
     enum Failure: Error, CustomStringConvertible {
         case noWiFiInterface
         case noSourceService
+        case sourceNotRunning
         case sessionFailed
         case lockFailed
         case commitFailed(String)
@@ -25,6 +26,7 @@ enum AccessPointControl {
             switch self {
             case .noWiFiInterface: "this Mac reports no Wi-Fi interface"
             case .noSourceService: "no UpLink Route service to share from — is the route tunnel installed?"
+            case .sourceNotRunning: "the UpLink Route tunnel is not running, so there is nothing to share from"
             case .sessionFailed: "could not open the Internet Sharing preferences"
             case .lockFailed: "another process is holding the network preferences"
             case let .commitFailed(why): "could not save the sharing configuration: \(why)"
@@ -51,13 +53,20 @@ enum AccessPointControl {
         guard let sourceName = serviceName(for: service) else {
             throw Failure.noSourceService
         }
+        // The live device, not a stored one. See AccessPointConfiguration's
+        // sourceDevice: a VPN service has no static device, and an empty one
+        // costs the Wi-Fi radio for nothing.
+        guard let sourceDevice = liveDevice(for: service) else {
+            throw Failure.sourceNotRunning
+        }
 
         let configuration = AccessPointConfiguration(
             ssid: ssid,
             passphrase: passphrase,
             sourceServiceID: service,
             sharingDeviceKey: device,
-            sourceName: sourceName
+            sourceName: sourceName,
+            sourceDevice: sourceDevice
         )
 
         log.info("raising access point on \(device, privacy: .public) from \(service, privacy: .public)")
@@ -185,6 +194,22 @@ enum AccessPointControl {
             return SCNetworkServiceGetName(service) as String?
         }
         return nil
+    }
+
+    /// The BSD interface a service is on right now.
+    ///
+    /// Read from the dynamic store rather than from preferences, because for a
+    /// VPN the answer does not exist in preferences at all — `DeviceName` there
+    /// is `None`, and the real device is assigned when the tunnel starts.
+    private static func liveDevice(for serviceID: String) -> String? {
+        guard let store = SCDynamicStoreCreate(nil, "UpLink" as CFString, nil, nil) else {
+            return nil
+        }
+        let key = "State:/Network/Service/\(serviceID)/IPv4" as CFString
+        guard let entry = SCDynamicStoreCopyValue(store, key) as? [String: Any] else {
+            return nil
+        }
+        return entry["InterfaceName"] as? String
     }
 
     private static func scError() -> String {

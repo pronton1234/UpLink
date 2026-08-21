@@ -49,18 +49,36 @@ public struct AccessPointConfiguration: Sendable, Equatable {
     /// able to repair its own past mistake rather than needing System Settings.
     public let sourceName: String
 
+    /// BSD name of the interface the source service is **currently** on, e.g.
+    /// `utun5`.
+    ///
+    /// MEASURED 2026-08-20, and the reason the access point would not start
+    /// even with every other field correct. The source here is a VPN service,
+    /// and a VPN has no static device: `preferences.plist` records its
+    /// interface as `Type: VPN, DeviceName: None`. So `PrimaryInterface.Device`
+    /// cannot be carried forward from configuration — it only exists at
+    /// runtime, in `State:/Network/Service/<id>/IPv4` → `InterfaceName`.
+    ///
+    /// Left empty, configd resolves the source and then reports
+    /// `external interface: (null)` and `sharing started on 0 interfaces`,
+    /// having taken the Wi-Fi radio on the way. That is the worst shape of
+    /// failure available: it looks like it is working.
+    public let sourceDevice: String
+
     public init(
         ssid: String,
         passphrase: String,
         sourceServiceID: String,
         sharingDeviceKey: String,
-        sourceName: String
+        sourceName: String,
+        sourceDevice: String
     ) {
         self.ssid = ssid
         self.passphrase = passphrase
         self.sourceServiceID = sourceServiceID
         self.sharingDeviceKey = sharingDeviceKey
         self.sourceName = sourceName
+        self.sourceDevice = sourceDevice
     }
 
     /// The configuration **merged onto** whatever is already there.
@@ -94,13 +112,12 @@ public struct AccessPointConfiguration: Sendable, Equatable {
         // the dead-end tunnel would put internet behind the access point.
         var primary = nat["PrimaryInterface"] as? [String: Any] ?? [:]
         primary["Enabled"] = 1
-        // Rebuilt when absent rather than only enabled when present. Device and
-        // HardwareKey are empty in this Mac's captured working configuration —
-        // the name is what identifies the service — so they are filled only to
-        // keep the dictionary the shape configd expects.
+        // Always set, never merely carried forward. The stored value is empty
+        // for a VPN source and an empty Device is what makes configd report
+        // `external interface: (null)` — after it has taken the radio.
+        primary["Device"] = sourceDevice
         if primary["PrimaryUserReadable"] == nil {
             primary["PrimaryUserReadable"] = sourceName
-            primary["Device"] = primary["Device"] ?? ""
             primary["HardwareKey"] = primary["HardwareKey"] ?? ""
         }
         nat["PrimaryInterface"] = primary
