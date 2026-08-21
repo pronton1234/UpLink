@@ -73,6 +73,12 @@ final class BridgeController {
     /// memory ring buffer and are the first thing evicted by a burst, which is
     /// exactly when they are needed.
     private let log = Logger(subsystem: UpLinkIdentifiers.logSubsystem, category: "bridge")
+    /// The same shared-container log the extension writes to.
+    ///
+    /// The app's own os.Logger lines cannot be read back off the device without
+    /// a cable, which is exactly what this bearer removes — so anything worth
+    /// knowing after the fact has to go here instead.
+    private let diagnostics = PhoneDiagnosticLog.shared
 
     private var manager: NETunnelProviderManager?
     private let store = PairedDeviceStore()
@@ -302,13 +308,18 @@ final class BridgeController {
             if let password = networkPassword {
                 do {
                     try await AccessPointJoin.join(passphrase: password)
+                    diagnostics.write("join: OK (prefix \(AccessPointCredentials.ssidPrefix))")
                 } catch {
-                    // Reported, not fatal: the phone may already be on the
-                    // network, or on one whose name does not match the prefix.
-                    // The dial below is what actually decides.
+                    // Written where it can be read back. A join that fails
+                    // silently leaves the phone off the network entirely while
+                    // the Mac goes on dialling the address in a DHCP lease that
+                    // outlived the association — which reads as a listener
+                    // problem and is not one.
+                    diagnostics.write("join FAILED: \(error)")
                     log.error("join: \(String(describing: error), privacy: .public)")
                 }
             } else {
+                diagnostics.write("join SKIPPED: no network password stored yet")
                 needsNetworkPassword = true
             }
 
