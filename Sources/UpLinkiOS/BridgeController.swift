@@ -16,7 +16,7 @@ enum BridgeState: Equatable {
     case needsPermission
     /// The bridge is switched off. Nothing is listening.
     case idle
-    /// Listening, with no Mac connected. Plug the cable in.
+    /// Listening, with no Mac connected. Start the network on the Mac.
     case waitingForMac
     case connected(peer: String, egress: EgressInterface)
     case failed(String)
@@ -46,6 +46,53 @@ final class BridgeController {
     /// read off the Mac.
     var isPairing = false
 
+    /// Set when the bridge cannot start because nobody has told this phone the
+    /// Mac network's password yet. Asked once; every start after that is a tap.
+    var needsNetworkPassword = false
+
+    private static let passwordKey = "UpLinkNetworkPassword"
+    /// Whether the user switched the bridge off **during this run of the app**.
+    ///
+    /// Deliberately not persisted, and the distinction matters. Auto-connect
+    /// must never override a choice the user just made — switching itself back
+    /// on thirty seconds after being switched off would be disobedient. But
+    /// remembering it forever is a different mistake: it makes Turn Off a trap
+    /// that silently disables auto-connect for every future launch, so opening
+    /// the app does nothing and nothing says why.
+    ///
+    /// Opening the app IS the request. Within one run, Off means off; a fresh
+    /// launch is a fresh ask.
+    private var userTurnedOff = false
+
+    /// Brings the bridge up on launch, without being asked.
+    ///
+    /// The product's whole claim is a Mac in the back of a car and no
+    /// interaction beyond picking up the phone. Two taps was already close;
+    /// this makes it none — open the app and it connects, because there is
+    /// nothing else the user could plausibly want when they open it with a
+    /// paired Mac and a stored password.
+    ///
+    /// Deliberately silent about failure. If the Mac is not there, the ordinary
+    /// waiting state says so, and an alert on launch would be noise every time
+    /// the app is opened out of range.
+    func connectIfReady() async {
+        guard !userTurnedOff else { return }
+        guard !pairedDevices.isEmpty, networkPassword != nil else { return }
+        guard case .idle = state else { return }
+        diagnostics.write("auto-connect: paired Mac and password present")
+        await startBridge()
+    }
+
+    /// The Mac network's password, as the user typed it once.
+    ///
+    /// It has to be asked for rather than discovered. macOS keeps the hosted
+    /// network's password where SIP forbids reading it even as root, so the Mac
+    /// cannot look it up to send here — see AccessPointJoin.
+    var networkPassword: String? {
+        get { UserDefaults.standard.string(forKey: Self.passwordKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.passwordKey) }
+    }
+
     /// The phone drives every session, and until now it did so in total
     /// silence: 370 lines with not one log call. When autoconnect failed the
     /// only trace was a `state` change nobody could see from a script, so a
@@ -57,6 +104,14 @@ final class BridgeController {
     /// memory ring buffer and are the first thing evicted by a burst, which is
     /// exactly when they are needed.
     private let log = Logger(subsystem: UpLinkIdentifiers.logSubsystem, category: "bridge")
+    /// The same shared-container log the extension writes to.
+    ///
+    /// The app's own os.Logger lines cannot be read back off the device without
+    /// a cable, which is exactly what this bearer removes — so anything worth
+    /// knowing after the fact has to go here instead.
+    private let diagnostics = PhoneDiagnosticLog.shared
+    /// The Bluetooth doorbell. See ``AccessPointRemote``.
+    private let remote = AccessPointRemote()
 
     private var manager: NETunnelProviderManager?
     private let store = PairedDeviceStore()
@@ -212,7 +267,7 @@ final class BridgeController {
         log.error("""
             autoconnect: listening but no Mac dialled within 30s — \
             \(self.pairedDevices.count, privacy: .public) paired device(s); \
-            check the cable and that UpLink is running on the Mac
+            check the UpLink network is started and UpLink is running on the Mac
             """)
     }
 
@@ -271,9 +326,50 @@ final class BridgeController {
     /// something before any pairing exists, so the listener must come up
     /// unpaired and refuse every handshake until a code is typed.
     func startBridge() async {
+        userTurnedOff = false
         do {
             await prepare()
             guard let manager else { throw BridgeError.noManager }
+
+            // JOIN FIRST, THEN TUNNEL. The Mac is only reachable over the
+            // network it hosts, so starting the tunnel before joining gives the
+            // extension a listener nothing can dial — which looks exactly like
+            // a Mac that is not running.
+            //
+            // This is the step that makes the whole thing one tap. Without it
+            // the user joins the network by hand in Settings first, which is
+            // the friction the product exists to remove.
+            // RING THE DOORBELL FIRST. The Mac may not be hosting yet, and if it
+            // is not, no amount of joining will find a network. This is the one
+            // request that cannot travel over the access point, because the
+            // access point is what it is asking for.
+            let delivered = await remote.send(.raiseAccessPoint)
+            diagnostics.write(delivered
+                ? "remote: asked the Mac to start its network"
+                : "remote: no Mac answered over Bluetooth — trying the network anyway")
+
+            if let password = networkPassword {
+                do {
+                    // Retried, because raising takes several seconds: measured
+                    // 2026-08-20, bridge100 appeared about ten seconds after the
+                    // helper was asked. A single attempt lands in that gap and
+                    // fails with "no network name matched", which reads as a
+                    // wrong password and is not one.
+                    try await joinWithRetry(passphrase: password, attempts: delivered ? 8 : 2)
+                    diagnostics.write("join: OK (prefix \(AccessPointCredentials.ssidPrefix))")
+                } catch {
+                    // Written where it can be read back. A join that fails
+                    // silently leaves the phone off the network entirely while
+                    // the Mac goes on dialling the address in a DHCP lease that
+                    // outlived the association — which reads as a listener
+                    // problem and is not one.
+                    diagnostics.write("join FAILED: \(error)")
+                    log.error("join: \(String(describing: error), privacy: .public)")
+                }
+            } else {
+                diagnostics.write("join SKIPPED: no network password stored yet")
+                needsNetworkPassword = true
+            }
 
             let proto = NETunnelProviderProtocol()
             proto.providerBundleIdentifier = "com.uplink.app.tunnel"
@@ -303,6 +399,7 @@ final class BridgeController {
             // show a connection that did not exist.
             state = .waitingForMac
             startStatusPolling()
+            watchTunnelComesUp()
         } catch {
             state = .failed(error.localizedDescription)
         }
@@ -313,12 +410,26 @@ final class BridgeController {
 
 
     func disconnect() {
+        userTurnedOff = true
         statusTask?.cancel()
         statusTask = nil
         missedStatusReplies = 0
         activePeerFingerprint = nil
         manager?.connection.stopVPNTunnel()
         state = .idle
+
+        // Give the Mac its own Wi-Fi back.
+        //
+        // Sent over Bluetooth rather than the bridge, deliberately: the bridge
+        // is being torn down as this runs, so a message down it would race the
+        // teardown and lose. The doorbell is still there either way.
+        //
+        // Fire and forget. If the Mac does not hear it the worst case is an
+        // access point left running, which is the state it is designed to sit
+        // in anyway — never a failure the user has to act on.
+        Task { [remote] in
+            _ = await remote.send(.lowerAccessPoint)
+        }
     }
 
     /// Asks the extension what it is actually observing.
@@ -326,6 +437,69 @@ final class BridgeController {
     /// Provider messages are request/response only — the extension cannot push
     /// — so the app polls, exactly as the Mac's menu bar does. Once a second is
     /// imperceptible and keeps the warning honest.
+    /// Reports a tunnel that was accepted and never actually came up.
+    ///
+    /// `startVPNTunnel()` returning means the REQUEST was accepted, nothing
+    /// more — so the UI has always said "waiting for the Mac" from that moment.
+    /// When the extension then never launches, that sentence is wrong and never
+    /// changes, and the screen sits there indefinitely with no way to tell that
+    /// anything is wrong. Observed on hardware 2026-08-20: the Mac dialled
+    /// 192.168.2.2 and timed out every 12 seconds against a phone whose
+    /// listener had never started.
+    ///
+    /// **iOS runs one packet tunnel at a time.** Another VPN holding it is the
+    /// most common reason this happens, and it is invisible from inside this
+    /// app — we can see that ours did not start, not who has it. So the message
+    /// names the likely cause rather than asserting it.
+    private func watchTunnelComesUp() {
+        tunnelWatchTask?.cancel()
+        tunnelWatchTask = Task { [weak self] in
+            for _ in 0 ..< 15 {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, !Task.isCancelled else { return }
+                guard case .waitingForMac = state else { return }
+                switch manager?.connection.status {
+                case .connected, .connecting, .reasserting:
+                    return
+                default:
+                    continue
+                }
+            }
+            guard let self, case .waitingForMac = state else { return }
+            guard manager?.connection.status != .connected else { return }
+            log.error("tunnel never came up; status \(String(describing: self.manager?.connection.status), privacy: .public)")
+            state = .failed(
+                "UpLink could not start its network extension. iOS runs one VPN "
+                + "at a time — if another VPN is on, turn it off and try again."
+            )
+        }
+    }
+
+    private var tunnelWatchTaskStorage: Task<Void, Never>?
+    private var tunnelWatchTask: Task<Void, Never>? {
+        get { tunnelWatchTaskStorage }
+        set { tunnelWatchTaskStorage?.cancel(); tunnelWatchTaskStorage = newValue }
+    }
+
+    /// Joins, retrying while the Mac's network is still coming up.
+    private func joinWithRetry(passphrase: String, attempts: Int) async throws {
+        var lastError: Error?
+        for attempt in 1 ... max(1, attempts) {
+            do {
+                try await AccessPointJoin.join(passphrase: passphrase)
+                return
+            } catch {
+                lastError = error
+                // Only worth retrying while the network might still be
+                // appearing. A refused password will never become a right one.
+                if case AccessPointJoin.Failure.denied = error { throw error }
+                diagnostics.write("join attempt \(attempt) failed: \(error)")
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+        throw lastError ?? AccessPointJoin.Failure.failed("join did not succeed")
+    }
+
     private func startStatusPolling() {
         statusTask?.cancel()
         statusTask = Task { @MainActor [weak self] in

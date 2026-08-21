@@ -61,12 +61,34 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             // See `refreshFromStore`: a launch before the device's first unlock
             // reads an empty keychain and nothing looked again.
-            if phase == .active { controller.refreshFromStore() }
+            if phase == .active {
+                controller.refreshFromStore()
+                // Opening the app IS the request. With a paired Mac and a
+                // stored password there is nothing else it could mean.
+                Task { await controller.connectIfReady() }
+            }
         }
         .sheet(isPresented: $controller.isPairing) {
             PairingSheet(controller: controller)
         }
+        // Asked once, and only because it cannot be discovered: macOS keeps the
+        // hosted network's password where SIP forbids reading it even as root,
+        // so the Mac has no way to send it here. Every start after this is a
+        // single tap.
+        .alert("UpLink network password", isPresented: $controller.needsNetworkPassword) {
+            SecureField("Password", text: $typedNetworkPassword)
+            Button("Save") {
+                controller.networkPassword = typedNetworkPassword
+                typedNetworkPassword = ""
+                Task { await controller.startBridge() }
+            }
+            Button("Cancel", role: .cancel) { typedNetworkPassword = "" }
+        } message: {
+            Text("Enter the Wi-Fi password you set for Internet Sharing on your Mac. UpLink needs it to join your Mac's network for you.")
+        }
     }
+
+    @State private var typedNetworkPassword = ""
 
     private var backgroundGradient: LinearGradient {
         LinearGradient(
@@ -125,7 +147,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
 
                 if controller.pairedDevices.isEmpty {
-                    Text("No Macs yet. Connect the cable and pair to get started.")
+                    Text("No Macs yet. Start the UpLink network on your Mac and pair to get started.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .padding(.vertical, 10)
@@ -191,7 +213,7 @@ struct StatusDial: View {
         // fault and must not look like one — see `headline`.
         case .connected(_, .unknown): "antenna.radiowaves.left.and.right"
         case .connected: "exclamationmark.triangle"
-        case .waitingForMac: "cable.connector"
+        case .waitingForMac: "wifi"
         case .failed: "exclamationmark.triangle"
         case .needsPermission: "lock.shield"
         case .idle: "personalhotspot"
@@ -271,9 +293,9 @@ struct StatusCaption: View {
             // The one instruction that matters, and the one the old copy got
             // wrong: nothing is "found automatically" any more. The cable is
             // the whole mechanism.
-            "Connect this iPhone to your Mac with a cable. You can lock your phone once it's bridging."
+            "Join your Mac's UpLink network — tap Connect and this app does it. You can lock your phone once it's bridging."
         case .idle:
-            "Turn UpLink on, then connect the cable to your Mac."
+            "Turn UpLink on, then start the UpLink network from your Mac's menu bar."
         case .needsPermission:
             "iOS needs your permission to add a VPN configuration. UpLink uses it to keep running while the phone is locked — it does not send your traffic to a server."
         case let .failed(message):

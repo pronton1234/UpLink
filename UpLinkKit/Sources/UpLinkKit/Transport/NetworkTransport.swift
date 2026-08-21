@@ -135,7 +135,25 @@ public enum TransportParameters {
     /// Network.framework to wander onto. What remains is the TLS-PSK, which is
     /// still end to end between this process and the phone — the relay carries
     /// ciphertext it has no key for.
-    public static func session(psk: SymmetricKey, identity: String) -> NWParameters {
+    /// - Parameter boundTo: local address the dial must originate from, or nil
+    ///   to let the routing table decide.
+    ///
+    ///   MEASURED 2026-08-20, and the reason this parameter exists. The phone
+    ///   sits on the network the Mac hosts, at `192.168.2.2`. When the bridge
+    ///   interface is not fully up, that address falls through to the default
+    ///   route and the Mac sends the SYN to the HOME ROUTER:
+    ///
+    ///       route to phone: gateway: 192.168.1.254 interface: en0
+    ///
+    ///   which drops it, and the dial fails with POSIX 60 — operation timed
+    ///   out — indistinguishable from a phone that is not answering. Binding
+    ///   the source to the Mac's own address on the hosted network makes the
+    ///   wrong interface impossible rather than unlikely.
+    public static func session(
+        psk: SymmetricKey,
+        identity: String,
+        boundTo localAddress: String? = nil
+    ) -> NWParameters {
         let tls = NWProtocolTLS.Options()
 
         applyPSK(tls, psk: psk, identity: identity)
@@ -143,7 +161,37 @@ public enum TransportParameters {
 
         let parameters = NWParameters(tls: tls, tcp: Self.tcpOptions())
         parameters.preferNoProxies = true
+        if let localAddress {
+            parameters.requiredLocalEndpoint = .hostPort(
+                host: NWEndpoint.Host(localAddress), port: .any
+            )
+        }
         return parameters
+    }
+
+    /// The Mac's own address on the network it hosts, or nil when not hosting.
+    ///
+    /// Read from the interfaces every time rather than remembered: the bridge
+    /// comes and goes with the access point, and a stale address binds the dial
+    /// to something that no longer exists.
+    public static func hostedNetworkAddress(interface: String = "bridge100") -> String? {
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let first = addresses else { return nil }
+        defer { freeifaddrs(addresses) }
+
+        for pointer in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            guard String(cString: pointer.pointee.ifa_name) == interface,
+                  let socketAddress = pointer.pointee.ifa_addr,
+                  socketAddress.pointee.sa_family == UInt8(AF_INET)
+            else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(
+                socketAddress, socklen_t(socketAddress.pointee.sa_len),
+                &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST
+            ) == 0 else { continue }
+            return String(cString: host)
+        }
+        return nil
     }
 
     private static func tcpOptions() -> NWProtocolTCP.Options {
@@ -172,10 +220,15 @@ public enum TransportParameters {
     /// dialling a non-loopback address instead, this is the one line to change
     /// — and the trade being made is stated here so that change is a decision
     /// rather than a shrug.
+    /// - Parameter bearer: deliberately has no default. Getting this wrong
+    ///   binds the listener somewhere the Mac cannot reach it, and the symptom
+    ///   — a phone that is running perfectly and simply never answers — is one
+    ///   this project has already chased once. Every call site states it.
     public static func listener(
         sessionKeys: [(identity: String, key: SymmetricKey)],
         pairingKey: (identity: String, key: SymmetricKey)?,
-        port: UInt16
+        port: UInt16,
+        bearer: WirelessBearer
     ) -> NWParameters {
         let tls = NWProtocolTLS.Options()
 
@@ -187,7 +240,9 @@ public enum TransportParameters {
         applyPSKCiphersuite(tls)
 
         let parameters = NWParameters(tls: tls, tcp: Self.tcpOptions())
-        // BOTH lines are required, and that is measured, not assumed.
+
+        // OVER THE CABLE BOTH LINES ARE REQUIRED, and that is measured, not
+        // assumed.
         //
         // `requiredLocalEndpoint` pins the bind to loopback and the fixed port.
         // `acceptLocalOnly` reads like it means the same thing and its
@@ -196,11 +251,19 @@ public enum TransportParameters {
         // stopped establishing a session at all. Whatever it does here, the
         // listener does not accept the loopback connection without it.
         //
-        // Left in with the evidence attached rather than reasoned away again.
-        parameters.requiredLocalEndpoint = .hostPort(
-            host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port)!
-        )
-        parameters.acceptLocalOnly = true
+        // OVER THE ACCESS POINT BOTH ARE WRONG. The Mac dials the phone's
+        // address on the shared link, so a listener pinned to loopback is
+        // unreachable and one accepting local connections only refuses it.
+        // This is the change the note above anticipated — "if a device run ever
+        // shows the muxer dialling a non-loopback address instead, this is the
+        // one line to change" — reached because the muxer is no longer what
+        // dials, not because the redundancy argument was made a second time.
+        if bearer == .usbmux {
+            parameters.requiredLocalEndpoint = .hostPort(
+                host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port)!
+            )
+            parameters.acceptLocalOnly = true
+        }
         // The extension can be restarted while the old socket is still in
         // TIME_WAIT, and a fixed port cannot simply move to another number the
         // way the old ephemeral listener did.

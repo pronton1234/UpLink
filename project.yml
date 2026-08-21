@@ -45,11 +45,21 @@ targets:
           # "Extension not found in App bundle".
           destination: wrapper
           subpath: Contents/Library/SystemExtensions
+      - target: UpLinkHelper
+        embed: true
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/MacOS
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.uplink.app
         PRODUCT_NAME: UpLink
         INFOPLIST_FILE: Sources/UpLinkMac/Info.plist
+        # Names the icon set inside Sources/UpLinkMac/Assets.xcassets. Same trap
+        # as the iOS target: without it the catalog compiles, the build stays
+        # green, and only the Dock tells you the icon is missing.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_ENTITLEMENTS: Sources/UpLinkMac/UpLinkMac.entitlements
         # Off deliberately — a sandboxed app cannot install a system extension.
         # See UpLinkMac.entitlements.
@@ -64,6 +74,50 @@ targets:
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "Developer ID Application"
         PROVISIONING_PROFILE_SPECIFIER: "UpTime app"
+    postBuildScripts:
+      # SMAppService.daemon(plistName:) looks here and nowhere else. A missing
+      # plist fails at register() time, long after the build is green.
+      - name: Install the helper's launchd plist
+        script: |
+          DEST="$BUILT_PRODUCTS_DIR/$CONTENTS_FOLDER_PATH/Library/LaunchDaemons"
+          mkdir -p "$DEST"
+          cp "$SRCROOT/Sources/UpLinkHelper/com.uplink.app.helper.plist" "$DEST/"
+
+  # The privileged half. Exists because Internet Sharing has no public API and
+  # cannot be toggled from an app — driving it means writing com.apple.nat.plist
+  # and restarting com.apple.NetworkSharing, both of which need root.
+  UpLinkHelper:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Sources/UpLinkHelper
+        excludes:
+          - "com.uplink.app.helper.plist"
+    dependencies:
+      - package: UpLinkKit
+        product: UpLinkKit
+    settings:
+      base:
+        # SMAppService matches the daemon by this name, and the launchd plist's
+        # BundleProgram points at Contents/MacOS/<this>. The three have to agree
+        # or registration fails with a message that names none of them.
+        PRODUCT_NAME: com.uplink.app.helper
+        PRODUCT_BUNDLE_IDENTIFIER: com.uplink.app.helper
+        # Gives the tool an embedded Info.plist, which is what Apple's guidance
+        # for SMAppService daemons asks for.
+        #
+        # MEASURED, so nobody re-derives it: this does NOT change the signed
+        # identifier. `codesign` reports `Identifier=com.uplink.app` either way,
+        # because a bare Mach-O in Contents/MacOS is re-signed as nested code
+        # when the app bundle is signed and inherits the app's identifier. That
+        # is normal for an embedded daemon and is not what stops launchd finding
+        # the service — an unapproved SMAppService daemon is simply not loaded
+        # until the user enables it in Login Items.
+        CREATE_INFOPLIST_SECTION_IN_BINARY: YES
+        INFOPLIST_KEY_CFBundleIdentifier: com.uplink.app.helper
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Developer ID Application"
+        SKIP_INSTALL: YES
 
   UpLinkProxyExtension:
     type: system-extension
@@ -115,6 +169,10 @@ targets:
         INFOPLIST_FILE: Sources/UpLinkiOS/Info.plist
         CODE_SIGN_ENTITLEMENTS: Sources/UpLinkiOS/UpLinkiOS.entitlements
         TARGETED_DEVICE_FAMILY: "1,2"
+        # Names the icon set inside Sources/UpLinkiOS/Assets.xcassets. Without
+        # it the catalog still compiles and the app still ships the default
+        # blank icon — the build stays green and only the home screen tells you.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
 
   UpLinkTunnelExtension:
     type: app-extension

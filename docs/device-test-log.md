@@ -709,3 +709,36 @@ bridge defect — it refuses HTTP/3 regardless, which is why the bulk test uses
 `dl.google.com`. The first run against it also returned 138 bytes over BOTH
 QUIC and TCP, which was a missing `-L`, not a transport fault. Both traps are
 the same shape: a number that looks like a bridge failure until a control is run.
+
+## Wireless bearer — VERIFIED ON HARDWARE, 2026-08-21
+
+The Mac hosts a 5 GHz access point with nothing behind it, the phone joins it on
+its own, and the bridge carries the Mac's traffic out over cellular. No cable, no
+Personal Hotspot, and no interaction with the Mac at all.
+
+**Throughput, measured over the wireless bridge:**
+
+| | |
+| --- | --- |
+| Download, 25 MB | **156.46 Mbps** |
+| Download, 10 MB | 118.48 Mbps |
+| Upload, 5 MB | 36.55 Mbps |
+| TCP connect, Mac → phone → destination | 4.33 ms |
+
+**Faster than the cable**, whose baseline is 116–153 Mbps (2026-08-15). The
+wireless hop is not the bottleneck.
+
+Egress was `207.213.21.133`. The home ISP address is `108.83.4.21`, so this is
+the carrier — the traffic left over cellular rather than the Mac's own network,
+which is the claim the product exists to make.
+
+**Traffic actually carried in one session:** 277 completed TCP flows across
+Chrome, Discord, Firefox, VS Code, Notion, Claude Desktop and Claude Code, both
+IPv4 and IPv6, with individual transfers up to 85 KB. The access point held with
+`en0` inactive throughout and no oscillation.
+
+**How it is started:** the phone rings a Bluetooth LE doorbell, the Mac raises
+the access point, the phone joins by SSID prefix and brings its tunnel up. BLE
+carries one command byte and never data — see `RemoteCommand`.
+
+Re-run any time with `./scripts/verify-wireless.sh`.

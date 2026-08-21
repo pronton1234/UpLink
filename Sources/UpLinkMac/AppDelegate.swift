@@ -21,6 +21,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var devicesWindow: NSWindow?
 
     private let model = MenuBarModel()
+    private let accessPoint = AccessPointHost()
+    private var beacon: AccessPointBeacon?
+    /// Last known access-point state, refreshed off the main thread. The menu
+    /// is rebuilt on every open, and asking the helper synchronously there
+    /// would block the menu on an XPC round trip.
+    private var accessPointIsUp = false
+    private var accessPointBusy = false
 
     static func main() {
         let delegate = AppDelegate()
@@ -33,15 +40,317 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installStatusItem()
         requestNotificationPermission()
 
-        model.onCableRemoved = { [weak self] in
-            self?.notifyCableRemoved()
+        // Idempotent, so it is safe on every launch. The user approves the
+        // helper once, in the same System Settings panel that already approves
+        // the network extension — one more switch in a flow that already has
+        // one, rather than a new kind of ceremony.
+        //
+        // Registering does not raise the access point. That is deliberate:
+        // installing the app should not silently take over the Wi-Fi radio.
+        accessPoint.register()
+        // Report — never fix — a helper left over from an older build. See
+        // `reportIfStale`: the only restart an app can perform also returns the
+        // service to needing approval, which leaves no helper at all.
+        Task { @MainActor in
+            await accessPoint.reportIfStale()
+            refreshAccessPointState()
+            hostAccessPointIfNeeded()
         }
 
-        model.observe { [weak self] in
-            Task { @MainActor in self?.refreshStatusItem() }
-        }
-
+        // WITHOUT THIS THE APP DOES NOTHING AT ALL, and it was deleted by a
+        // tidy-up that removed an adjacent dead function and took 58 lines.
+        //
+        // `start()` is what brings up the route tunnel and the proxy extension
+        // and begins polling them. Without it the app launches, shows a menu
+        // bar, advertises over Bluetooth and answers the phone — while the
+        // route tunnel stays Disconnected, the extension never runs, and not a
+        // single IPC message is exchanged. Every symptom sits downstream: the
+        // phone joins, the Mac announces a peer nothing receives, no session
+        // forms, no flow is claimed, and the phone waits forever for a Mac that
+        // is running and idle.
         model.start()
+
+        // The doorbell the phone rings to start us. The phone cannot ask over
+        // the access point, because asking is what raises it.
+        startBeaconUnlessItCrashedLastTime()
+
+        // TELLING THE EXTENSION WHERE THE PHONE IS, which is a different job
+        // from hosting and must not share a timer with it again.
+        //
+        // These two lived in one block, and deleting that block to stop the
+        // access point being re-raised on a schedule silently took this with
+        // it. The Mac then never announced a peer, so the extension never
+        // dialled, so there was no session, so the proxy claimed no flows and
+        // every packet fell into the dead-end route tunnel — "route: packets
+        // 101 — flows the proxy did NOT claim". The bridge looked connected
+        // from the phone and carried nothing.
+        //
+        // This one is safe to repeat where the other was not: it sends an IPC
+        // message naming an address, and the extension ignores a repeat of what
+        // it is already dialling. Nothing is torn down and rebuilt.
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.refreshAccessPointState()
+                await self.model.announcePeerIfPossible()
+            }
+        }
+    }
+
+    /// Starts the Bluetooth doorbell, at most once per build if it aborts.
+    ///
+    /// **A TCC abort cannot be caught.** Creating a `CBPeripheralManager` here
+    /// once killed the process at launch — SIGABRT, "must contain an
+    /// NSBluetoothAlwaysUsageDescription key" — with that key present in the
+    /// installed Info.plist, the signature valid, nothing for `tccutil` to
+    /// reset, and a clean reinstall making no difference. Whatever the cause,
+    /// the failure mode is fatal and silent, and an app that dies at launch has
+    /// no menu bar, hosts nothing, and announces no peer: every symptom then
+    /// looks like a bridge fault. An hour was spent there.
+    ///
+    /// So the attempt is recorded before it is made and confirmed after it
+    /// succeeds. A build that crashed on its last attempt does not try again —
+    /// the doorbell is lost, which costs "start the Mac from the phone", and
+    /// the app runs, which costs nothing. One crash is a fact to investigate;
+    /// a crash loop is a machine that cannot be used.
+    private func startBeaconUnlessItCrashedLastTime() {
+        let defaults = UserDefaults.standard
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+
+        if defaults.string(forKey: "UpLinkBeaconAttempted") == build,
+           defaults.string(forKey: "UpLinkBeaconSurvived") != build {
+            logAccessPoint.error("beacon aborted on its last attempt in this build — not retrying")
+            return
+        }
+
+        // Written and flushed BEFORE the risky call, because the process may
+        // not survive to write anything afterwards.
+        defaults.set(build, forKey: "UpLinkBeaconAttempted")
+        defaults.removeObject(forKey: "UpLinkBeaconSurvived")
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication)
+
+        startBeacon()
+
+        // Reaching here means CoreBluetooth was constructed without aborting.
+        defaults.set(build, forKey: "UpLinkBeaconSurvived")
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication)
+    }
+
+
+    // MARK: The doorbell
+
+    /// Publishes the Bluetooth control channel the phone uses to start us.
+    ///
+    /// This is what makes the whole thing work from the phone alone. Everything
+    /// else the phone needs travels over the access point, and the access point
+    /// is the one thing that cannot be asked for that way.
+    private func startBeacon() {
+        let beacon = AccessPointBeacon(
+            onCommand: { [weak self] command in
+                guard let self else { return }
+                switch command {
+                case .raiseAccessPoint:
+                    // Clears an earlier Stop: the phone asking is unambiguously
+                    // "host again", and refusing on the strength of a switch
+                    // flipped hours ago would be the wrong kind of loyalty.
+                    accessPointStoppedByUser = false
+                    hostAccessPointIfNeeded()
+                case .lowerAccessPoint:
+                    guard accessPointIsUp else { return }
+                    toggleAccessPoint()
+                }
+            },
+            accessPointIsUp: { TransportParameters.hostedNetworkAddress() != nil }
+        )
+        beacon.start()
+        self.beacon = beacon
+
+        // Quiet while a bridge is live. Nothing needs the doorbell once the
+        // door is open.
+        model.observe { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                beacon.setSessionLive(self.model.status.isConnected)
+            }
+        }
+    }
+
+    // MARK: The access point
+
+    /// Brings the network up unless the user switched it off by hand.
+    ///
+    /// Deliberately not the same thing as `toggleAccessPoint`: this one never
+    /// takes the radio back from a user who asked for it, which is the
+    /// difference between a product that heals itself and one that fights you.
+    private func hostAccessPointIfNeeded() {
+        guard !accessPointStoppedByUser, !accessPointBusy else { return }
+        // NEVER while a session is live. Raising re-applies the Internet
+        // Sharing configuration, which restarts the access point and drops
+        // every client on it — so a re-host during a working bridge does not
+        // repair anything, it destroys the thing it was meant to protect.
+        guard !model.status.isConnected else { return }
+        if let lastRaise, Date().timeIntervalSince(lastRaise) < Self.raiseCooldown {
+            // Observed 00:14:33 and 00:14:37 — two raises four seconds apart,
+            // each restarting sharing, so the access point never had time to
+            // finish coming up before it was torn down again.
+            logAccessPoint.error("access point was raised recently — not raising again yet")
+            return
+        }
+        Task { @MainActor in
+            guard await !accessPoint.isUp() else {
+                if !accessPointIsUp { accessPointIsUp = true; refreshStatusItem() }
+                return
+            }
+
+            // NO "IS IT REALLY DOWN?" CHECK ANY MORE, and removing it was
+            // required rather than tidy.
+            //
+            // It existed to stop the periodic re-host from acting on a blip —
+            // the access point flaps briefly when the first client associates.
+            // With the timer gone, both remaining callers are somebody asking:
+            // the app launching, and the phone pressing Connect. Making a
+            // person ask twice is not caution, it is a bug, and this guard
+            // would have silently stopped the Mac hosting at launch at all.
+            accessPointBusy = true
+            lastRaise = Date()
+            refreshStatusItem()
+            let failure = await accessPoint.raise()
+            accessPointBusy = false
+            if let failure {
+                // Not an alert. This runs unattended and on a timer; a modal
+                // every thirty seconds would be worse than the fault.
+                logAccessPoint.error("auto-host failed: \(failure, privacy: .public)")
+            }
+            await settle(expecting: true)
+        }
+    }
+
+    private let logAccessPoint = Logger(subsystem: UpLinkIdentifiers.logSubsystem, category: "ap")
+    /// Set only by an explicit Stop, so automatic hosting never overrides a
+    /// deliberate choice.
+    private var accessPointStoppedByUser = false
+    /// When the access point was last asked to come up.
+    ///
+    /// Raising is not idempotent: it re-applies the sharing configuration and
+    /// macOS rebuilds the access point from scratch, dropping every client. So
+    /// two raises close together are strictly worse than one, and there are now
+    /// three callers — the launch, the timer, and the phone's doorbell — that
+    /// can all fire within seconds of each other.
+    private var lastRaise: Date?
+    /// Long enough to cover a raise actually completing: measured at about ten
+    /// seconds from the helper being asked to `bridge100` appearing, with the
+    /// interface settling for a few seconds after that.
+    private static let raiseCooldown: TimeInterval = 45
+
+    /// Raises or lowers the Mac's network.
+    ///
+    /// Hosting takes the Wi-Fi radio, so this is never done implicitly — not on
+    /// launch, not on pairing. It is one deliberate action with one obvious
+    /// inverse, which is the same rule Disconnect had to learn: an action with
+    /// no inverse in the UI is a bug, not a missing feature.
+    @objc private func toggleAccessPoint() {
+        guard !accessPointBusy else { return }
+        let wasUp = accessPointIsUp
+        // Remembered, so the thirty-second re-host does not undo a Stop the
+        // user just asked for.
+        accessPointStoppedByUser = wasUp
+        accessPointBusy = true
+        refreshStatusItem()
+
+        Task { @MainActor in
+            let failure = wasUp ? await accessPoint.lower() : await accessPoint.raise()
+            accessPointBusy = false
+
+            if let failure {
+                // Said out loud rather than logged and swallowed. "Not
+                // bridging" with no cause is the failure LinkStatus exists to
+                // prevent, and this is the one cause the user can act on.
+                let alert = NSAlert()
+                alert.messageText = wasUp
+                    ? "Could not stop the UpLink network"
+                    : "Could not start the UpLink network"
+                alert.informativeText = failure
+                alert.runModal()
+            }
+
+            // Read back from the interfaces rather than assuming the call did
+            // what it said. The preference file is input, not output, and has
+            // been observed disagreeing with what is actually running.
+            //
+            // AND WAIT FOR IT. Measured on hardware 2026-08-20: the helper
+            // returns as soon as configd accepts the change, but `bridge100`
+            // took a further EIGHT SECONDS to appear (raise logged at
+            // 20:53:36, address at 20:53:44). Reading once, immediately, always
+            // saw "down" — so the menu kept offering Start for a network that
+            // was already up, and the logs show it being clicked five times.
+            await settle(expecting: !wasUp)
+        }
+    }
+
+    /// Polls until the access point reaches the expected state, or gives up.
+    ///
+    /// Gives up rather than waiting forever, and shows whatever is true when it
+    /// does: a button stuck on "Working…" is worse than one that admits the
+    /// state it can actually see.
+    private func settle(expecting expected: Bool) async {
+        for _ in 0 ..< 20 {
+            let up = await accessPoint.isUp()
+            if up != accessPointIsUp {
+                accessPointIsUp = up
+                refreshStatusItem()
+            }
+            if up == expected { return }
+            try? await Task.sleep(for: .seconds(1))
+        }
+    }
+
+    /// Asks for the password the user set on the network in System Settings.
+    ///
+    /// It cannot be discovered. `com.apple.airport.preferences.plist` holds the
+    /// live software-AP configuration and SIP makes it unreadable even to root,
+    /// so there is no privilege level at which the Mac can look this up. The
+    /// phone needs it to join, so someone has to say it once — and once is the
+    /// whole of it, because it is stored and travels over the pairing channel
+    /// from then on.
+    @objc private func setNetworkPassword() {
+        let alert = NSAlert()
+        alert.messageText = "UpLink network password"
+        alert.informativeText =
+            "Type the password you set for Internet Sharing in System Settings → "
+            + "General → Sharing → Internet Sharing → Wi-Fi Options.\n\n"
+            + "macOS does not let any app read it, so UpLink cannot find it for you. "
+            + "Your iPhone needs it to join the network on its own."
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = accessPoint.credentials.passphrase
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let typed = field.stringValue
+        // WPA2 refuses anything outside 8...63 characters, and it refuses it
+        // deep inside Internet Sharing rather than here — so it is caught here.
+        guard (8 ... 63).contains(typed.count) else {
+            let problem = NSAlert()
+            problem.messageText = "That password will not work"
+            problem.informativeText =
+                "A Wi-Fi password has to be between 8 and 63 characters. "
+                + "That is a WPA2 rule, not UpLink's."
+            problem.runModal()
+            return
+        }
+        accessPoint.setPassphrase(typed)
+    }
+
+    private func refreshAccessPointState() {
+        Task { @MainActor in
+            let up = await accessPoint.isUp()
+            guard up != accessPointIsUp else { return }
+            accessPointIsUp = up
+            refreshStatusItem()
+        }
     }
 
     // MARK: Status item
@@ -61,20 +370,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.menu = buildMenu()
         // Reflect a degraded bridge in the menu bar itself, not just inside the
         // menu — the user should not have to open it to find out.
-        // The glyph distinguishes "no cable" from "cable, something else
-        // wrong", because those need different things from the user and the
-        // whole point of a menu bar icon is to answer at a glance.
+        //
+        // The glyphs are about the RADIO now, not a cable. Each one answers a
+        // different question at a glance, which is the whole point of a menu
+        // bar icon: is the network up, has the phone arrived, is traffic
+        // actually going out over cellular.
         let symbol: String
         switch model.status {
-        case .connected(_, .cellular): symbol = "personalhotspot"
+        // Bridging, over cellular: the thing the product exists to do.
+        case .connected(_, .cellular): symbol = "antenna.radiowaves.left.and.right"
+        // Connected but NOT over cellular. Deliberately an alarm rather than a
+        // quieter variant — a bridge that silently egresses over Wi-Fi looks
+        // identical to one that works and is the failure worth shouting about.
         case .connected: symbol = "exclamationmark.triangle"
-        case .waitingForCable: symbol = "cable.connector.slash"
-        case .deviceNotResponding, .deviceNotPaired: symbol = "cable.connector"
-        case .connecting: symbol = "cable.connector"
+        // No access point: nothing can reach this Mac at all.
+        case .accessPointDown: symbol = "wifi.slash"
+        // Hosting, waiting for the phone to join.
+        case .waitingForPhone, .waitingForCable: symbol = "wifi"
+        // The phone is on the network but not yet bridging.
+        case .deviceNotResponding, .deviceNotPaired: symbol = "wifi.exclamationmark"
+        case .connecting: symbol = "wifi"
         case .pairingLost: symbol = "exclamationmark.triangle"
         case .failed, .needsApproval: symbol = "exclamationmark.triangle"
-        case .switchedOff: symbol = "personalhotspot.slash"
-        case .installingExtension: symbol = "personalhotspot.slash"
+        case .switchedOff: symbol = "antenna.radiowaves.left.and.right.slash"
+        case .installingExtension: symbol = "antenna.radiowaves.left.and.right.slash"
         }
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "UpLink")
         image?.isTemplate = true
@@ -118,6 +437,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSMenuItem(title: "Disconnect", action: #selector(disconnect), keyEquivalent: "")
             )
         }
+
+        // The access point is the one thing in this menu the user can act on
+        // that is not about the phone. It is listed first for that reason:
+        // with the network down, nothing else in here can work.
+        let apTitle: String
+        if accessPointBusy {
+            apTitle = "Working…"
+        } else if accessPointIsUp {
+            apTitle = "Stop “\(accessPoint.credentials.ssid)”"
+        } else {
+            apTitle = "Start “\(accessPoint.credentials.ssid)”"
+        }
+        let apItem = NSMenuItem(
+            title: apTitle, action: #selector(toggleAccessPoint), keyEquivalent: ""
+        )
+        apItem.isEnabled = !accessPointBusy
+        menu.addItem(apItem)
+
+        // The password cannot be read from the system either — same protected
+        // store as the name — so it is asked for once rather than guessed at.
+        menu.addItem(NSMenuItem(
+            title: "Set Network Password…", action: #selector(setNetworkPassword), keyEquivalent: ""
+        ))
+
+        menu.addItem(.separator())
 
         let codeItem = NSMenuItem(
             title: "Show Pairing Code…", action: #selector(showPairingCode), keyEquivalent: ""
@@ -206,11 +550,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func notifyCableRemoved() {
         let content = UNMutableNotificationContent()
         content.title = "iPhone disconnected"
-        content.body = "UpLink stopped bridging when the cable came out."
+        content.body = "UpLink stopped bridging when your iPhone left the network."
         content.sound = nil
 
         let request = UNNotificationRequest(
-            identifier: "uplink.cable-removed",
+            identifier: "uplink.phone-left",
             content: content,
             trigger: nil
         )

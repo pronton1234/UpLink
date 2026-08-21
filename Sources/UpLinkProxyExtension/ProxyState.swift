@@ -37,6 +37,10 @@ actor ProxyState {
     /// The loopback port the app's relay is currently serving, and the device
     /// behind it. Nil whenever no cable is attached.
     private var relayPort: UInt16?
+    /// Where the phone is. Loopback means the cable's relay; anything else
+    /// is the phone's own address on the network the Mac hosts.
+    private var relayHost: String = "127.0.0.1"
+    private var dialingHost: String?
     private var relayUDID: String?
 
     /// Redials the phone while the cable is attached.
@@ -223,7 +227,9 @@ actor ProxyState {
     }
 
     private func beginSession(client: MacSessionClient, port: UInt16, udid: String) {
-        startRedialing(client: client, port: port, udid: udid)
+        // Whatever host is current — loopback for the cable, the phone's own
+        // address on the hosted network otherwise.
+        startRedialing(client: client, host: relayHost, port: port, udid: udid)
     }
 
     /// Keeps a session up for as long as the cable is attached.
@@ -233,7 +239,7 @@ actor ProxyState {
     /// the listener rebuilds — and the cable being physically present is the
     /// signal that trying again is worthwhile. Detachment cancels this, so the
     /// loop never spins against a device that has gone.
-    private func startRedialing(client: MacSessionClient, port: UInt16, udid: String) {
+    private func startRedialing(client: MacSessionClient, host: String, port: UInt16, udid: String) {
         // Idempotent, and it must compare against what the RUNNING LOOP is
         // dialling — not against `relayPort`.
         //
@@ -257,10 +263,15 @@ actor ProxyState {
         // kept refusing to start one. `dialingPort` is cleared by the loop on
         // its way out, so a nil there is the honest signal that nothing is
         // running. (Third time this idiom has bitten; see `USBRelay.pumps`.)
-        if dialingPort == port, dialingUDID == udid {
+        // The host is part of the identity of "what is being dialled". Without
+        // it, moving from the cable's loopback to the phone's address on the
+        // hosted network would be indistinguishable from a repeat announcement
+        // and the loop would go on dialling the old one.
+        if dialingHost == host, dialingPort == port, dialingUDID == udid {
             return
         }
         sessionTask?.cancel()
+        dialingHost = host
         dialingPort = port
         dialingUDID = udid
         // Captured up front: the task body is not isolated to this actor, so
@@ -309,7 +320,13 @@ actor ProxyState {
                     await self.adoptUDID(udid, for: device)
                 }
                 do {
-                    try await client.runSession(relayPort: port, with: device)
+                    try await client.runSession(
+                        endpoint: NWEndpoint.hostPort(
+                            host: NWEndpoint.Host(host),
+                            port: NWEndpoint.Port(rawValue: port) ?? .any
+                        ),
+                        with: device
+                    )
                     // A session that ran and ended is not a failure: the phone
                     // restarted its extension, or the screen locked. Reset, so
                     // the next drop is retried promptly rather than inheriting
@@ -367,6 +384,7 @@ actor ProxyState {
     /// Marks the redial loop as no longer running, so it can be restarted.
     private func clearDialing(port: UInt16, udid: String) {
         guard dialingPort == port, dialingUDID == udid else { return }
+        dialingHost = nil
         dialingPort = nil
         dialingUDID = nil
     }
@@ -565,6 +583,33 @@ actor ProxyState {
         // The cable came up. Everything the extension needs to reach the phone
         // arrives in this one message: the loopback port the app is relaying,
         // and which physical device is on the other end of it.
+        // THE WIRELESS BEARER. Same shape as `usbrelay:` and the same meaning —
+        // everything the extension needs to reach the phone in one message —
+        // except the phone is not on loopback. Over the cable the app relayed
+        // usbmuxd onto a local port; over the hosted network the phone has its
+        // own address and the extension dials it directly, so there is no relay
+        // in the path at all.
+        if message.hasPrefix("peer:") {
+            let parts = message.dropFirst("peer:".count).split(separator: ":", maxSplits: 2)
+            guard parts.count == 3, let port = UInt16(parts[1]) else {
+                return "error|malformed peer"
+            }
+            let host = String(parts[0])
+            let udid = String(parts[2])
+            if lastRelayUDID != udid { disconnectedByUser = false }
+            lastRelayUDID = udid
+            guard !disconnectedByUser else {
+                log?.error("ipc: peer offered but the user disconnected — not dialling")
+                return "ok|disconnected"
+            }
+            log?.error("ipc: peer at \(host, privacy: .public):\(port, privacy: .public)")
+            relayHost = host
+            relayPort = port
+            relayUDID = udid
+            startRedialing(client: client, host: host, port: port, udid: udid)
+            return "ok"
+        }
+
         if message.hasPrefix("usbrelay:") {
             let parts = message.dropFirst("usbrelay:".count).split(separator: ":", maxSplits: 1)
             guard parts.count == 2, let port = UInt16(parts[0]) else {
@@ -589,7 +634,8 @@ actor ProxyState {
             log?.error("ipc: relay on 127.0.0.1:\(port, privacy: .public) for \(udid, privacy: .public)")
             relayPort = port
             relayUDID = udid
-            startRedialing(client: client, port: port, udid: udid)
+            relayHost = "127.0.0.1"
+            startRedialing(client: client, host: "127.0.0.1", port: port, udid: udid)
             return "ok"
         }
 
@@ -606,6 +652,7 @@ actor ProxyState {
             relayUDID = nil
             sessionTask?.cancel()
             sessionTask = nil
+            dialingHost = nil
             dialingPort = nil
             dialingUDID = nil
             await client.endSession()
@@ -633,6 +680,7 @@ actor ProxyState {
             disconnectedByUser = true
             relayPort = nil
             relayUDID = nil
+            dialingHost = nil
             dialingPort = nil
             dialingUDID = nil
             return "ok"
@@ -712,7 +760,7 @@ actor ProxyState {
                 log?.error("ipc: \(fingerprint, privacy: .public) removed while not connected — will tell it on the next cable")
                 // If a relay is already up, tell it now rather than waiting.
                 if let port = relayPort, let udid = relayUDID {
-                    startRedialing(client: client, port: port, udid: udid)
+                    startRedialing(client: client, host: relayHost, port: port, udid: udid)
                 }
             }
             return "ok"

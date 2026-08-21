@@ -18,7 +18,7 @@ Mac                                          iPhone
 │ UpLinkMac (menu bar)         │            │ UpLinkiOS (SwiftUI)        │
 │  Devices window + pairing    │            │  user turns the bridge on  │
 │  USBRelay ──► /var/run/      │            │                            │
-│               usbmuxd  ══════╪═ CABLE ════╪══► UpLinkTunnelExtension   │
+│  raises the access point ════╪═ 5GHz AP ══╪══► UpLinkTunnelExtension   │
 ├──────────────────────────────┤            │      NEPacketTunnelProvider│
 │ UpLinkProxyExtension (sysex) │            │      listens on 127.0.0.1  │
 │  transparent proxy captures  │◄─TLS-PSK──►│      dials out per stream  │
@@ -26,11 +26,17 @@ Mac                                          iPhone
 └──────────────────────────────┘                       ▼ cellular = app data
 ```
 
-**The cable is the only transport.** `usbmuxd` — the same channel Xcode uses —
-needs no network interface at all: no Wi-Fi association, no Bonjour, no
-multicast, no Personal Hotspot. That is the point. The Mac's Wi-Fi radio can be
-associated with nothing and the bridge still works, which is the configuration
-this product exists for and the one AWDL could never hold.
+**The Mac hosts the network; the phone joins it.** This is the hotspot
+inverted, and the inversion is the whole idea. A Personal Hotspot needs the
+laptop opened and told to join something; here the Mac hosts a 5 GHz access
+point with *nothing behind it* — shared from the product's own dead-end route
+tunnel — and the phone joins that and re-originates the Mac's traffic from an
+app socket pinned to cellular. The Mac is never touched.
+
+**Starting it cannot travel over the network it starts.** The phone's only path
+to the Mac is the access point, so a Mac waiting to be asked over that path can
+never be asked at all. A Bluetooth LE doorbell closes the loop: one command
+byte, never data, and advertising stops entirely once a session is live.
 
 `usbmuxd` carries connections in one direction only, so **the Mac dials and the
 phone listens**. The Mac's proxy extension is sandboxed and cannot open
@@ -49,7 +55,9 @@ what forces egress through the cellular radio.
 | --- | --- |
 | Wire protocol, multiplexer, flow control | **Done**, 277 tests across the kit |
 | Pairing crypto + Keychain storage | **Done**, verified on hardware |
-| USB transport (`usbmuxd`) | **VERIFIED ON HARDWARE 2026-08-15** — Wi-Fi radio off, 116–153 Mbps, every traffic class bridged including IPv6, nothing leaked |
+| **Wireless transport (Mac-hosted 5 GHz AP)** | **VERIFIED ON HARDWARE 2026-08-21** — **156 Mbps down**, faster than the cable; 277 flows in one session across Chrome, Discord, Firefox, VS Code, Notion, Claude; IPv4 and IPv6; carrier egress |
+| Bluetooth LE doorbell | **Verified on hardware** — the phone raises the Mac's access point with the network down. Control bytes only, never data |
+| USB transport (`usbmuxd`) | **VERIFIED ON HARDWARE 2026-08-15** — 116–153 Mbps. Retained as the reference path |
 | TLS-PSK / cellular dialer | **Done**, verified on hardware |
 | End-to-end proxying | **Proven** in-process and, for TCP, on hardware |
 | iOS app + tunnel extension | **Builds**, UI complete |

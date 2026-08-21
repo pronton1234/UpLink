@@ -47,8 +47,8 @@ struct DevicesView: View {
         switch model.status {
         case .connected(_, .cellular): "personalhotspot"
         case .connected: "exclamationmark.triangle"
-        case .waitingForCable: "cable.connector.slash"
-        default: "cable.connector"
+        case .waitingForCable: "wifi.slash"
+        default: "wifi"
         }
     }
 

@@ -282,7 +282,21 @@ open "$DEST"
 echo
 green "Notarized, installed, and running."
 echo
-echo "First launch only: approve UpLink in"
+echo "IF YOU CHANGED THE HELPER, IT IS STILL RUNNING THE OLD CODE.
+Replacing the app does not restart a running LaunchDaemon, and nothing short of
+root can restart it -- 'launchctl kickstart' answers 'Operation not permitted'.
+The app will look updated and behave exactly as it did before, which is a
+confusing hour if you do not know it.
+
+  System Settings -> General -> Login Items & Extensions
+  -> toggle UpLink off, then on.
+
+Confirm it took, by comparing these two:
+
+  defaults read /Applications/UpLink.app/Contents/Info.plist CFBundleVersion
+  launchctl print system/com.uplink.app.helper | grep 'parent bundle version'
+
+First launch only: approve UpLink in"
 echo "  System Settings → General → Login Items & Extensions → Network Extensions"
 echo
 echo "Then check coverage:"

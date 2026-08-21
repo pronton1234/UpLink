@@ -224,7 +224,15 @@ actor PhoneBridge {
             port: UpLinkUSB.extensionPort,
             // So a Mac revoked while it was unplugged is still told after this
             // extension is relaunched — which iOS does often.
-            tombstoneStore: TombstoneStore()
+            tombstoneStore: TombstoneStore(),
+            // THE BEARER. `.hostedAP` stops the listener pinning itself to
+            // loopback — which usbmuxd required and which makes it unreachable
+            // from the network the Mac hosts — and makes it advertise
+            // `_uplink._tcp` so the Mac can find the address DHCP just gave it.
+            //
+            // Over the cable the Mac dialled a fixed loopback port and usbmuxd
+            // did the finding. Nothing plays that role now.
+            bearer: .hostedAP
         )
         self.host = host
 
@@ -240,7 +248,24 @@ actor PhoneBridge {
             diagnostics.write("listener FAILED to start: \(error)")
             throw error
         }
-        diagnostics.write("listening on 127.0.0.1:\(UpLinkUSB.extensionPort) — waiting for the Mac to dial over the cable")
+        // REPORTS WHAT IS TRUE, not what was intended.
+        //
+        // This line used to be the literal string "listening on 127.0.0.1:50505
+        // — waiting for the Mac to dial over the cable", written whatever the
+        // listener actually did. It went on saying "over the cable" through an
+        // entire evening of wireless debugging, and it said loopback while the
+        // bearer had been changed to bind every interface. A diagnostic that
+        // cannot be wrong is a diagnostic that cannot help.
+        //
+        // The build is here because installing the app does NOT restart a
+        // running Network Extension: the phone can keep an old binary across
+        // any number of installs, and every symptom then points at code that is
+        // not running. That cost several rounds before it was noticed.
+        let bound = await host.listeningPort.map { "\($0.rawValue)" } ?? "NOT BOUND"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        diagnostics.write(
+            "listening: port=\(bound) bearer=\(WirelessBearer.hostedAP.rawValue) build=\(build)"
+        )
     }
 
     func stop() async {

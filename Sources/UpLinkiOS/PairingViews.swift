@@ -27,7 +27,7 @@ struct PairingSheet: View {
                 VStack(spacing: 8) {
                     Text("Pair with your Mac")
                         .font(.title2.weight(.semibold))
-                    Text("Connect the cable, click UpLink in your Mac's menu bar and choose **Show Pairing Code**, then enter the six digits here.")
+                    Text("Click UpLink in your Mac's menu bar, choose **Show Pairing Code**, then enter the six digits here.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)

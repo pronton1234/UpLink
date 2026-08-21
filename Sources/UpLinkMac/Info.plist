@@ -36,5 +36,24 @@
 	     and the app activates properly when it opens. -->
 	<key>LSUIElement</key>
 	<true/>
+	<!-- REQUIRED on macOS 15+, and denied silently without it.
+	     The proxy extension dials the phone at its address on the network this
+	     Mac hosts — 192.168.2.2 — which is local network access, and macOS now
+	     gates that the same way iOS does.
+	     Measured 2026-08-20: `nc` from Terminal reached 192.168.2.2:50505
+	     immediately, while the extension's dial to the identical address and
+	     port timed out at 12s with NOTHING arriving at the phone. Terminal had
+	     been granted; the extension never had. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>UpLink connects to your iPhone over the network this Mac hosts. Nothing is sent to any server.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_uplink._tcp</string>
+	</array>
+	<!-- The phone rings this to bring the access point up while it is down,
+	     which Wi-Fi cannot do: the phone's only path to the Mac is the network
+	     the Mac hosts. Control bytes only — never data. -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>UpLink lets your iPhone start this Mac's network when it is off. Only a start or stop command is sent — never your data.</string>
 </dict>
 </plist>

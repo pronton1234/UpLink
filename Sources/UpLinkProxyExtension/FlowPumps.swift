@@ -45,28 +45,50 @@ func pumpTCP(
         // NetworkExtension hands back whatever is buffered, so those rounds are
         // frequent and small. Exactly one read is ever in flight, which is what
         // the flow API requires.
-        await withTaskGroup(of: Void.self) { group in
+        // COUNTED, because "the stream opened" and "the stream carried
+        // something" are different facts and only the first was observable.
+        //
+        // A flow that opens and then moves nothing looks identical in the log
+        // to one that works — and that is precisely the difference between an
+        // application that loads and one that hangs. Reported once per flow, on
+        // the way out, so a session's log says what actually crossed.
+        let moved = await withTaskGroup(of: (Bool, Int).self) { group -> (Int, Int) in
             group.addTask {
+                var sent = 0
                 var inFlight = Task { try? await handle.read() }
                 while true {
                     guard let data = await inFlight.value, !data.isEmpty else { break }
                     inFlight = Task { try? await handle.read() }
                     guard (try? await stream.send(data)) != nil else { break }
+                    sent += data.count
                 }
                 inFlight.cancel()
                 await stream.close()
+                return (true, sent)
             }
             group.addTask {
+                var received = 0
                 var inFlight = Task { await stream.receive() }
                 while true {
                     guard let data = await inFlight.value else { break }
                     inFlight = Task { await stream.receive() }
                     guard (try? await handle.write(data)) != nil else { break }
+                    received += data.count
                 }
                 inFlight.cancel()
                 handle.closeBoth(nil)
+                return (false, received)
             }
+            var up = 0
+            var down = 0
+            for await (isUp, count) in group {
+                if isUp { up = count } else { down = count }
+            }
+            return (up, down)
         }
+        log.error(
+            "tcp done  \(where_, privacy: .public) — \(moved.0, privacy: .public) up / \(moved.1, privacy: .public) down"
+        )
     } catch {
         log.error("tcp FAIL  \(destination.host, privacy: .public):\(destination.port, privacy: .public) — \(String(describing: error), privacy: .public)")
         handle.closeBoth(error)

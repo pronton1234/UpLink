@@ -38,6 +38,9 @@ public actor PhoneSessionHost {
     private let queue: DispatchQueue
     private let dialer: DestinationDialer
     private let port: UInt16
+    /// Which link the Mac will reach this listener over. Decides whether the
+    /// bind is pinned to loopback; see ``TransportParameters/listener(sessionKeys:pairingKey:port:bearer:)``.
+    private let bearer: WirelessBearer
     /// Durable home for tombstones. Nil in tests, which have no app group.
     private let tombstoneStore: TombstoneStore?
 
@@ -85,7 +88,8 @@ public actor PhoneSessionHost {
         dialer: DestinationDialer,
         queue: DispatchQueue,
         port: UInt16 = UpLinkUSB.extensionPort,
-        tombstoneStore: TombstoneStore? = nil
+        tombstoneStore: TombstoneStore? = nil,
+        bearer: WirelessBearer = .usbmux
     ) {
         self.identity = identity
         self.deviceName = deviceName
@@ -94,6 +98,7 @@ public actor PhoneSessionHost {
         self.queue = queue
         self.port = port
         self.tombstoneStore = tombstoneStore
+        self.bearer = bearer
         if let tombstoneStore {
             tombstones = tombstoneStore.load()
         }
@@ -231,10 +236,40 @@ public actor PhoneSessionHost {
         let parameters = TransportParameters.listener(
             sessionKeys: sessionKeys,
             pairingKey: pairingKey,
-            port: port
+            port: port,
+            bearer: bearer
         )
 
-        let listener = try NWListener(using: parameters)
+        // THE PORT HAS TO BE SAID OUT LOUD HERE.
+        //
+        // Over the cable it arrived inside `requiredLocalEndpoint`, which
+        // carried two things at once: bind to loopback, and bind to THIS port.
+        // Dropping that endpoint for the wireless bearer — which was right, it
+        // is what made the listener unreachable from the network the Mac hosts
+        // — took the port with it, and `NWListener(using:)` with no port picks
+        // an ephemeral one.
+        //
+        // The result was a listener that came up perfectly, on a port nobody
+        // was dialling: the Mac dialled 50505 and got "no connection within
+        // 12s" for as long as anyone cared to watch, with both sides healthy.
+        let listener = try bearer == .usbmux
+            ? NWListener(using: parameters)
+            : NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
+
+        // The phone announces itself and the Mac browses. Over the cable this
+        // was usbmuxd's job — the Mac dialled a fixed loopback port and the
+        // daemon did the finding. On a shared link the phone holds a DHCP
+        // address nothing else knows, so nothing can find it unless it says so.
+        //
+        // A mismatch in the service type is silent on both sides: the Mac
+        // simply never finds a phone that is advertising perfectly happily,
+        // which is why the name is a single constant in UpLinkIdentifiers.
+        if bearer != .usbmux {
+            listener.service = NWListener.Service(
+                name: deviceName, type: UpLinkIdentifiers.bonjourServiceType
+            )
+        }
+
         listener.newConnectionHandler = { [weak self] connection in
             Task { await self?.accept(connection) }
         }
@@ -361,6 +396,13 @@ public actor PhoneSessionHost {
 
     private func accept(_ connection: NWConnection) async {
         log.error("accept: inbound connection from \(String(describing: connection.endpoint), privacy: .public)")
+        // ALSO to the readable log. os.Logger cannot be read back off the phone
+        // without a cable, which is the thing this bearer removes — so every
+        // step of the handshake that could be the failure has to be written
+        // where it can be recovered afterwards. An evening was spent reading
+        // "nothing after `listening`" as "no connection arrived", when accepts
+        // simply were not being recorded here.
+        PhoneDiagnosticLog.shared.write("accept: inbound from \(connection.endpoint)")
         let channel = NWConnectionChannel(connection: connection)
         do {
             // A wrong pairing code, or an unpaired Mac, fails the TLS handshake
@@ -380,6 +422,7 @@ public actor PhoneSessionHost {
             guard let first else { throw ChannelError.peerClosed }
 
             log.error("accept: TLS ok, first frame = \(String(describing: first.kind), privacy: .public)")
+            PhoneDiagnosticLog.shared.write("accept: TLS ok, first frame = \(first.kind)")
             switch first.kind {
             case .pairRequest:
                 try await handlePairing(first, on: channel)
@@ -397,8 +440,10 @@ public actor PhoneSessionHost {
             if let refusal = error as? PairingError {
                 try? await channel.send(FrameEncoder.encode(Multiplexer.pairFailureFrame(refusal)))
                 log.error("accept: pairing REFUSED — \(String(describing: refusal), privacy: .public)")
+                PhoneDiagnosticLog.shared.write("accept: pairing REFUSED — \(refusal)")
             } else {
                 log.error("accept: REJECTED \(String(describing: error), privacy: .public)")
+                PhoneDiagnosticLog.shared.write("accept: REJECTED \(error)")
             }
             await channel.close()
         }

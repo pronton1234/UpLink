@@ -42,7 +42,8 @@ struct TLSHandshakeRegressionTests {
             using: TransportParameters.listener(
                 sessionKeys: [(identity, psk)],
                 pairingKey: nil,
-                port: UInt16.random(in: 41000 ..< 48000)
+                port: UInt16.random(in: 41000 ..< 48000),
+                bearer: .usbmux
             )
         )
         let held = Held<NWConnection?>(nil)
@@ -128,7 +129,8 @@ struct TLSHandshakeRegressionTests {
             using: TransportParameters.listener(
                 sessionKeys: [("regression", SymmetricKey(size: .bits256))],
                 pairingKey: nil,
-                port: UInt16.random(in: 41000 ..< 48000)
+                port: UInt16.random(in: 41000 ..< 48000),
+                bearer: .usbmux
             )
         )
         let held = Held<NWConnection?>(nil)

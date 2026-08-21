@@ -94,9 +94,9 @@ public actor MacSessionClient {
     /// Returns once the session is over, so the caller's reconnect loop can
     /// decide whether to try again — the cable may simply have been unplugged,
     /// which is not a failure worth retrying in a tight loop.
-    public func runSession(relayPort: UInt16, with device: PairedDevice) async throws {
+    public func runSession(endpoint: NWEndpoint, with device: PairedDevice) async throws {
         let key = try sessionKey(for: device)
-        let channel = try await dial(port: relayPort, psk: key, identity: fingerprint)
+        let channel = try await dial(endpoint: endpoint, psk: key, identity: fingerprint)
 
         // Proves to the phone that we are the Mac we say we are. See
         // ``HelloProof``: TLS establishes that we hold one of the phone's PSKs,
@@ -117,7 +117,7 @@ public actor MacSessionClient {
         let generation = sessionGeneration
         self.initiator = initiator
         activeChannel = channel
-        let description = "usb:127.0.0.1:\(relayPort) → \(device.name)"
+        let description = "\(Self.describe(endpoint)) → \(device.name)"
         peerDescription = description
         activeFingerprint = device.fingerprint
 
@@ -199,10 +199,10 @@ public actor MacSessionClient {
     /// So the key is kept just long enough for one more dial, exactly as the
     /// phone keeps a revoked Mac's key on the air long enough to answer it once.
     /// Returns whether the notice was delivered.
-    public func deliverUnpairNotice(relayPort: UInt16, to device: PairedDevice) async -> Bool {
+    public func deliverUnpairNotice(endpoint: NWEndpoint, to device: PairedDevice) async -> Bool {
         do {
             let key = try sessionKey(for: device)
-            let channel = try await dial(port: relayPort, psk: key, identity: fingerprint)
+            let channel = try await dial(endpoint: endpoint, psk: key, identity: fingerprint)
             defer { Task { await channel.close() } }
 
             // The phone dispatches on the first frame, so this has to look like
@@ -234,11 +234,11 @@ public actor MacSessionClient {
     /// fails inside the TLS handshake — this is the only place a mismatch can
     /// be detected, and it arrives as an opaque transport error, so it is
     /// mapped here to the value the UI can actually explain.
-    public func pair(relayPort: UInt16, code: PairingCode, udid: String) async throws -> PairedDevice {
+    public func pair(endpoint: NWEndpoint, code: PairingCode, udid: String) async throws -> PairedDevice {
         let channel: FrameChannel
         do {
             channel = try await dial(
-                port: relayPort,
+                endpoint: endpoint,
                 parameters: TransportParameters.pairing(code: code)
             )
         } catch {
@@ -263,6 +263,24 @@ public actor MacSessionClient {
 
     // MARK: - Dialling
 
+    // MARK: The cable, expressed in terms of the above
+    //
+    // These exist so adopting the wireless bearer does not require rewriting
+    // ProxyState's relayPort threading in the same change. They go with the
+    // cable.
+
+    public func runSession(relayPort: UInt16, with device: PairedDevice) async throws {
+        try await runSession(endpoint: Self.loopbackEndpoint(port: relayPort), with: device)
+    }
+
+    public func deliverUnpairNotice(relayPort: UInt16, to device: PairedDevice) async -> Bool {
+        await deliverUnpairNotice(endpoint: Self.loopbackEndpoint(port: relayPort), to: device)
+    }
+
+    public func pair(relayPort: UInt16, code: PairingCode, udid: String) async throws -> PairedDevice {
+        try await pair(endpoint: Self.loopbackEndpoint(port: relayPort), code: code, udid: udid)
+    }
+
     private func sessionKey(for device: PairedDevice) throws -> SymmetricKey {
         let remote = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: device.publicKey)
         // Context is the PHONE's fingerprint on both ends: it is the phone's
@@ -274,14 +292,50 @@ public actor MacSessionClient {
         )
     }
 
-    private func dial(port: UInt16, psk: SymmetricKey, identity: String) async throws -> FrameChannel {
-        try await dial(port: port, parameters: TransportParameters.session(psk: psk, identity: identity))
+    /// How a peer link is named in logs, in the menu bar, and in the checks
+    /// that decide whether a run proved anything.
+    ///
+    /// This used to be the literal `usb:127.0.0.1:<port>`, which was true of
+    /// the only bearer there was. It is now derived, because a description that
+    /// says "usb" for a link running over the air is exactly the class of
+    /// false evidence `verify-cellular.sh` exists to refuse — a run that works
+    /// and is not proving what it claims to prove.
+    public static func describe(_ endpoint: NWEndpoint) -> String {
+        guard case let .hostPort(host, port) = endpoint else { return "\(endpoint)" }
+        let rendered = "\(host)"
+        // Loopback is only ever reached through the menu-bar app's relay, so
+        // naming the cable here is a statement about the path, not a guess.
+        if rendered == "127.0.0.1" { return "usb:127.0.0.1:\(port)" }
+        return "\(rendered):\(port)"
     }
 
-    private func dial(port: UInt16, parameters: NWParameters) async throws -> FrameChannel {
-        let endpoint = NWEndpoint.hostPort(
-            host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port)!
+    /// The cable's endpoint.
+    ///
+    /// Kept as a named constructor rather than a literal so the USB path stays
+    /// legible while both bearers exist, and so removing the cable is one
+    /// symbol to delete rather than a shape to go hunting for.
+    public static func loopbackEndpoint(port: UInt16) -> NWEndpoint {
+        .hostPort(host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port)!)
+    }
+
+    private func dial(endpoint: NWEndpoint, psk: SymmetricKey, identity: String) async throws -> FrameChannel {
+        // Bound to the hosted network when we are hosting one, so the dial
+        // cannot leave over the home Wi-Fi and die at the home router. Nil over
+        // the cable, where loopback needs no help.
+        let local = Self.isLoopback(endpoint) ? nil : TransportParameters.hostedNetworkAddress()
+        return try await dial(
+            endpoint: endpoint,
+            parameters: TransportParameters.session(psk: psk, identity: identity, boundTo: local)
         )
+    }
+
+    /// Whether this endpoint is the cable's loopback relay.
+    static func isLoopback(_ endpoint: NWEndpoint) -> Bool {
+        guard case let .hostPort(host, _) = endpoint else { return false }
+        return "\(host)" == "127.0.0.1"
+    }
+
+    private func dial(endpoint: NWEndpoint, parameters: NWParameters) async throws -> FrameChannel {
         let channel = NWConnectionChannel(connection: NWConnection(to: endpoint, using: parameters))
         try await channel.start(on: queue)
         return channel

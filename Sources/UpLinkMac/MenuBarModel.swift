@@ -18,6 +18,12 @@ import UpLinkKit
 enum MacBridgeStatus: Equatable {
     case installingExtension
     case needsApproval
+    /// The Mac is not hosting its access point, so there is no link at all.
+    /// The only state here the user can personally fix, which is why it gets
+    /// an action rather than a description.
+    case accessPointDown
+    /// The access point is up and no phone has joined it yet.
+    case waitingForPhone
     /// No cabled iPhone attached.
     case waitingForCable
     /// Attached, but nothing answered on either UpLink port.
@@ -53,6 +59,9 @@ final class MenuBarModel {
 
     fileprivate(set) var status: MacBridgeStatus = .waitingForCable
     private(set) var pairedDevices: [PairedDevice] = []
+    /// Last peer announcement, so the log records changes rather than a
+    /// line every few seconds.
+    private var lastAnnouncedPeer: String?
 
     private(set) var activePairingCode: PairingCode?
     private(set) var pairingExpiresAt: Date?
@@ -159,6 +168,8 @@ final class MenuBarModel {
         switch status {
         case .installingExtension: "Installing…"
         case .needsApproval: "Approval needed in System Settings"
+        case .accessPointDown: LinkStatus.accessPointDown.headline
+        case .waitingForPhone: LinkStatus.waitingForPhone.headline
         case .waitingForCable: LinkStatus.waitingForCable.headline
         case .deviceNotResponding: LinkStatus.deviceNotResponding.headline
         case .deviceNotPaired: LinkStatus.deviceNotPaired.headline
@@ -177,6 +188,8 @@ final class MenuBarModel {
             "Setting up network routing"
         case .needsApproval:
             "System Settings → General → Login Items & Extensions → Network Extensions"
+        case .accessPointDown: LinkStatus.accessPointDown.detail
+        case .waitingForPhone: LinkStatus.waitingForPhone.detail
         case .waitingForCable: LinkStatus.waitingForCable.detail
         case .deviceNotResponding: LinkStatus.deviceNotResponding.detail
         case .deviceNotPaired: LinkStatus.deviceNotPaired.detail
@@ -716,6 +729,15 @@ final class MenuBarModel {
         switch RouteTunnelReconciler.next(
             status: status,
             sessionLive: sessionLive,
+            // While the access point is up, the mode is pinned: Internet
+            // Sharing is sourced from this tunnel and rebuilds the access point
+            // on every reconfiguration. See RouteTunnelReconciler.
+            // Intent OR observation. While the access point is coming up the
+            // interface does not exist yet, and reporting not-hosting in that
+            // window makes the reconciler reconfigure the very tunnel Internet
+            // Sharing is building on. See AccessPointHost.intendsToHost.
+            hostingAccessPoint: AccessPointHost.intendsToHost
+                || TransportParameters.hostedNetworkAddress() != nil,
             needsRebuild: routeManagerNeedsRebuild
         ) {
         case .wait:
@@ -816,6 +838,56 @@ final class MenuBarModel {
     }
 
     @discardableResult
+    /// Tells the extension where the phone is on the network this Mac hosts.
+    ///
+    /// **Not Bonjour, deliberately.** The Mac is the DHCP server for its own
+    /// access point, so it already knows every address it handed out. Browsing
+    /// for a service would add a discovery protocol, a local-network permission
+    /// prompt, and a thing that has to survive radio changes — to learn
+    /// something already written down in `/var/db/dhcpd_leases`.
+    ///
+    /// The UDID is the paired device's, not anything read off the network.
+    /// Over the cable it identified which handset was plugged in; here it only
+    /// selects which pairing to use, and the TLS-PSK handshake is what actually
+    /// establishes who the peer is.
+    func announcePeerIfPossible() async {
+        // No access point means no network to find the phone on, and the lease
+        // file outlives the network — so this check is what stops a stale entry
+        // being announced as a live peer.
+        guard FileManager.default.fileExists(atPath: "/dev/null"),
+              (try? String(contentsOfFile: DHCPLease.path, encoding: .utf8)) != nil,
+              isHostingAccessPoint() else { return }
+
+        guard let contents = try? String(contentsOfFile: DHCPLease.path, encoding: .utf8),
+              let lease = DHCPLease.mostRecent(in: contents) else { return }
+
+        // A record with no UDID matches any device on the extension's side, so
+        // an empty string is the honest thing to send when we have no pairing
+        // yet rather than inventing an identifier.
+        let udid = pairedDevices.first?.udid ?? ""
+        let message = "peer:\(lease.address):\(UpLinkUSB.extensionPort):\(udid)"
+        if message != lastAnnouncedPeer {
+            lastAnnouncedPeer = message
+            log.error("announcing peer at \(lease.address, privacy: .public)")
+        }
+        _ = await sendToExtension(message)
+    }
+
+    /// Whether this Mac is currently hosting its access point.
+    ///
+    /// Read from the interfaces. The preference file says what was asked for,
+    /// which has repeatedly not been what is running.
+    private func isHostingAccessPoint() -> Bool {
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let first = addresses else { return false }
+        defer { freeifaddrs(addresses) }
+        for pointer in sequence(first: first, next: { $0.pointee.ifa_next })
+        where String(cString: pointer.pointee.ifa_name) == "bridge100" {
+            return pointer.pointee.ifa_flags & UInt32(IFF_RUNNING) != 0
+        }
+        return false
+    }
+
     private func sendToExtension(_ message: String) async -> String? {
         guard let session = manager?.connection as? NETunnelProviderSession else { return nil }
         return await withCheckedContinuation { continuation in
@@ -866,7 +938,7 @@ final class MenuBarModel {
         // showing a code that cannot possibly be used and letting the user
         // discover that by typing it.
         guard case let .ready(udid, port, _) = relayState else {
-            status = .failed("Connect your iPhone with a cable before pairing.")
+            status = .failed("Start the UpLink network and join it from your iPhone before pairing.")
             notifyObservers()
             return
         }
@@ -902,7 +974,7 @@ final class MenuBarModel {
             let reply = await self?.sendToExtension("pair:\(code.digits)")
             if reply?.hasPrefix("error") == true {
                 self?.log.error("pairing could not start: \(reply ?? "", privacy: .public)")
-                self?.status = .failed("Couldn't start pairing. Check the cable and try again.")
+                self?.status = .failed("Couldn't start pairing. Check your iPhone is on the UpLink network and try again.")
                 // Take the code down with it. Leaving it up rendered a
                 // six-digit code that could not possibly work, indefinitely,
                 // because this path returned before anything cleared it.
@@ -1053,6 +1125,8 @@ final class MenuBarModel {
             userDisconnected: userDisconnected,
             pairingRefused: pairingRefused
         ) {
+        case .accessPointDown: new = .accessPointDown
+        case .waitingForPhone: new = .waitingForPhone
         case .waitingForCable: new = .waitingForCable
         case .deviceNotResponding: new = .deviceNotResponding
         case .deviceNotPaired: new = .deviceNotPaired

@@ -18,6 +18,17 @@ public enum UpLinkIdentifiers {
     public static let macProxyExtension = "com.uplink.app.proxy"
 
 
+    /// The Bonjour service the phone advertises on the shared link and the
+    /// Mac browses for.
+    ///
+    /// Over the cable there was nothing to discover — the Mac dialled a fixed
+    /// loopback port and `usbmuxd` did the finding. Over an access point the
+    /// phone has a DHCP address nothing else knows, so it announces itself.
+    ///
+    /// One constant, because a mismatch here is silent on both sides: the Mac
+    /// simply never finds a phone that is advertising perfectly happily.
+    public static let bonjourServiceType = "_uplink._tcp"
+
     /// Log subsystem for every target.
     public static let logSubsystem = "com.uplink.app"
 

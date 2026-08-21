@@ -826,3 +826,649 @@ the case the subset left out.
 Pinned by `RouteTunnelRestartRegressionTests`, which walks the reported sequence
 as transitions and asserts that no combination of inputs can ever tear the
 tunnel down.
+
+## Wireless bearer, 2026-08-20 — the peer link's own interface is an egress path
+
+`CellularDialer` has always prohibited `.wiredEthernet`, and the comment above
+that line explains why: plugging the phone into the Mac gives the phone a wired
+interface, so a Mac with any route to share lets the phone dial out through it.
+The bridge then carries traffic from the Mac to the phone and straight back to
+the Mac, bypassing nothing while reporting a healthy session, and the egress
+report says `.wiredEthernet` only after the fact.
+
+The wireless bearer recreates that hazard exactly, one interface over. With the
+phone associated to an access point the Mac hosts, a destination dial satisfied
+over Wi-Fi leaves the phone, crosses the access point and arrives back at the
+Mac. Same loop, different radio.
+
+`requiredInterfaceType` does not close it. It is documented as a preference
+Network.framework may fall back from, which is precisely how a Wi-Fi fallback
+was once observed being reported as a successful cellular dial. Prohibition is
+the half that cannot be negotiated away.
+
+**The fix is where the rule lives, not what it says.** A literal
+`[.wiredEthernet]` in the dialer is correct while there is one bearer and wrong
+the moment there are three, because the set is not a property of the dialer — it
+is a property of whichever link is carrying the peer connection.
+`WirelessBearer.prohibitedEgressInterfaces` owns it, so adding a bearer cannot
+leave the prohibition behind. This is the same shape as the identifiers that
+were scattered across four targets until one file owned them.
+
+| Test | Guards against |
+| --- | --- |
+| `EgressLoopRegressionTests` | A proxied dial re-entering the Mac over the access point. Asserts `.wifi` prohibited under `.hostedAP`, cellular still required, and — separately — that the cable's prohibition is unchanged, so adopting the wireless bearer cannot quietly widen or narrow the USB path. |
+| `CellularEgressRegressionTests` | Unchanged, now naming `.usbmux` explicitly rather than relying on a default. A cable regression that silently started testing a different bearer would be worse than no test. |
+
+Loopback stays permitted under every bearer, deliberately. A destination on the
+phone's own loopback is not a way around the bridge, and banning it breaks every
+integration test that points "the internet" at a local server — which is how the
+datagram and refused-destination suites run with no network at all.
+
+## Internet Sharing, 2026-08-20 — the write succeeds and nothing happens
+
+Raising the access point failed on hardware with:
+
+```
+Could not start the UpLink network
+NetworkSharing did not restart (status 150)
+```
+
+`launchctl error 150` decodes to **"Operation not permitted while System
+Integrity Protection is engaged."** SIP owns Apple's daemons, so nothing outside
+Apple may restart `com.apple.NetworkSharing`. The helper runs as root and it
+makes no difference: this is not a permissions problem that more privilege
+solves.
+
+**The dangerous half is that the write worked.** After the failure the
+preference file read exactly right — `NAT.Enabled = 1`, `AirPort.Enabled = 1`,
+`NetworkName = UpLink-…`, `SharingDevices = [en0]`, `PrimaryService` pointing at
+the product's own dead-end route tunnel. Every field correct, and no access
+point: `bridge100` absent, `InternetSharing` not running.
+
+So a direct write to `com.apple.nat.plist` is not "most of the way there". It
+goes behind SystemConfiguration's back, configd is never told, and the file
+becomes a description of a state the machine is not in. Anything reading that
+file to decide whether sharing is on gets a confident wrong answer — which is
+the same trap already recorded here as ":NAT:AirPort:Enabled reads 0 with the AP
+fully up", seen from the other side.
+
+**The fix is to use the door rather than the window.**
+`SCPreferencesApplyChanges` is the notification System Settings itself sends,
+and configd's `com.apple.SystemConfiguration.ISPreference` plugin is what
+listens for it and starts the daemon. The sequence is
+`SCPreferencesCreate` → `SCPreferencesLock` → `SCPreferencesSetValue` →
+`SCPreferencesCommitChanges` → `SCPreferencesApplyChanges`. No daemon is
+restarted by us at any point, so SIP has no reason to object.
+
+The lock is not optional politeness: these preferences are shared with System
+Settings, and committing without it can lose a concurrent edit or fail in a way
+that reads as a permissions problem — sending the next person back to SIP, which
+is a dead end.
+
+**Rule this encodes.** When SIP refuses an operation, that is the boundary
+naming the supported API, not an obstacle to route around. Every "run the tool
+by hand" approach here — `launchctl kickstart`, writing the plist, `defaults
+write` — fails or lies. The framework call works and is shorter.
+
+### The same run, one layer down — a correct file that says nothing
+
+With the SIP problem understood, the access point still did not come up, and
+configd said why:
+
+```
+[com.apple.NetworkSharing:preference] store changed
+[com.apple.NetworkSharing:preference] no external service id
+[com.apple.NetworkSharing:preference] external interface: (null)
+[com.apple.NetworkSharing:preference] sharing started on 0 interfaces
+```
+
+`store changed` means the plugin *did* see the write. It could not resolve the
+source being shared, because the configuration was built from scratch and had
+silently dropped `PrimaryInterface` — the sub-dictionary naming that source.
+Every field a reader would think to check was present and correct. The fault was
+entirely in what was missing, which is why reading the written file proved
+nothing and why the earlier "the write worked" conclusion was only half true.
+
+`AccessPointConfiguration.natPreferences(mergedOnto:)` merges now, and never
+replaces. Unknown keys are carried through untouched: a system preference is not
+ours to rewrite from first principles, and not knowing what every key is for is
+precisely what made this defect possible.
+
+| Test | Guards against |
+| --- | --- |
+| `SharingMergeRegressionTests` | Rebuilding the sharing configuration from scratch. Pins `PrimaryInterface` surviving and being enabled, unknown keys inside `NAT` surviving, and sibling top-level keys surviving — against this Mac's real captured off-state, so the fixture is the thing that actually failed. |
+
+**Rule this encodes.** Two failures in one run both took the shape "the artefact
+looks right and the system disagrees". Confirm a system change by asking the
+system, never by reading back the file you wrote.
+
+### The same run, one layer further down — a VPN has no device
+
+With SIP understood and the merge fixed, the access point still did not start —
+and this time it took the Wi-Fi radio on its way to failing, which is the worst
+shape available: from the outside it looks like it is working. The Mac spent the
+whole attempt hunting for networks that no longer existed, because its radio was
+gone and nothing had replaced it.
+
+```
+[com.apple.NetworkSharing:preference] AP stopped
+[com.apple.NetworkSharing:preference] external interface: (null)
+[com.apple.NetworkSharing:preference] sharing started on 0 interfaces
+```
+
+`en0` was `inactive` for 40 of the recorded samples and `InternetSharing` was
+`running` for 50 of them, so every outward sign said the mechanism had engaged.
+
+The source being shared is the product's own route tunnel, which is a **VPN
+service**, and `preferences.plist` records a VPN's interface as
+`Type: VPN, DeviceName: None`. So `PrimaryInterface.Device` cannot be carried
+forward from stored configuration or merged from what is on disk: it does not
+exist until the tunnel is running. The live value is in the dynamic store, at
+`State:/Network/Service/<serviceID>/IPv4` → `InterfaceName` (here `utun5`).
+
+| Test | Guards against |
+| --- | --- |
+| `SharingSourceDeviceRegressionTests` | An empty or stale `PrimaryInterface.Device`. Pins that the live device is always written, that a stored `""` is replaced rather than merged forward, and that a device from a previous tunnel is replaced too — `utun` numbering is not stable across restarts. |
+
+**Rule this encodes.** Three failures in one run, each one layer beneath the
+last, and all three looked correct from the artefact. Preferences describe
+configuration; only the dynamic store describes what is *running*. Anything
+naming a live interface has to come from the latter.
+
+## The hosted network's name cannot be set, 2026-08-20
+
+The Mac brought its access point up correctly and broadcast the wrong name. The
+preference read `UpLink-c743de63`; the radio was on the air as `UpLink-Spike`,
+a name left over from an earlier spike and present nowhere in this repository.
+
+`NAT:AirPort:NetworkName` is written, accepted, and ignored. This is the third
+field in this one plist to behave that way, after `:NAT:AirPort:Enabled` reading
+`0` with the access point fully up and `PrimaryInterface.Device` being empty for
+a VPN source. The pattern is now unmistakable: **`com.apple.nat.plist` records
+intent, and a good deal of it is vestigial.**
+
+Where the live configuration actually lives is
+`com.apple.airport.preferences.plist`, and with SIP enabled that file cannot be
+read **even by root** — `sudo plutil -p` returns "you don't have permission to
+view it" on a file whose mode is `rw-r--r-- root:wheel`. Searching by the name
+on the air found it only inside `/var/db/diagnostics/*.tracev3`, which are log
+files, not configuration. So the name can be neither read nor written, at any
+privilege level, by us.
+
+**The fix is to stop needing it.** `NEHotspotConfiguration(ssidPrefix:passphrase:isWEP:)`
+(iOS 13+) joins any network whose name begins with a prefix. The user names the
+network once in System Settings, anything starting with `UpLink` matches, and
+the exact name never has to travel between the two devices.
+
+**Rule this encodes.** When a value cannot be read at any privilege level, that
+is the platform declining to have the conversation. Design so the value is not
+needed, rather than looking for a way to extract it — the extraction is the part
+that breaks on the next OS release.
+
+## Wireless bearer, 2026-08-20 — both sides healthy, disagreeing about the port
+
+The Mac hosted its access point, found the phone through its own DHCP lease,
+announced `peer:192.168.2.2:50505`, and dialled it. The phone's listener was up
+and the tunnel extension was running the current build. For several minutes the
+log read, every twelve seconds:
+
+```
+ipc: peer at 192.168.2.2:50505
+dial failed: handshakeFailed("no connection within 12s")
+```
+
+Nothing was broken on either side. They had stopped agreeing about the port.
+
+Over the cable the port arrived inside `requiredLocalEndpoint`, which carried
+**two facts in one value**: bind to loopback, and bind to *this* port. Removing
+that endpoint for the wireless bearer was correct — loopback is unreachable from
+the network the Mac hosts — and silently took the port with it, so
+`NWListener(using:)` chose an ephemeral one. The listener then came up perfectly,
+on a port nobody was dialling.
+
+The port is passed to `NWListener(using:on:)` explicitly now.
+
+| Test | Guards against |
+| --- | --- |
+| `ListenerPortRegressionTests` | The two sides drifting apart on the port. Pins that the wireless listener carries no `requiredLocalEndpoint` to silently re-pin it to loopback, that the cable's still names the same constant, and that the constant is what the Mac announces. |
+
+**Rule this encodes.** A value that carries two facts will lose one of them when
+it is removed for the sake of the other. `requiredLocalEndpoint` meant "loopback"
+and "port 50505" at once; only the first was unwanted. Where a change deletes a
+compound value, name each fact it was carrying and decide about each one.
+
+### The same evening — a diagnostic that could not be wrong
+
+The phone's log said, through every wireless attempt:
+
+```
+listening on 127.0.0.1:50505 — waiting for the Mac to dial over the cable
+```
+
+It was a literal string, written unconditionally after the listener started. It
+said `127.0.0.1` while the bearer had been changed to bind every interface, and
+it said "over the cable" during an evening in which no cable was attached. It
+was read as evidence twice and sent the search in the wrong direction both
+times.
+
+It now reports the port actually bound, the bearer, and the **build**.
+
+The build is there because **installing the app does not restart a running
+Network Extension.** The phone kept an old binary across several installs, so
+fix after fix was shipped to a device that never loaded any of them, and every
+symptom pointed at code that was not running. The proof was that the phone's log
+had not been written to since before the last three installs — identical size
+and mtime — which is a thing nobody thinks to check.
+
+**Rule this encodes.** A diagnostic that cannot be wrong cannot help. If a line
+would print the same text whatever happened, it is decoration. Print the value,
+and print which build printed it.
+
+### macOS has local network privacy too, 2026-08-20
+
+After the phone was proven correct — `join: OK`, `listening: port=50505
+bearer=hostedAP`, reachable at 2.7ms with an ARP entry — the Mac's dial still
+timed out at twelve seconds with **nothing arriving at the phone at all**.
+
+The measurement that separated it:
+
+```
+tcp 50505: Connection to 192.168.2.2 port 50505 succeeded!   ← nc, from Terminal
+dial failed: handshakeFailed("no connection within 12s")     ← the extension
+```
+
+Same address, same port, seconds apart. The difference is not the network, it is
+**which binary is asking**. macOS 15 brought iOS's local network privacy to the
+Mac, and neither `UpLinkMac` nor the proxy extension declared
+`NSLocalNetworkUsageDescription`. Terminal had been granted long ago; the
+extension had never asked, and a denial here is silent — the connection simply
+never completes.
+
+This is the same defect as the iOS one recorded above, on the other device, and
+it was not looked for there because the Mac side had been working all evening
+over loopback — where local network privacy does not apply.
+
+**Rule this encodes.** When two processes on one machine get different answers
+from the same address and port, the variable is the process, not the network.
+Look at what the OS grants each of them before looking at anything else.
+
+### The SYN was going to the home router, 2026-08-20
+
+The dial failed with `POSIXErrorCode(rawValue: 60)` — operation timed out —
+which reads as "the phone is not answering". The phone was answering: ping 2.7ms,
+a valid ARP entry, and `nc` from Terminal reaching the same port. The route
+probe showed what was actually happening:
+
+```
+route to phone: gateway: 192.168.1.254   interface: en0
+```
+
+`192.168.2.2` was falling through to the **default** route, so the Mac sent the
+SYN to the home router, which dropped it. ETIMEDOUT is the correct and useless
+answer to that.
+
+This is why the earlier readings disagreed: an ordinary process and the
+extension were measured at different moments, and the bridge interface comes and
+goes with the access point. Whenever it was not fully up, everything targeting
+the phone left over the home Wi-Fi instead — including, at times, `nc`.
+
+The dial now binds its source to the Mac's own address on the hosted network,
+read from the interfaces at dial time rather than remembered, so the wrong
+interface is impossible rather than unlikely. Loopback is exempt: the cable
+needs no help.
+
+| Test | Guards against |
+| --- | --- |
+| `DialBindingRegressionTests` | An unbound dial leaving over the default route. Pins that the cable's loopback endpoint is recognised and left unbound, that a peer on the hosted network is not mistaken for it, and that binding actually reaches `requiredLocalEndpoint`. |
+
+**Rule this encodes.** ETIMEDOUT names a destination that did not answer, never
+the path taken to it. When it appears against a host that is provably reachable,
+the question is which interface the packets left on.
+
+## The bridge came up, and the thing meant to protect it killed it, 2026-08-20
+
+First working wireless session, and the whole chain:
+
+```
+23:36:33.620 join: OK (prefix UpLink)
+23:36:33.827 listening: port=50505 bearer=hostedAP build=1
+23:36:34.297 accept: inbound from 192.168.2.1:63578
+23:36:34.322 accept: TLS ok, first frame = hello
+23:36:34.332 session started with 012ff2a529f58e7a
+23:36:45.572 session ENDED
+```
+
+Eleven seconds. The Mac's side explains it:
+
+```
+23:36:14  bridge100: inet 192.168.2.1     ← access point up
+23:36:36  bridge100: absent                ← two seconds after the session started
+23:36:47  bridge100: inet 192.168.2.1     ← back on its own
+23:36:55  helper: raising access point     ← the re-host, making it worse
+```
+
+**The access point flaps when the first client associates** — Internet Sharing
+reconfigures and `bridge100` briefly disappears. The thirty-second re-host,
+added so a Mac in the back of a car could recover an access point that had gone
+down, read that blip as "down" and raised again. Raising re-applies the sharing
+configuration, which restarts the access point and drops every client, so the
+repair destroyed a session that had just completed its TLS handshake.
+
+Two guards now, and each is necessary on its own:
+
+- **Never re-host while a session is live.** A working bridge needs no repair,
+  and a re-host during one cannot help by construction.
+- **Down must be sustained.** One sample is a blip; two consecutive checks a
+  minute apart is an access point that is genuinely gone.
+
+**Rule this encodes.** Automatic recovery has to be surer of the fault than of
+its remedy. A repair that is destructive when wrong must wait for evidence that
+would be silly to doubt — and must never run while the thing it protects is
+working.
+
+## The route tunnel was tearing down the access point, 2026-08-20
+
+The first bridge to carry real traffic — Chrome's TCP :443 and a pile of QUIC
+flows — died after twenty-three seconds, and the log shows the machinery eating
+itself:
+
+```
+23:44:36.282  capture policy: peer=192.168.2.3   ← session starting
+23:44:36.722  utun5 removed default route         ← standby → capture
+23:44:36.731  utun5 added default route
+23:44:37.410  InternetSharing: deleted routes     ← sharing rebuilds
+23:44:40      bridge100: absent                    ← the phone is dropped
+```
+
+Internet Sharing is sourced from `UpLink Route`, so **every mode change
+reconfigures the interface it is sharing from** and macOS rebuilds the access
+point underneath it. The phone lost its lease and rejoined as `192.168.2.3`, the
+session died, the mode fell back to standby, and the cycle repeated about every
+twenty seconds.
+
+Nothing here was broken on its own. The route tunnel's standby mode exists so
+the Mac's own network is untouched when not bridging, and it is right; sourcing
+the access point from that tunnel is what makes it come up with no internet
+behind it, and that is right too. Together they form a loop.
+
+While hosting, the mode is now pinned to `.capture`. That is the correct resting
+place rather than a compromise: `en0` is inactive while hosting, given over to
+the radio, so the routes and resolver cost nothing and are needed the moment a
+session arrives.
+
+| Test | Guards against |
+| --- | --- |
+| `RouteModeWhileHostingRegressionTests` | The mode moving while an access point is up. Covers the half that actually bit — no session, where the reconciler wanted standby and wanting it was enough — and asserts the non-hosting behaviour is untouched. |
+
+**Rule this encodes.** Two correct mechanisms can compose into a loop. When one
+supplies the other's foundation, the supplier must be stable for as long as the
+consumer is up, whatever its own logic would otherwise prefer.
+
+## One radio, two claimants, 2026-08-21
+
+Every wireless run so far has had an access point that would not stay up. The
+recorder shows why in a single pair of columns:
+
+```
+bridge100: inet 192.168.2.1  |  en0: status: inactive   ← AP up, radio given over
+bridge100: absent            |  en0: status: active     ← en0 back on home Wi-Fi
+```
+
+They alternate. macOS auto-joins a known Wi-Fi network, hosting an access point
+needs that same radio exclusively, and neither side yields. The Mac spends its
+time oscillating between being a client and being a host.
+
+**This is a property of testing beside a known network**, and the deployment it
+is for has none: a Mac in a car has no remembered Wi-Fi in range, so nothing
+competes for the radio. It still has to be understood, because at a desk it
+makes everything above it look broken — the phone joins and is dropped, the
+dial reports ETIMEDOUT, the session dies after seconds, and each of those has a
+plausible wrong explanation.
+
+A second, self-inflicted half made it worse. Raising is **not idempotent**: it
+re-applies the sharing configuration and macOS rebuilds the access point from
+scratch, dropping every client. Three callers could each ask — the launch, the
+thirty-second timer, and the phone's Bluetooth doorbell — and two raises four
+seconds apart were observed at 00:14:33 and 00:14:37, so the access point was
+being restarted before it had finished coming up. Raises are now debounced with
+a cooldown longer than a raise takes to complete.
+
+**Rule this encodes.** An operation that rebuilds shared state is not made safer
+by being called more often. Before adding a caller to one, ask what happens when
+every caller fires at once — and if the answer is "it restarts", it needs a
+cooldown, not another guard.
+
+### Why it started, 2026-08-21
+
+The user asked why Internet Sharing had begun switching on and off by itself,
+when it had not before. The answer was four hours old and ours.
+
+`1e67f80` gave the access point a switch: it changed when, and only when, the
+user clicked. Deterministic. `11dac05` added a thirty-second timer that
+re-raised it whenever it looked down, so that a Mac in the back of a car could
+recover from a failure nobody was there to see.
+
+Raising is not idempotent. Every raise re-applies the sharing configuration and
+macOS rebuilds the access point from scratch, dropping every client — so a timer
+firing on its own schedule *is* intermittent, unexplainable on/off, by
+construction. It did that to sessions carrying real traffic.
+
+The timer existed for one reason: the phone had no way to ask the Mac to start.
+It does now, over Bluetooth. That is a person asking, at a moment they chose,
+instead of a timer guessing — so the timer is deleted rather than tuned. An
+access point that fails while nobody is asking for it is repaired the moment
+somebody does.
+
+Removing it also required removing the "seen down twice" guard, which existed
+only to stop the timer acting on a blip. With both remaining callers being
+somebody asking — the launch, and Connect on the phone — that guard would have
+silently prevented the Mac from hosting at launch at all.
+
+**Rule this encodes.** Automatic recovery is a liability wherever a person is
+already available to ask. Prefer the deterministic request; add the background
+repair only when nobody can be present, and never to an operation that rebuilds
+the thing it is repairing.
+
+## The root daemon was never the code we were shipping, 2026-08-21
+
+For most of a night, fixes were installed, verified on disk, and not running.
+
+**Replacing the app does not restart a running LaunchDaemon**, and nothing short
+of root can restart one — `launchctl kickstart` answers `Operation not
+permitted`. So the helper went on executing whatever binary it had started with
+while the app, the code on disk, and every version string said otherwise. It
+showed `runs = 1` and a build four releases behind the app it was embedded in.
+
+Every symptom this produced pointed at code that was not executing, which is the
+most expensive kind of wrong: each one had a plausible explanation in the source
+being read, and none of those explanations were being tested by the machine.
+
+Two things now make it impossible rather than something to remember:
+
+- `helperBuild` on the XPC protocol. A helper too old to implement it fails the
+  call, and that failure is itself the answer — so this detects the case it was
+  written for, not merely the case after it.
+- `replaceIfStale()` at launch: unregister, register. That is the one restart an
+  unprivileged app can perform on a system daemon, it is silent because the
+  service is already approved, and it runs before anything asks the helper for
+  work.
+
+**Rule this encodes.** When a component's lifetime is not tied to the thing that
+deploys it, its version is a fact that must be checked at runtime, not assumed
+from the build. Anything long-lived and separately launched — daemons, network
+extensions, agents — needs to say what it is, out loud, on every start.
+
+## The Mac app was crash-looping, and every symptom pointed elsewhere, 2026-08-21
+
+The user reported that nothing was fixed and that Internet Sharing was switching
+on and off. The Mac app was not running at all. It had been aborting at launch
+for an hour, so there was no menu bar, no hosting, no peer announcement — and
+every symptom of that looked exactly like a bridge fault, which is where the
+searching went.
+
+```
+_dispatch_assert_queue_fail
+swift_task_checkIsolatedSwift
+closure #1 in AccessPointHost.proxy(_:)
+__NSXPCCONNECTION_IS_CALLING_OUT_TO_ERROR_BLOCK__
+```
+
+`AccessPointHost` is `@MainActor`, and **a closure written inline in one of its
+methods inherits that isolation**. XPC invokes its error block on its own queue,
+so the runtime asserts on *entering* the closure — before any of its body runs.
+`SIGABRT`, at launch, in a loop.
+
+Two wrong turns are worth recording, because both looked right:
+
+- The first crash report blamed TCC and named
+  `NSBluetoothAlwaysUsageDescription`. That key was present in the installed
+  Info.plist, the signature verified, `tccutil` had nothing to reset, and a
+  clean reinstall changed nothing. It was a *different, earlier* crash than the
+  one still happening, and reading it as current cost a reinstall cycle and a
+  feature being switched off for nothing.
+- Moving the work inside the closure onto the main actor changed nothing,
+  because the violation is entry, not contents. Only `@Sendable` — which opts a
+  closure out of inheriting isolation — fixes it.
+
+It fired reliably whenever an XPC call *failed*, which is exactly what calling a
+method the running helper is too old to implement does. So the staleness check
+crashed the app by way of the stale helper it was written to detect.
+
+**Rule this encodes.** A callback handed to a C or Objective-C API is called on
+that API's thread, whatever the surrounding type's isolation says. Mark it
+`@Sendable` and hop explicitly — and when a crash trace names a closure rather
+than a line inside it, suspect entry rather than contents.
+
+## Two jobs in one timer, 2026-08-21
+
+The phone could start the Mac, join, and bring a tunnel up — and no data moved.
+The Mac said why, once:
+
+```
+route: packets 101 — flows the proxy did NOT claim
+```
+
+Packets were arriving at the dead-end route tunnel and the transparent proxy was
+not claiming them, which is what it does when there is no session. There was no
+session because the Mac never dialled, and it never dialled because it never
+announced where the phone was: `announcePeerIfPossible()` was defined and called
+from nowhere.
+
+It had shared a timer with the automatic re-host. Deleting that timer — correct,
+it was restarting Internet Sharing on a schedule — silently took the peer
+announcement with it. One deletion, two behaviours, and only one of them
+intended.
+
+The two are now separate, and the difference is worth stating because it is why
+one was safe to repeat and the other was not:
+
+- **Announcing** sends an IPC message naming an address. The extension ignores a
+  repeat of what it is already dialling. Nothing is torn down.
+- **Raising** re-applies the sharing configuration and macOS rebuilds the access
+  point, dropping every client. Repetition is destructive.
+
+**Rule this encodes.** Before deleting a periodic block, list every behaviour
+inside it and decide about each one. A timer is a schedule, not a subject —
+things end up in one because they need the same interval, not because they are
+the same job.
+
+## The app launched and started nothing, 2026-08-21
+
+After a reboot cleared twenty stale system extensions, the Mac still carried no
+data. The state told the story:
+
+```
+UpLink Route  ...  (Disconnected)      ← route tunnel never started
+com.uplink.app.proxy                    ← extension not running
+"ipc: received" in 20s: 0               ← was hundreds per minute
+```
+
+`model.start()` was gone from `applicationDidFinishLaunching`. It had been
+removed by a tidy-up deleting an adjacent dead function, which took 58 lines
+instead of the intended 20.
+
+That single call is what brings up the route tunnel and the proxy extension and
+begins polling them. Without it the app still launches, shows a menu bar,
+advertises over Bluetooth, raises the access point on request and answers the
+phone — so it looks entirely alive. Everything that fails is downstream: the
+phone joins, the Mac announces a peer nothing is listening for, no session
+forms, no flow is claimed, and the phone waits forever for a Mac that is running
+and idle.
+
+**Rule this encodes.** Deleting code by locating a start and scanning for the
+next closing brace will take whatever is between them. Count the lines removed
+against the lines intended, and check what the deletion's neighbours were.
+
+## The Mac pulsed between its own Wi-Fi and the shared one, 2026-08-21
+
+The user described the Mac "switching between connecting between the internet
+sharing and the home internet". The recorder shows it plainly, with `en0`
+flipping every five to ten seconds:
+
+```
+01:46:47  en0 inactive              ← access point starting
+01:46:47  en0 active                ← en0 reclaims the radio
+01:47:07  en0 inactive, bridge100 UP
+01:47:18  en0 active, bridge100 gone
+```
+
+Only two raise commands were issued in that whole window, so nothing in the app
+was churning it. The loop was the route tunnel's mode, and the hole was in the
+fix that was supposed to prevent exactly this.
+
+The mode is pinned to `.capture` while hosting, because Internet Sharing is
+sourced from that tunnel and rebuilds the access point on every
+reconfiguration. But "hosting" was decided by asking whether `bridge100`
+existed — and **while the access point is coming up, it does not**. So in the
+seconds that matter most the Mac reported not-hosting, the reconciler asked for
+standby, the tunnel reconfigured, and Internet Sharing tore down the access
+point it was in the middle of starting. `en0` then rejoined a known network,
+sharing tried again, and round it went.
+
+`AccessPointHost.intendsToHost` is set **before** the raise call rather than
+after it succeeds, and the reconciler now takes intent OR observation.
+
+**Rule this encodes.** A guard that protects a startup must be armed before the
+thing starts, not when it finishes. Deciding "are we doing X?" by looking for
+X's finished artefact answers "no" for the entire window in which X is most
+fragile.
+
+## "Chrome works and nothing else does", 2026-08-21
+
+Reported twice, and it survived several wrong explanations before the flow
+accounting settled it. TCP was suspected and cleared; DNS was suspected and
+cleared. What the numbers actually show:
+
+```
+com.relay.mac                274 TCP flows
+com.google.Chrome.helper      37
+com.anthropic.claudefordesktop 7
+com.anthropic.claude-code      1     ← one, in the whole session
+```
+
+Claude Code holds **one long-lived HTTP/2 connection**. Chrome opens a new
+connection per origin and several per page, so it re-establishes constantly and
+never notices the change. A client with one connection notices nothing else.
+
+That single flow, when it finally did open, worked:
+
+```
+02:58:53  tcp open  2600:1901:0:9e23:::443
+02:59:59  tcp done  — 10668 up / 4316 down
+```
+
+**A connection opened over `en0` cannot survive the radio being handed to
+hosting.** Its socket is bound to an address that stops being reachable, and
+nothing resets it — so the client sits on a dead connection until TCP's own
+timeout, which is minutes. New connections work immediately; the old one hangs.
+That is exactly "Chrome is fine and the API request failed", and it is a
+property of the transition rather than a fault in the bridge.
+
+The bridge itself was healthy throughout: 277 completed flows, both address
+families, individual transfers up to 85 KB, and an access point that stayed up
+with no pulsing for the whole session.
+
+**Rule this encodes.** When one application fails and others do not, count its
+connections before suspecting the transport. An application with a single
+long-lived connection is a different test from one that opens hundreds, and only
+the first can see a transition at all.
