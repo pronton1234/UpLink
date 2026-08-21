@@ -1338,3 +1338,36 @@ crashed the app by way of the stale helper it was written to detect.
 that API's thread, whatever the surrounding type's isolation says. Mark it
 `@Sendable` and hop explicitly — and when a crash trace names a closure rather
 than a line inside it, suspect entry rather than contents.
+
+## Two jobs in one timer, 2026-08-21
+
+The phone could start the Mac, join, and bring a tunnel up — and no data moved.
+The Mac said why, once:
+
+```
+route: packets 101 — flows the proxy did NOT claim
+```
+
+Packets were arriving at the dead-end route tunnel and the transparent proxy was
+not claiming them, which is what it does when there is no session. There was no
+session because the Mac never dialled, and it never dialled because it never
+announced where the phone was: `announcePeerIfPossible()` was defined and called
+from nowhere.
+
+It had shared a timer with the automatic re-host. Deleting that timer — correct,
+it was restarting Internet Sharing on a schedule — silently took the peer
+announcement with it. One deletion, two behaviours, and only one of them
+intended.
+
+The two are now separate, and the difference is worth stating because it is why
+one was safe to repeat and the other was not:
+
+- **Announcing** sends an IPC message naming an address. The extension ignores a
+  repeat of what it is already dialling. Nothing is torn down.
+- **Raising** re-applies the sharing configuration and macOS rebuilds the access
+  point, dropping every client. Repetition is destructive.
+
+**Rule this encodes.** Before deleting a periodic block, list every behaviour
+inside it and decide about each one. A timer is a schedule, not a subject —
+things end up in one because they need the same interval, not because they are
+the same job.

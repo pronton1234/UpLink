@@ -68,6 +68,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // stays available in the menu for when the user genuinely wants the
         // radio back.
         startBeaconUnlessItCrashedLastTime()
+
+        // TELLING THE EXTENSION WHERE THE PHONE IS, which is a different job
+        // from hosting and must not share a timer with it again.
+        //
+        // These two lived in one block, and deleting that block to stop the
+        // access point being re-raised on a schedule silently took this with
+        // it. The Mac then never announced a peer, so the extension never
+        // dialled, so there was no session, so the proxy claimed no flows and
+        // every packet fell into the dead-end route tunnel — "route: packets
+        // 101 — flows the proxy did NOT claim". The bridge looked connected
+        // from the phone and carried nothing.
+        //
+        // This one is safe to repeat where the other was not: it sends an IPC
+        // message naming an address, and the extension ignores a repeat of what
+        // it is already dialling. Nothing is torn down and rebuilt.
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.refreshAccessPointState()
+                await self.model.announcePeerIfPossible()
+            }
+        }
     }
 
     /// Starts the Bluetooth doorbell, at most once per build if it aborts.
