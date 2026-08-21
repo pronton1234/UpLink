@@ -50,6 +50,12 @@ final class AccessPointHost {
         return created
     }
 
+    /// Records the password the user set on the network in System Settings.
+    func setPassphrase(_ passphrase: String) {
+        UserDefaults.standard.set(passphrase, forKey: Self.passphraseKey)
+        log.info("access point passphrase updated")
+    }
+
     /// Raises the access point using this Mac's own credentials.
     func raise() async -> String? { await raise(credentials) }
 

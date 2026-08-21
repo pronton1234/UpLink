@@ -128,6 +128,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Asks for the password the user set on the network in System Settings.
+    ///
+    /// It cannot be discovered. `com.apple.airport.preferences.plist` holds the
+    /// live software-AP configuration and SIP makes it unreadable even to root,
+    /// so there is no privilege level at which the Mac can look this up. The
+    /// phone needs it to join, so someone has to say it once — and once is the
+    /// whole of it, because it is stored and travels over the pairing channel
+    /// from then on.
+    @objc private func setNetworkPassword() {
+        let alert = NSAlert()
+        alert.messageText = "UpLink network password"
+        alert.informativeText =
+            "Type the password you set for Internet Sharing in System Settings → "
+            + "General → Sharing → Internet Sharing → Wi-Fi Options.\n\n"
+            + "macOS does not let any app read it, so UpLink cannot find it for you. "
+            + "Your iPhone needs it to join the network on its own."
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = accessPoint.credentials.passphrase
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let typed = field.stringValue
+        // WPA2 refuses anything outside 8...63 characters, and it refuses it
+        // deep inside Internet Sharing rather than here — so it is caught here.
+        guard (8 ... 63).contains(typed.count) else {
+            let problem = NSAlert()
+            problem.messageText = "That password will not work"
+            problem.informativeText =
+                "A Wi-Fi password has to be between 8 and 63 characters. "
+                + "That is a WPA2 rule, not UpLink's."
+            problem.runModal()
+            return
+        }
+        accessPoint.setPassphrase(typed)
+    }
+
     private func refreshAccessPointState() {
         Task { @MainActor in
             let up = await accessPoint.isUp()
@@ -230,6 +270,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         apItem.isEnabled = !accessPointBusy
         menu.addItem(apItem)
+
+        // The password cannot be read from the system either — same protected
+        // store as the name — so it is asked for once rather than guessed at.
+        menu.addItem(NSMenuItem(
+            title: "Set Network Password…", action: #selector(setNetworkPassword), keyEquivalent: ""
+        ))
 
         menu.addItem(.separator())
 
