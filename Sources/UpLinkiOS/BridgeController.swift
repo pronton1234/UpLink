@@ -51,17 +51,18 @@ final class BridgeController {
     var needsNetworkPassword = false
 
     private static let passwordKey = "UpLinkNetworkPassword"
-    private static let turnedOffKey = "UpLinkUserTurnedOff"
-
-    /// Whether the user's last deliberate act was to switch the bridge off.
+    /// Whether the user switched the bridge off **during this run of the app**.
     ///
-    /// Remembered so that reconnecting can be automatic without ever overriding
-    /// a choice: an app that switches itself back on after being switched off
-    /// is not convenient, it is disobedient.
-    private var userTurnedOff: Bool {
-        get { UserDefaults.standard.bool(forKey: Self.turnedOffKey) }
-        set { UserDefaults.standard.set(newValue, forKey: Self.turnedOffKey) }
-    }
+    /// Deliberately not persisted, and the distinction matters. Auto-connect
+    /// must never override a choice the user just made — switching itself back
+    /// on thirty seconds after being switched off would be disobedient. But
+    /// remembering it forever is a different mistake: it makes Turn Off a trap
+    /// that silently disables auto-connect for every future launch, so opening
+    /// the app does nothing and nothing says why.
+    ///
+    /// Opening the app IS the request. Within one run, Off means off; a fresh
+    /// launch is a fresh ask.
+    private var userTurnedOff = false
 
     /// Brings the bridge up on launch, without being asked.
     ///
