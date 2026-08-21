@@ -59,6 +59,9 @@ final class MenuBarModel {
 
     fileprivate(set) var status: MacBridgeStatus = .waitingForCable
     private(set) var pairedDevices: [PairedDevice] = []
+    /// Last peer announcement, so the log records changes rather than a
+    /// line every few seconds.
+    private var lastAnnouncedPeer: String?
 
     private(set) var activePairingCode: PairingCode?
     private(set) var pairingExpiresAt: Date?
@@ -826,6 +829,56 @@ final class MenuBarModel {
     }
 
     @discardableResult
+    /// Tells the extension where the phone is on the network this Mac hosts.
+    ///
+    /// **Not Bonjour, deliberately.** The Mac is the DHCP server for its own
+    /// access point, so it already knows every address it handed out. Browsing
+    /// for a service would add a discovery protocol, a local-network permission
+    /// prompt, and a thing that has to survive radio changes — to learn
+    /// something already written down in `/var/db/dhcpd_leases`.
+    ///
+    /// The UDID is the paired device's, not anything read off the network.
+    /// Over the cable it identified which handset was plugged in; here it only
+    /// selects which pairing to use, and the TLS-PSK handshake is what actually
+    /// establishes who the peer is.
+    func announcePeerIfPossible() async {
+        // No access point means no network to find the phone on, and the lease
+        // file outlives the network — so this check is what stops a stale entry
+        // being announced as a live peer.
+        guard FileManager.default.fileExists(atPath: "/dev/null"),
+              (try? String(contentsOfFile: DHCPLease.path, encoding: .utf8)) != nil,
+              isHostingAccessPoint() else { return }
+
+        guard let contents = try? String(contentsOfFile: DHCPLease.path, encoding: .utf8),
+              let lease = DHCPLease.mostRecent(in: contents) else { return }
+
+        // A record with no UDID matches any device on the extension's side, so
+        // an empty string is the honest thing to send when we have no pairing
+        // yet rather than inventing an identifier.
+        let udid = pairedDevices.first?.udid ?? ""
+        let message = "peer:\(lease.address):\(UpLinkUSB.extensionPort):\(udid)"
+        if message != lastAnnouncedPeer {
+            lastAnnouncedPeer = message
+            log.error("announcing peer at \(lease.address, privacy: .public)")
+        }
+        _ = await sendToExtension(message)
+    }
+
+    /// Whether this Mac is currently hosting its access point.
+    ///
+    /// Read from the interfaces. The preference file says what was asked for,
+    /// which has repeatedly not been what is running.
+    private func isHostingAccessPoint() -> Bool {
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let first = addresses else { return false }
+        defer { freeifaddrs(addresses) }
+        for pointer in sequence(first: first, next: { $0.pointee.ifa_next })
+        where String(cString: pointer.pointee.ifa_name) == "bridge100" {
+            return pointer.pointee.ifa_flags & UInt32(IFF_RUNNING) != 0
+        }
+        return false
+    }
+
     private func sendToExtension(_ message: String) async -> String? {
         guard let session = manager?.connection as? NETunnelProviderSession else { return nil }
         return await withCheckedContinuation { continuation in

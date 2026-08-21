@@ -63,7 +63,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // us, and a menu still offering "Start" for a running network is how
         // the user ends up clicking it five times. Cheap enough to just ask.
         Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refreshAccessPointState() }
+            Task { @MainActor in
+                self?.refreshAccessPointState()
+                // The phone can join at any moment, and joining is the only
+                // signal that it is reachable. Re-announcing is idempotent —
+                // the extension ignores a repeat of what it is already dialling.
+                await self?.model.announcePeerIfPossible()
+            }
         }
     }
 

@@ -224,7 +224,15 @@ actor PhoneBridge {
             port: UpLinkUSB.extensionPort,
             // So a Mac revoked while it was unplugged is still told after this
             // extension is relaunched — which iOS does often.
-            tombstoneStore: TombstoneStore()
+            tombstoneStore: TombstoneStore(),
+            // THE BEARER. `.hostedAP` stops the listener pinning itself to
+            // loopback — which usbmuxd required and which makes it unreachable
+            // from the network the Mac hosts — and makes it advertise
+            // `_uplink._tcp` so the Mac can find the address DHCP just gave it.
+            //
+            // Over the cable the Mac dialled a fixed loopback port and usbmuxd
+            // did the finding. Nothing plays that role now.
+            bearer: .hostedAP
         )
         self.host = host
 

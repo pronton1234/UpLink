@@ -16,7 +16,7 @@ enum BridgeState: Equatable {
     case needsPermission
     /// The bridge is switched off. Nothing is listening.
     case idle
-    /// Listening, with no Mac connected. Plug the cable in.
+    /// Listening, with no Mac connected. Start the network on the Mac.
     case waitingForMac
     case connected(peer: String, egress: EgressInterface)
     case failed(String)
@@ -212,7 +212,7 @@ final class BridgeController {
         log.error("""
             autoconnect: listening but no Mac dialled within 30s — \
             \(self.pairedDevices.count, privacy: .public) paired device(s); \
-            check the cable and that UpLink is running on the Mac
+            check the UpLink network is started and UpLink is running on the Mac
             """)
     }
 
