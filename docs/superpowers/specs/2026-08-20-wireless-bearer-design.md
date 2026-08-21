@@ -266,22 +266,22 @@ Output is an answer in `docs/device-test-log.md`, not code.
 **Phase 1 — the helper.** `SMAppService` daemon, the access-point lifecycle, and
 sleep policy.
 
-**Phase 1b — bearer.** `TransportProfile`, the three sites above, and the
+**Phase 2 — bearer.** `TransportProfile`, the three sites above, and the
 `.wifi` prohibition.
 
-**Phase 2 — the phone's join.** `NEHotspotConfiguration`, the
+**Phase 3 — the phone's join.** `NEHotspotConfiguration`, the
 `com.apple.developer.networking.HotspotConfiguration` entitlement, and the
 Connect button.
 
-**Phase 3 — surfacing.** Access-point and association states in both apps.
+**Phase 4 — surfacing.** Access-point and association states in both apps.
 Rewrite `verify-cellular.sh`.
 
-**Phase 4 — proof.** The full live-traffic matrix over the access point.
+**Phase 5 — proof.** The full live-traffic matrix over the access point.
 
-**Phase 5 — removal.** Delete `usbmuxd`, `USBRelay`, the loopback relay and the
-menu-bar dependency it forced. Only after Phase 4 passes.
+**Phase 6 — removal.** Delete `usbmuxd`, `USBRelay`, the loopback relay and the
+menu-bar dependency it forced. Only after Phase 5 passes.
 
-Phases 0 and 4 need the operator and the iPhone in the same room. Every other
+Phases 0 and 5 need the operator and the iPhone in the same room. Every other
 phase runs unattended.
 
 ## Risks
