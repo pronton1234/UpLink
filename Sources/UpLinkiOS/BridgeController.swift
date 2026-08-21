@@ -340,6 +340,7 @@ final class BridgeController {
             // show a connection that did not exist.
             state = .waitingForMac
             startStatusPolling()
+            watchTunnelComesUp()
         } catch {
             state = .failed(error.localizedDescription)
         }
@@ -363,6 +364,50 @@ final class BridgeController {
     /// Provider messages are request/response only — the extension cannot push
     /// — so the app polls, exactly as the Mac's menu bar does. Once a second is
     /// imperceptible and keeps the warning honest.
+    /// Reports a tunnel that was accepted and never actually came up.
+    ///
+    /// `startVPNTunnel()` returning means the REQUEST was accepted, nothing
+    /// more — so the UI has always said "waiting for the Mac" from that moment.
+    /// When the extension then never launches, that sentence is wrong and never
+    /// changes, and the screen sits there indefinitely with no way to tell that
+    /// anything is wrong. Observed on hardware 2026-08-20: the Mac dialled
+    /// 192.168.2.2 and timed out every 12 seconds against a phone whose
+    /// listener had never started.
+    ///
+    /// **iOS runs one packet tunnel at a time.** Another VPN holding it is the
+    /// most common reason this happens, and it is invisible from inside this
+    /// app — we can see that ours did not start, not who has it. So the message
+    /// names the likely cause rather than asserting it.
+    private func watchTunnelComesUp() {
+        tunnelWatchTask?.cancel()
+        tunnelWatchTask = Task { [weak self] in
+            for _ in 0 ..< 15 {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, !Task.isCancelled else { return }
+                guard case .waitingForMac = state else { return }
+                switch manager?.connection.status {
+                case .connected, .connecting, .reasserting:
+                    return
+                default:
+                    continue
+                }
+            }
+            guard let self, case .waitingForMac = state else { return }
+            guard manager?.connection.status != .connected else { return }
+            log.error("tunnel never came up; status \(String(describing: self.manager?.connection.status), privacy: .public)")
+            state = .failed(
+                "UpLink could not start its network extension. iOS runs one VPN "
+                + "at a time — if another VPN is on, turn it off and try again."
+            )
+        }
+    }
+
+    private var tunnelWatchTaskStorage: Task<Void, Never>?
+    private var tunnelWatchTask: Task<Void, Never>? {
+        get { tunnelWatchTaskStorage }
+        set { tunnelWatchTaskStorage?.cancel(); tunnelWatchTaskStorage = newValue }
+    }
+
     private func startStatusPolling() {
         statusTask?.cancel()
         statusTask = Task { @MainActor [weak self] in
