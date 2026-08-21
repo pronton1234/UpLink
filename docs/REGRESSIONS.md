@@ -1297,3 +1297,44 @@ Two things now make it impossible rather than something to remember:
 deploys it, its version is a fact that must be checked at runtime, not assumed
 from the build. Anything long-lived and separately launched — daemons, network
 extensions, agents — needs to say what it is, out loud, on every start.
+
+## The Mac app was crash-looping, and every symptom pointed elsewhere, 2026-08-21
+
+The user reported that nothing was fixed and that Internet Sharing was switching
+on and off. The Mac app was not running at all. It had been aborting at launch
+for an hour, so there was no menu bar, no hosting, no peer announcement — and
+every symptom of that looked exactly like a bridge fault, which is where the
+searching went.
+
+```
+_dispatch_assert_queue_fail
+swift_task_checkIsolatedSwift
+closure #1 in AccessPointHost.proxy(_:)
+__NSXPCCONNECTION_IS_CALLING_OUT_TO_ERROR_BLOCK__
+```
+
+`AccessPointHost` is `@MainActor`, and **a closure written inline in one of its
+methods inherits that isolation**. XPC invokes its error block on its own queue,
+so the runtime asserts on *entering* the closure — before any of its body runs.
+`SIGABRT`, at launch, in a loop.
+
+Two wrong turns are worth recording, because both looked right:
+
+- The first crash report blamed TCC and named
+  `NSBluetoothAlwaysUsageDescription`. That key was present in the installed
+  Info.plist, the signature verified, `tccutil` had nothing to reset, and a
+  clean reinstall changed nothing. It was a *different, earlier* crash than the
+  one still happening, and reading it as current cost a reinstall cycle and a
+  feature being switched off for nothing.
+- Moving the work inside the closure onto the main actor changed nothing,
+  because the violation is entry, not contents. Only `@Sendable` — which opts a
+  closure out of inheriting isolation — fixes it.
+
+It fired reliably whenever an XPC call *failed*, which is exactly what calling a
+method the running helper is too old to implement does. So the staleness check
+crashed the app by way of the stale helper it was written to detect.
+
+**Rule this encodes.** A callback handed to a C or Objective-C API is called on
+that API's thread, whatever the surrounding type's isolation says. Mark it
+`@Sendable` and hop explicitly — and when a crash trace names a closure rather
+than a line inside it, suspect entry rather than contents.

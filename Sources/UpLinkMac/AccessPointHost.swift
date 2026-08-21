@@ -175,7 +175,7 @@ final class AccessPointHost {
     /// helper that was never approved simply never replies, and a continuation
     /// that is never resumed is a hang, not an error. Both handlers below exist
     /// to make sure the reply always arrives.
-    private func proxy(_ body: @escaping (UpLinkHelperProtocol?, String?) -> Void) {
+    private func proxy(_ body: @escaping @MainActor (UpLinkHelperProtocol?, String?) -> Void) {
         guard isRegistered else {
             body(nil, "the UpLink helper has not been approved yet")
             return
@@ -184,11 +184,38 @@ final class AccessPointHost {
         self.connection = connection
 
         let once = OneShotFlag()
-        let remote = connection.remoteObjectProxyWithErrorHandler { [weak self] error in
+        // CRASHED THE APP, and it took an hour of looking elsewhere to see it.
+        //
+        // XPC invokes this error block on ITS OWN QUEUE, not on the main actor.
+        // This type is @MainActor, so the previous version's `self?.log` and
+        // its direct `body(...)` were main-actor work performed on a background
+        // thread: the Swift runtime asserts and the process aborts. Not an
+        // error, not a hang — SIGABRT at launch, crash-looping, with the menu
+        // bar never appearing and every downstream symptom looking like a
+        // bridge fault.
+        //
+        // It fired reliably whenever an XPC call FAILED, which is exactly what
+        // a method the running helper is too old to implement does. So the
+        // staleness check crashed the app by way of the stale helper it was
+        // written to detect.
+        //
+        // The logger is captured by value — `Logger` is Sendable — and every
+        // resumption hops to the main actor explicitly.
+        //
+        // `@Sendable` is what actually fixes it, and nothing less does. A
+        // closure written inline in a method of a @MainActor type INHERITS that
+        // isolation, so the runtime asserts on ENTERING it from XPC's queue —
+        // before a single line of the body runs. Moving the work inside onto
+        // the main actor therefore changed nothing; the closure has to opt out
+        // of inheriting isolation in the first place.
+        let log = self.log
+        let handler: @Sendable (Error) -> Void = { error in
             guard once.claim() else { return }
-            self?.log.error("helper unreachable: \(error.localizedDescription, privacy: .public)")
-            body(nil, error.localizedDescription)
-        } as? UpLinkHelperProtocol
+            log.error("helper unreachable: \(error.localizedDescription, privacy: .public)")
+            let message = error.localizedDescription
+            Task { @MainActor in body(nil, message) }
+        }
+        let remote = connection.remoteObjectProxyWithErrorHandler(handler) as? UpLinkHelperProtocol
 
         guard once.claim() else { return }
         body(remote, remote == nil ? "the UpLink helper is not answering" : nil)

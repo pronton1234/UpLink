@@ -67,7 +67,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // there is nothing being taken away by hosting continuously. Stopping
         // stays available in the menu for when the user genuinely wants the
         // radio back.
-        startBeacon()
+        // OFF BY DEFAULT, AND THAT IS NOT CAUTION.
+        //
+        // Creating a CBPeripheralManager here made TCC abort the process on
+        // launch — SIGABRT, "must contain an NSBluetoothAlwaysUsageDescription
+        // key" — with that key present in the installed Info.plist, the bundle
+        // signature valid, and a clean reinstall making no difference. A TCC
+        // abort cannot be caught, so a beacon that trips it does not degrade,
+        // it takes the whole app down: no hosting, no peer announcement, no
+        // menu bar. The Mac app crash-looped for an hour that way while every
+        // symptom looked like a bridge problem.
+        //
+        // So the doorbell is behind a switch until it can be brought up without
+        // risking the app. Everything else works without it; only "start the
+        // Mac from the phone" is lost, and a Mac that runs is worth more than
+        // a feature that stops it running.
+        if UserDefaults.standard.bool(forKey: "UpLinkEnableBeacon") {
+            startBeacon()
+        } else {
+            logAccessPoint.error("beacon disabled — set UpLinkEnableBeacon to turn it on")
+        }
 
         // NO TIMER HERE, DELIBERATELY, and it was here for four hours.
         //
