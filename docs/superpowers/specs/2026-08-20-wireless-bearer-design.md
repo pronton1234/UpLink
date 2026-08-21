@@ -114,6 +114,26 @@ NAT -dict-add Enabled -int 1
 launchctl kickstart -k system/com.apple.NetworkSharing
 ```
 
+**The mechanism is identified, not guessed.**
+`/System/Library/SystemConfiguration/InternetSharingPreference.bundle` is a
+**configd plugin** — bundle id `com.apple.SystemConfiguration.ISPreference`,
+`Enabled = true` in its Info.plist — and its binary references
+`com.apple.nat.plist`, `com.apple.NetworkSharing` and `SharingDevices`, with log
+strings of the form `preference: NAT disabled`.
+
+Two things follow, and together they are why this design does not rest on hope:
+
+- **Writing the preference is the supported input path.** The plugin exists to
+  read that file and start the daemon from it. It is not a side door.
+- **Boot persistence has an owner.** `com.apple.NetworkSharing` has no
+  `RunAtLoad`, so something must start it after a restart, and this plugin is
+  that something — configd loads it at boot and acts on the preference. The
+  access point coming back is a property of the system, not of our helper
+  remembering to ask.
+
+The helper's `RunAtLoad` is therefore belt-and-braces rather than the only
+thing standing between the user and a trip to System Settings.
+
 **Why the earlier finding does not forbid this.** A prior run recorded
 `:NAT:AirPort:Enabled` reading `0` with the access point fully up, and concluded
 "never test that field." That conclusion is correct and it is about *reading*.
@@ -286,12 +306,14 @@ phase runs unattended.
 
 ## Risks
 
-- **The write-and-kickstart mechanism is unverified on macOS 26.** This is the
-  design's load-bearing assumption. If it fails, the helper cannot raise the
-  access point and the Mac needs Internet Sharing enabled by hand — once at
-  setup if macOS restores it at boot, once per reboot if it does not. The
-  degradation is graceful but it is the difference between meeting the
-  requirement and approaching it.
+- **The write-and-kickstart mechanism is unconfirmed on macOS 26**, though no
+  longer a blind assumption: configd's own `ISPreference` plugin reads
+  `com.apple.nat.plist` and owns starting `com.apple.NetworkSharing`, which is
+  both the supported write path and the reason the setting survives a reboot.
+  `scripts/ap-probe.sh` captures that plugin's own log line, so the answer comes
+  from what configd concluded rather than from inference. If it somehow fails,
+  the helper still owns sleep policy and the access point is enabled by hand
+  once at setup — the plugin restores it at boot regardless of who enabled it.
 - **iOS may not hold a no-internet association indefinitely.** It joined on
   2026-08-15; that it *stays* for hours is unproven.
 - **The machine under test is the machine driving the test.**

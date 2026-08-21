@@ -113,6 +113,32 @@ run /usr/bin/plutil -extract NAT.SharingDevices json -o - "$PLIST"
 say "AFTER — what the daemon said"
 run /usr/bin/log show --last 2m --predicate 'process == "InternetSharing"' --style compact
 
+# THE BEST EVIDENCE IN THIS FILE.
+#
+# com.apple.SystemConfiguration.ISPreference is a configd plugin, Enabled=true,
+# and its strings reference com.apple.nat.plist, com.apple.NetworkSharing and
+# SharingDevices. It is what reads the preference and starts the daemon from it
+# — which is both why writing the file is the supported input path and why the
+# setting survives a reboot at all. It logs its own decision ("preference: NAT
+# disabled"), so this says what configd concluded rather than leaving us to
+# infer it from interfaces that may lag or lie.
+say "AFTER — what configd's Internet Sharing plugin concluded"
+run /usr/bin/log show --last 2m --predicate 'process == "configd"' --style compact
+run /usr/bin/log show --last 2m --predicate 'subsystem == "com.apple.SystemConfiguration"' --style compact
+
+say "REBOOT PERSISTENCE — what to check after restarting"
+{
+    echo "The plugin above is what restores this at boot, so if the AP came up"
+    echo "here it should also come up after a restart. To confirm, leave NAT"
+    echo "enabled, reboot, and run:"
+    echo
+    echo "    ifconfig bridge100 && pgrep -x InternetSharing"
+    echo
+    echo "This probe deliberately restores the original config, so it does NOT"
+    echo "leave anything enabled to reboot into. That is a separate deliberate"
+    echo "step, not something to do by accident."
+} >>"$OUT"
+
 say "VERDICT INPUTS"
 {
     echo "bridge100 present : $(/sbin/ifconfig bridge100 >/dev/null 2>&1 && echo YES || echo NO)"
