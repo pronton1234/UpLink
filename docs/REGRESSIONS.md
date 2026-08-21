@@ -1091,3 +1091,36 @@ over loopback — where local network privacy does not apply.
 **Rule this encodes.** When two processes on one machine get different answers
 from the same address and port, the variable is the process, not the network.
 Look at what the OS grants each of them before looking at anything else.
+
+### The SYN was going to the home router, 2026-08-20
+
+The dial failed with `POSIXErrorCode(rawValue: 60)` — operation timed out —
+which reads as "the phone is not answering". The phone was answering: ping 2.7ms,
+a valid ARP entry, and `nc` from Terminal reaching the same port. The route
+probe showed what was actually happening:
+
+```
+route to phone: gateway: 192.168.1.254   interface: en0
+```
+
+`192.168.2.2` was falling through to the **default** route, so the Mac sent the
+SYN to the home router, which dropped it. ETIMEDOUT is the correct and useless
+answer to that.
+
+This is why the earlier readings disagreed: an ordinary process and the
+extension were measured at different moments, and the bridge interface comes and
+goes with the access point. Whenever it was not fully up, everything targeting
+the phone left over the home Wi-Fi instead — including, at times, `nc`.
+
+The dial now binds its source to the Mac's own address on the hosted network,
+read from the interfaces at dial time rather than remembered, so the wrong
+interface is impossible rather than unlikely. Loopback is exempt: the cable
+needs no help.
+
+| Test | Guards against |
+| --- | --- |
+| `DialBindingRegressionTests` | An unbound dial leaving over the default route. Pins that the cable's loopback endpoint is recognised and left unbound, that a peer on the hosted network is not mistaken for it, and that binding actually reaches `requiredLocalEndpoint`. |
+
+**Rule this encodes.** ETIMEDOUT names a destination that did not answer, never
+the path taken to it. When it appears against a host that is provably reachable,
+the question is which interface the packets left on.

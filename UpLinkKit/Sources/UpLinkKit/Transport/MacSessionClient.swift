@@ -319,7 +319,20 @@ public actor MacSessionClient {
     }
 
     private func dial(endpoint: NWEndpoint, psk: SymmetricKey, identity: String) async throws -> FrameChannel {
-        try await dial(endpoint: endpoint, parameters: TransportParameters.session(psk: psk, identity: identity))
+        // Bound to the hosted network when we are hosting one, so the dial
+        // cannot leave over the home Wi-Fi and die at the home router. Nil over
+        // the cable, where loopback needs no help.
+        let local = Self.isLoopback(endpoint) ? nil : TransportParameters.hostedNetworkAddress()
+        return try await dial(
+            endpoint: endpoint,
+            parameters: TransportParameters.session(psk: psk, identity: identity, boundTo: local)
+        )
+    }
+
+    /// Whether this endpoint is the cable's loopback relay.
+    static func isLoopback(_ endpoint: NWEndpoint) -> Bool {
+        guard case let .hostPort(host, _) = endpoint else { return false }
+        return "\(host)" == "127.0.0.1"
     }
 
     private func dial(endpoint: NWEndpoint, parameters: NWParameters) async throws -> FrameChannel {

@@ -118,3 +118,38 @@ struct ListenerPortRegressionTests {
         #expect(port.rawValue == UpLinkUSB.extensionPort)
     }
 }
+
+// SYMPTOM, on hardware 2026-08-20: the dial failed with POSIX 60, operation
+// timed out, which reads as "the phone is not answering". The phone was
+// answering — ping 2.7ms, ARP present, and an ordinary process reached the same
+// port. The route probe showed why:
+//
+//     route to phone: gateway: 192.168.1.254 interface: en0
+//
+// 192.168.2.2 was falling through to the DEFAULT route and the Mac was sending
+// the SYN to the home router, which dropped it. Binding the source to the Mac's
+// own address on the hosted network makes the wrong interface impossible.
+
+@Suite("Regression: the dial cannot leave over the wrong interface")
+struct DialBindingRegressionTests {
+
+    @Test("The cable's endpoint is recognised, so loopback is never bound")
+    func loopbackIsRecognised() {
+        #expect(MacSessionClient.isLoopback(MacSessionClient.loopbackEndpoint(port: 50505)))
+    }
+
+    @Test("A peer on the hosted network is not mistaken for loopback")
+    func hostedPeerIsNotLoopback() {
+        #expect(!MacSessionClient.isLoopback(.hostPort(host: "192.168.2.2", port: 50505)))
+    }
+
+    @Test("A bound session pins its local endpoint; an unbound one does not")
+    func bindingIsApplied() {
+        let key = SymmetricKey(size: .bits256)
+        let bound = TransportParameters.session(psk: key, identity: "x", boundTo: "192.168.2.1")
+        #expect(bound.requiredLocalEndpoint != nil)
+
+        let free = TransportParameters.session(psk: key, identity: "x")
+        #expect(free.requiredLocalEndpoint == nil)
+    }
+}
