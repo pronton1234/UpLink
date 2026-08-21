@@ -241,6 +241,21 @@ public actor PhoneSessionHost {
         )
 
         let listener = try NWListener(using: parameters)
+
+        // The phone announces itself and the Mac browses. Over the cable this
+        // was usbmuxd's job — the Mac dialled a fixed loopback port and the
+        // daemon did the finding. On a shared link the phone holds a DHCP
+        // address nothing else knows, so nothing can find it unless it says so.
+        //
+        // A mismatch in the service type is silent on both sides: the Mac
+        // simply never finds a phone that is advertising perfectly happily,
+        // which is why the name is a single constant in UpLinkIdentifiers.
+        if bearer != .usbmux {
+            listener.service = NWListener.Service(
+                name: deviceName, type: UpLinkIdentifiers.bonjourServiceType
+            )
+        }
+
         listener.newConnectionHandler = { [weak self] connection in
             Task { await self?.accept(connection) }
         }
