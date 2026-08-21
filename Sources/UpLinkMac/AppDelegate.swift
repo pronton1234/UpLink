@@ -64,12 +64,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hostAccessPointIfNeeded()
         startBeacon()
 
-        // Also on a timer: the access point can go down for reasons of its own
-        // — a reboot, a network change, someone switching it off in System
-        // Settings — and a Mac in the back of a car cannot be asked to notice.
-        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.hostAccessPointIfNeeded() }
-        }
+        // NO TIMER HERE, DELIBERATELY, and it was here for four hours.
+        //
+        // It re-raised the access point whenever it looked down, so that a Mac
+        // in the back of a car could recover one that had genuinely failed.
+        // Raising is not idempotent: each one re-applies the sharing
+        // configuration and macOS rebuilds the access point from scratch,
+        // dropping every client. A timer firing on its own schedule therefore
+        // produced exactly what the user reported — Internet Sharing switching
+        // on and off with no discernible cause — and it did that to sessions
+        // that were carrying real traffic.
+        //
+        // It existed only because the phone had no way to ask the Mac to start.
+        // It does now, over Bluetooth, and that is a deterministic request from
+        // a person rather than a guess from a timer. Nothing is lost: an access
+        // point that fails while nobody is asking for it is repaired the moment
+        // somebody does.
 
         model.onCableRemoved = { [weak self] in
             self?.notifyCableRemoved()
@@ -112,7 +122,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // "host again", and refusing on the strength of a switch
                     // flipped hours ago would be the wrong kind of loyalty.
                     accessPointStoppedByUser = false
-                    accessPointDownChecks = 2
                     hostAccessPointIfNeeded()
                 case .lowerAccessPoint:
                     guard accessPointIsUp else { return }
@@ -147,10 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Sharing configuration, which restarts the access point and drops
         // every client on it — so a re-host during a working bridge does not
         // repair anything, it destroys the thing it was meant to protect.
-        guard !model.status.isConnected else {
-            accessPointDownChecks = 0
-            return
-        }
+        guard !model.status.isConnected else { return }
         if let lastRaise, Date().timeIntervalSince(lastRaise) < Self.raiseCooldown {
             // Observed 00:14:33 and 00:14:37 — two raises four seconds apart,
             // each restarting sharing, so the access point never had time to
@@ -160,27 +166,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         Task { @MainActor in
             guard await !accessPoint.isUp() else {
-                accessPointDownChecks = 0
                 if !accessPointIsUp { accessPointIsUp = true; refreshStatusItem() }
                 return
             }
 
-            // MEASURED 2026-08-20, and this guard is the whole point of the
-            // counter. The access point FLAPS when the first client associates:
-            // bridge100 vanished two seconds after the phone joined and came
-            // back eleven seconds later. A re-host on that blip restarted
-            // sharing and killed a session that had just completed its TLS
-            // handshake and was carrying traffic.
+            // NO "IS IT REALLY DOWN?" CHECK ANY MORE, and removing it was
+            // required rather than tidy.
             //
-            // So down has to be sustained before it is believed. One sample is
-            // a blip; two in a row, a minute apart, is an access point that is
-            // genuinely gone.
-            accessPointDownChecks += 1
-            guard accessPointDownChecks >= 2 else {
-                logAccessPoint.error("access point looks down — waiting for a second check")
-                return
-            }
-            accessPointDownChecks = 0
+            // It existed to stop the periodic re-host from acting on a blip —
+            // the access point flaps briefly when the first client associates.
+            // With the timer gone, both remaining callers are somebody asking:
+            // the app launching, and the phone pressing Connect. Making a
+            // person ask twice is not caution, it is a bug, and this guard
+            // would have silently stopped the Mac hosting at launch at all.
             accessPointBusy = true
             lastRaise = Date()
             refreshStatusItem()
@@ -199,8 +197,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Set only by an explicit Stop, so automatic hosting never overrides a
     /// deliberate choice.
     private var accessPointStoppedByUser = false
-    /// Consecutive checks that saw no access point. See ``hostAccessPointIfNeeded``.
-    private var accessPointDownChecks = 0
     /// When the access point was last asked to come up.
     ///
     /// Raising is not idempotent: it re-applies the sharing configuration and

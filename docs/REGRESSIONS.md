@@ -1237,3 +1237,34 @@ a cooldown longer than a raise takes to complete.
 by being called more often. Before adding a caller to one, ask what happens when
 every caller fires at once — and if the answer is "it restarts", it needs a
 cooldown, not another guard.
+
+### Why it started, 2026-08-21
+
+The user asked why Internet Sharing had begun switching on and off by itself,
+when it had not before. The answer was four hours old and ours.
+
+`1e67f80` gave the access point a switch: it changed when, and only when, the
+user clicked. Deterministic. `11dac05` added a thirty-second timer that
+re-raised it whenever it looked down, so that a Mac in the back of a car could
+recover from a failure nobody was there to see.
+
+Raising is not idempotent. Every raise re-applies the sharing configuration and
+macOS rebuilds the access point from scratch, dropping every client — so a timer
+firing on its own schedule *is* intermittent, unexplainable on/off, by
+construction. It did that to sessions carrying real traffic.
+
+The timer existed for one reason: the phone had no way to ask the Mac to start.
+It does now, over Bluetooth. That is a person asking, at a moment they chose,
+instead of a timer guessing — so the timer is deleted rather than tuned. An
+access point that fails while nobody is asking for it is repaired the moment
+somebody does.
+
+Removing it also required removing the "seen down twice" guard, which existed
+only to stop the timer acting on a blip. With both remaining callers being
+somebody asking — the launch, and Connect on the phone — that guard would have
+silently prevented the Mac from hosting at launch at all.
+
+**Rule this encodes.** Automatic recovery is a liability wherever a person is
+already available to ask. Prefer the deterministic request; add the background
+repair only when nobody can be present, and never to an operation that rebuilds
+the thing it is repairing.
