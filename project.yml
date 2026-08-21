@@ -99,6 +99,18 @@ targets:
         # or registration fails with a message that names none of them.
         PRODUCT_NAME: com.uplink.app.helper
         PRODUCT_BUNDLE_IDENTIFIER: com.uplink.app.helper
+        # Gives the tool an embedded Info.plist, which is what Apple's guidance
+        # for SMAppService daemons asks for.
+        #
+        # MEASURED, so nobody re-derives it: this does NOT change the signed
+        # identifier. `codesign` reports `Identifier=com.uplink.app` either way,
+        # because a bare Mach-O in Contents/MacOS is re-signed as nested code
+        # when the app bundle is signed and inherits the app's identifier. That
+        # is normal for an embedded daemon and is not what stops launchd finding
+        # the service — an unapproved SMAppService daemon is simply not loaded
+        # until the user enables it in Login Items.
+        CREATE_INFOPLIST_SECTION_IN_BINARY: YES
+        INFOPLIST_KEY_CFBundleIdentifier: com.uplink.app.helper
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "Developer ID Application"
         SKIP_INSTALL: YES
