@@ -40,16 +40,27 @@ public struct AccessPointConfiguration: Sendable, Equatable {
     /// right on a Mac that is not this one.
     public let sharingDeviceKey: String
 
+    /// Human-readable name of the source service, e.g. `UpLink Route`.
+    ///
+    /// Needed because `PrimaryInterface` cannot always be merged from what is
+    /// already on disk: a previous version of this code replaced the whole
+    /// dictionary and destroyed it, and a Mac in that state has nothing left to
+    /// carry forward. Rebuilding it from the service is what makes the helper
+    /// able to repair its own past mistake rather than needing System Settings.
+    public let sourceName: String
+
     public init(
         ssid: String,
         passphrase: String,
         sourceServiceID: String,
-        sharingDeviceKey: String
+        sharingDeviceKey: String,
+        sourceName: String
     ) {
         self.ssid = ssid
         self.passphrase = passphrase
         self.sourceServiceID = sourceServiceID
         self.sharingDeviceKey = sharingDeviceKey
+        self.sourceName = sourceName
     }
 
     /// The configuration **merged onto** whatever is already there.
@@ -83,6 +94,15 @@ public struct AccessPointConfiguration: Sendable, Equatable {
         // the dead-end tunnel would put internet behind the access point.
         var primary = nat["PrimaryInterface"] as? [String: Any] ?? [:]
         primary["Enabled"] = 1
+        // Rebuilt when absent rather than only enabled when present. Device and
+        // HardwareKey are empty in this Mac's captured working configuration —
+        // the name is what identifies the service — so they are filled only to
+        // keep the dictionary the shape configd expects.
+        if primary["PrimaryUserReadable"] == nil {
+            primary["PrimaryUserReadable"] = sourceName
+            primary["Device"] = primary["Device"] ?? ""
+            primary["HardwareKey"] = primary["HardwareKey"] ?? ""
+        }
         nat["PrimaryInterface"] = primary
 
         nat["Enabled"] = 1

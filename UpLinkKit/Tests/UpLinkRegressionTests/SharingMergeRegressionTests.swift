@@ -24,7 +24,8 @@ struct SharingMergeRegressionTests {
             ssid: "UpLink-c743de63",
             passphrase: "PqXxRUJef4Do8qigDKs7zqVKzVgdagLw",
             sourceServiceID: "5F2E593C-4D8D-4175-AC49-2A8C56C10587",
-            sharingDeviceKey: "en0"
+            sharingDeviceKey: "en0",
+            sourceName: "UpLink Route"
         )
     }
 
@@ -101,5 +102,54 @@ struct SharingMergeRegressionTests {
         let merged = nat(config.natPreferences())
         #expect(merged?["Enabled"] as? Int == 1)
         #expect(merged?["PrimaryService"] as? String == "5F2E593C-4D8D-4175-AC49-2A8C56C10587")
+    }
+}
+
+// A Mac whose PrimaryInterface was already destroyed by the very defect above
+// has nothing to merge forward. It must still be repairable from the app, or
+// the only route back is System Settings — which is the manual step the helper
+// exists to remove.
+@Suite("Regression: a destroyed PrimaryInterface is rebuilt, not merely enabled")
+struct SharingRepairRegressionTests {
+
+    private var config: AccessPointConfiguration {
+        AccessPointConfiguration(
+            ssid: "UpLink-c743de63",
+            passphrase: "PqXxRUJef4Do8qigDKs7zqVKzVgdagLw",
+            sourceServiceID: "5F2E593C-4D8D-4175-AC49-2A8C56C10587",
+            sharingDeviceKey: "en0",
+            sourceName: "UpLink Route"
+        )
+    }
+
+    /// This Mac's real state after the bad write: PrimaryInterface simply gone.
+    private var damaged: [String: Any] {
+        ["NAT": [
+            "AirPort": ["Enabled": 1, "NetworkName": "UpLink-c743de63"] as [String: Any],
+            "Enabled": 1,
+            "PrimaryService": "5F2E593C-4D8D-4175-AC49-2A8C56C10587",
+            "SharingDevices": ["en0"],
+        ] as [String: Any]]
+    }
+
+    @Test("The source is named again, so configd can resolve it")
+    func rebuildsTheName() {
+        let nat = config.natPreferences(mergedOnto: damaged)["NAT"] as? [String: Any]
+        let primary = nat?["PrimaryInterface"] as? [String: Any]
+        #expect(primary?["PrimaryUserReadable"] as? String == "UpLink Route")
+        #expect(primary?["Enabled"] as? Int == 1)
+    }
+
+    @Test("An existing name is never overwritten by ours")
+    func doesNotClobberAName() {
+        var withName = damaged
+        var nat = withName["NAT"] as! [String: Any]
+        nat["PrimaryInterface"] = ["PrimaryUserReadable": "Something The User Chose", "Enabled": 0]
+        withName["NAT"] = nat
+
+        let merged = config.natPreferences(mergedOnto: withName)["NAT"] as? [String: Any]
+        let primary = merged?["PrimaryInterface"] as? [String: Any]
+        #expect(primary?["PrimaryUserReadable"] as? String == "Something The User Chose")
+        #expect(primary?["Enabled"] as? Int == 1)
     }
 }

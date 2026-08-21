@@ -48,11 +48,16 @@ enum AccessPointControl {
             throw Failure.noSourceService
         }
 
+        guard let sourceName = serviceName(for: service) else {
+            throw Failure.noSourceService
+        }
+
         let configuration = AccessPointConfiguration(
             ssid: ssid,
             passphrase: passphrase,
             sourceServiceID: service,
-            sharingDeviceKey: device
+            sharingDeviceKey: device,
+            sourceName: sourceName
         )
 
         log.info("raising access point on \(device, privacy: .public) from \(service, privacy: .public)")
@@ -161,6 +166,25 @@ enum AccessPointControl {
         guard SCPreferencesApplyChanges(preferences) else {
             throw Failure.applyFailed(scError())
         }
+    }
+
+    /// The human-readable name of a network service, by its identifier.
+    ///
+    /// Asked of the system rather than remembered, so a Mac whose
+    /// `PrimaryInterface` was destroyed by an earlier version of this code can
+    /// be repaired from the app instead of from System Settings — which is the
+    /// manual step this helper exists to remove.
+    private static func serviceName(for serviceID: String) -> String? {
+        guard let preferences = SCPreferencesCreate(nil, "UpLink" as CFString, nil),
+              let set = SCNetworkSetCopyCurrent(preferences),
+              let services = SCNetworkSetCopyServices(set) as? [SCNetworkService]
+        else { return nil }
+
+        for service in services
+        where (SCNetworkServiceGetServiceID(service) as String?) == serviceID {
+            return SCNetworkServiceGetName(service) as String?
+        }
+        return nil
     }
 
     private static func scError() -> String {
