@@ -1432,3 +1432,43 @@ after it succeeds, and the reconciler now takes intent OR observation.
 thing starts, not when it finishes. Deciding "are we doing X?" by looking for
 X's finished artefact answers "no" for the entire window in which X is most
 fragile.
+
+## "Chrome works and nothing else does", 2026-08-21
+
+Reported twice, and it survived several wrong explanations before the flow
+accounting settled it. TCP was suspected and cleared; DNS was suspected and
+cleared. What the numbers actually show:
+
+```
+com.relay.mac                274 TCP flows
+com.google.Chrome.helper      37
+com.anthropic.claudefordesktop 7
+com.anthropic.claude-code      1     ← one, in the whole session
+```
+
+Claude Code holds **one long-lived HTTP/2 connection**. Chrome opens a new
+connection per origin and several per page, so it re-establishes constantly and
+never notices the change. A client with one connection notices nothing else.
+
+That single flow, when it finally did open, worked:
+
+```
+02:58:53  tcp open  2600:1901:0:9e23:::443
+02:59:59  tcp done  — 10668 up / 4316 down
+```
+
+**A connection opened over `en0` cannot survive the radio being handed to
+hosting.** Its socket is bound to an address that stops being reachable, and
+nothing resets it — so the client sits on a dead connection until TCP's own
+timeout, which is minutes. New connections work immediately; the old one hangs.
+That is exactly "Chrome is fine and the API request failed", and it is a
+property of the transition rather than a fault in the bridge.
+
+The bridge itself was healthy throughout: 277 completed flows, both address
+families, individual transfers up to 85 KB, and an access point that stayed up
+with no pulsing for the whole session.
+
+**Rule this encodes.** When one application fails and others do not, count its
+connections before suspecting the transport. An application with a single
+long-lived connection is a different test from one that opens hundreds, and only
+the first can see a transition at all.
