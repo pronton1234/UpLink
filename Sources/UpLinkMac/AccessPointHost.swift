@@ -111,6 +111,24 @@ final class AccessPointHost {
         log.info("access point passphrase updated")
     }
 
+    /// Whether this Mac intends to be hosting, regardless of whether the
+    /// interface has appeared yet.
+    ///
+    /// **Intent, not observation, and the difference is a live loop.** The
+    /// route tunnel's mode is pinned while hosting because Internet Sharing is
+    /// sourced from that tunnel and rebuilds the access point on every
+    /// reconfiguration. Deciding that from `bridge100` existing leaves a hole
+    /// exactly where it matters: while the access point is *coming up* the
+    /// interface is absent, so the Mac reports not-hosting, the reconciler asks
+    /// for standby, the tunnel reconfigures, and Internet Sharing tears down
+    /// the access point it was in the middle of starting. en0 then reclaims the
+    /// radio, and the whole thing repeats every few seconds — which is what the
+    /// user saw as the Mac "pulsing" between its own Wi-Fi and the shared one.
+    static var intendsToHost: Bool {
+        get { UserDefaults.standard.bool(forKey: "UpLinkIntendsToHost") }
+        set { UserDefaults.standard.set(newValue, forKey: "UpLinkIntendsToHost") }
+    }
+
     /// Raises the access point using this Mac's own credentials.
     func raise() async -> String? { await raise(credentials) }
 
@@ -141,7 +159,11 @@ final class AccessPointHost {
 
     /// Brings the access point up, returning nil on success or a reason.
     func raise(_ credentials: AccessPointCredentials) async -> String? {
-        await withCheckedContinuation { continuation in
+        // Set BEFORE the call, not after it succeeds. The window this closes is
+        // precisely the one that was broken: the seconds between asking for the
+        // access point and the interface appearing.
+        Self.intendsToHost = true
+        return await withCheckedContinuation { continuation in
             proxy { helper, fail in
                 guard let helper else { return continuation.resume(returning: fail) }
                 helper.raiseAccessPoint(
@@ -154,7 +176,8 @@ final class AccessPointHost {
     }
 
     func lower() async -> String? {
-        await withCheckedContinuation { continuation in
+        Self.intendsToHost = false
+        return await withCheckedContinuation { continuation in
             proxy { helper, fail in
                 guard let helper else { return continuation.resume(returning: fail) }
                 helper.lowerAccessPoint { reason in continuation.resume(returning: reason) }

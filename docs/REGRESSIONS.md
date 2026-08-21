@@ -1398,3 +1398,37 @@ and idle.
 **Rule this encodes.** Deleting code by locating a start and scanning for the
 next closing brace will take whatever is between them. Count the lines removed
 against the lines intended, and check what the deletion's neighbours were.
+
+## The Mac pulsed between its own Wi-Fi and the shared one, 2026-08-21
+
+The user described the Mac "switching between connecting between the internet
+sharing and the home internet". The recorder shows it plainly, with `en0`
+flipping every five to ten seconds:
+
+```
+01:46:47  en0 inactive              ← access point starting
+01:46:47  en0 active                ← en0 reclaims the radio
+01:47:07  en0 inactive, bridge100 UP
+01:47:18  en0 active, bridge100 gone
+```
+
+Only two raise commands were issued in that whole window, so nothing in the app
+was churning it. The loop was the route tunnel's mode, and the hole was in the
+fix that was supposed to prevent exactly this.
+
+The mode is pinned to `.capture` while hosting, because Internet Sharing is
+sourced from that tunnel and rebuilds the access point on every
+reconfiguration. But "hosting" was decided by asking whether `bridge100`
+existed — and **while the access point is coming up, it does not**. So in the
+seconds that matter most the Mac reported not-hosting, the reconciler asked for
+standby, the tunnel reconfigured, and Internet Sharing tore down the access
+point it was in the middle of starting. `en0` then rejoined a known network,
+sharing tried again, and round it went.
+
+`AccessPointHost.intendsToHost` is set **before** the raise call rather than
+after it succeeds, and the reconciler now takes intent OR observation.
+
+**Rule this encodes.** A guard that protects a startup must be armed before the
+thing starts, not when it finishes. Deciding "are we doing X?" by looking for
+X's finished artefact answers "no" for the entire window in which X is most
+fragile.

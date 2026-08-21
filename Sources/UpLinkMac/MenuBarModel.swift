@@ -732,7 +732,12 @@ final class MenuBarModel {
             // While the access point is up, the mode is pinned: Internet
             // Sharing is sourced from this tunnel and rebuilds the access point
             // on every reconfiguration. See RouteTunnelReconciler.
-            hostingAccessPoint: TransportParameters.hostedNetworkAddress() != nil,
+            // Intent OR observation. While the access point is coming up the
+            // interface does not exist yet, and reporting not-hosting in that
+            // window makes the reconciler reconfigure the very tunnel Internet
+            // Sharing is building on. See AccessPointHost.intendsToHost.
+            hostingAccessPoint: AccessPointHost.intendsToHost
+                || TransportParameters.hostedNetworkAddress() != nil,
             needsRebuild: routeManagerNeedsRebuild
         ) {
         case .wait:
