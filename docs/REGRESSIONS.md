@@ -863,3 +863,49 @@ Loopback stays permitted under every bearer, deliberately. A destination on the
 phone's own loopback is not a way around the bridge, and banning it breaks every
 integration test that points "the internet" at a local server — which is how the
 datagram and refused-destination suites run with no network at all.
+
+## Internet Sharing, 2026-08-20 — the write succeeds and nothing happens
+
+Raising the access point failed on hardware with:
+
+```
+Could not start the UpLink network
+NetworkSharing did not restart (status 150)
+```
+
+`launchctl error 150` decodes to **"Operation not permitted while System
+Integrity Protection is engaged."** SIP owns Apple's daemons, so nothing outside
+Apple may restart `com.apple.NetworkSharing`. The helper runs as root and it
+makes no difference: this is not a permissions problem that more privilege
+solves.
+
+**The dangerous half is that the write worked.** After the failure the
+preference file read exactly right — `NAT.Enabled = 1`, `AirPort.Enabled = 1`,
+`NetworkName = UpLink-…`, `SharingDevices = [en0]`, `PrimaryService` pointing at
+the product's own dead-end route tunnel. Every field correct, and no access
+point: `bridge100` absent, `InternetSharing` not running.
+
+So a direct write to `com.apple.nat.plist` is not "most of the way there". It
+goes behind SystemConfiguration's back, configd is never told, and the file
+becomes a description of a state the machine is not in. Anything reading that
+file to decide whether sharing is on gets a confident wrong answer — which is
+the same trap already recorded here as ":NAT:AirPort:Enabled reads 0 with the AP
+fully up", seen from the other side.
+
+**The fix is to use the door rather than the window.**
+`SCPreferencesApplyChanges` is the notification System Settings itself sends,
+and configd's `com.apple.SystemConfiguration.ISPreference` plugin is what
+listens for it and starts the daemon. The sequence is
+`SCPreferencesCreate` → `SCPreferencesLock` → `SCPreferencesSetValue` →
+`SCPreferencesCommitChanges` → `SCPreferencesApplyChanges`. No daemon is
+restarted by us at any point, so SIP has no reason to object.
+
+The lock is not optional politeness: these preferences are shared with System
+Settings, and committing without it can lose a concurrent edit or fail in a way
+that reads as a permissions problem — sending the next person back to SIP, which
+is a dead end.
+
+**Rule this encodes.** When SIP refuses an operation, that is the boundary
+naming the supported API, not an obstacle to route around. Every "run the tool
+by hand" approach here — `launchctl kickstart`, writing the plist, `defaults
+write` — fails or lies. The framework call works and is shorter.

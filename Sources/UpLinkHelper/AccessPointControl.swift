@@ -1,4 +1,5 @@
 import Foundation
+import SystemConfiguration
 import UpLinkKit
 import OSLog
 
@@ -15,15 +16,19 @@ enum AccessPointControl {
     enum Failure: Error, CustomStringConvertible {
         case noWiFiInterface
         case noSourceService
-        case writeFailed
-        case kickstartFailed(Int32)
+        case sessionFailed
+        case lockFailed
+        case commitFailed(String)
+        case applyFailed(String)
 
         var description: String {
             switch self {
             case .noWiFiInterface: "this Mac reports no Wi-Fi interface"
             case .noSourceService: "no UpLink Route service to share from — is the route tunnel installed?"
-            case .writeFailed: "could not write \(AccessPointConfiguration.preferencesPath)"
-            case let .kickstartFailed(code): "NetworkSharing did not restart (status \(code))"
+            case .sessionFailed: "could not open the Internet Sharing preferences"
+            case .lockFailed: "another process is holding the network preferences"
+            case let .commitFailed(why): "could not save the sharing configuration: \(why)"
+            case let .applyFailed(why): "saved the configuration but could not apply it: \(why)"
             }
         }
     }
@@ -51,8 +56,7 @@ enum AccessPointControl {
         )
 
         log.info("raising access point on \(device, privacy: .public) from \(service, privacy: .public)")
-        try write(configuration.natPreferences())
-        try kickstartNetworkSharing()
+        try apply(configuration.natPreferences())
         holdAwake(true)
     }
 
@@ -69,8 +73,7 @@ enum AccessPointControl {
         preferences["NAT"] = nat
 
         log.info("lowering access point")
-        try write(preferences)
-        try kickstartNetworkSharing()
+        try apply(preferences)
         holdAwake(false)
     }
 
@@ -109,17 +112,56 @@ enum AccessPointControl {
         (currentPreferences()?["NAT"] as? [String: Any])?["PrimaryService"] as? String
     }
 
-    private static func write(_ preferences: [String: Any]) throws {
-        guard (preferences as NSDictionary).write(
-            toFile: AccessPointConfiguration.preferencesPath, atomically: true
-        ) else { throw Failure.writeFailed }
+    /// Writes the sharing configuration **through SystemConfiguration**, then
+    /// asks configd to apply it.
+    ///
+    /// MEASURED 2026-08-20, and it is the difference between this working and
+    /// not. Writing `com.apple.nat.plist` directly succeeds — the file ends up
+    /// exactly right — and nothing happens, because a direct write goes behind
+    /// SystemConfiguration's back and configd is never told. The obvious
+    /// follow-up, restarting the daemon by hand, is refused outright:
+    ///
+    ///     launchctl kickstart -k system/com.apple.NetworkSharing
+    ///     → 150: Operation not permitted while System Integrity Protection is engaged
+    ///
+    /// SIP owns Apple's daemons, so nothing outside Apple may restart one. That
+    /// is not a gap to work around, it is the boundary saying to use the
+    /// supported door instead: `SCPreferencesApplyChanges` is the notification
+    /// System Settings itself sends, and configd's Internet Sharing plugin
+    /// (`com.apple.SystemConfiguration.ISPreference`) is what listens for it and
+    /// starts the daemon.
+    ///
+    /// The lock matters. These preferences are shared with System Settings, and
+    /// committing without it can lose a concurrent edit — or fail in a way that
+    /// reads as a permissions problem.
+    private static func apply(_ nat: [String: Any]) throws {
+        guard let preferences = SCPreferencesCreate(
+            nil, "UpLink" as CFString, "com.apple.nat.plist" as CFString
+        ) else { throw Failure.sessionFailed }
+
+        guard SCPreferencesLock(preferences, true) else {
+            throw Failure.lockFailed
+        }
+        defer { SCPreferencesUnlock(preferences) }
+
+        guard let value = nat["NAT"] as? [String: Any] else {
+            throw Failure.commitFailed("no NAT dictionary to write")
+        }
+        guard SCPreferencesSetValue(
+            preferences, "NAT" as CFString, value as CFDictionary
+        ) else { throw Failure.commitFailed(scError()) }
+
+        guard SCPreferencesCommitChanges(preferences) else {
+            throw Failure.commitFailed(scError())
+        }
+        // The half a direct file write can never do.
+        guard SCPreferencesApplyChanges(preferences) else {
+            throw Failure.applyFailed(scError())
+        }
     }
 
-    /// Restarts the daemon so configd's Internet Sharing plugin re-reads the
-    /// preference it just changed.
-    private static func kickstartNetworkSharing() throws {
-        let status = run("/bin/launchctl", ["kickstart", "-k", "system/com.apple.NetworkSharing"])
-        guard status == 0 else { throw Failure.kickstartFailed(status) }
+    private static func scError() -> String {
+        String(cString: SCErrorString(SCError()))
     }
 
     /// Internet Sharing sets no-sleep only on AC power — it says so in the
