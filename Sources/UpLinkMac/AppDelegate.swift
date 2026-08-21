@@ -58,6 +58,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         model.start()
+
+        // The access point can be turned on or off in System Settings without
+        // us, and a menu still offering "Start" for a running network is how
+        // the user ends up clicking it five times. Cheap enough to just ask.
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshAccessPointState() }
+        }
     }
 
     // MARK: The access point
@@ -70,11 +77,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// no inverse in the UI is a bug, not a missing feature.
     @objc private func toggleAccessPoint() {
         guard !accessPointBusy else { return }
+        let wasUp = accessPointIsUp
         accessPointBusy = true
         refreshStatusItem()
 
         Task { @MainActor in
-            let failure = accessPointIsUp ? await accessPoint.lower() : await accessPoint.raise()
+            let failure = wasUp ? await accessPoint.lower() : await accessPoint.raise()
             accessPointBusy = false
 
             if let failure {
@@ -82,7 +90,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // bridging" with no cause is the failure LinkStatus exists to
                 // prevent, and this is the one cause the user can act on.
                 let alert = NSAlert()
-                alert.messageText = accessPointIsUp
+                alert.messageText = wasUp
                     ? "Could not stop the UpLink network"
                     : "Could not start the UpLink network"
                 alert.informativeText = failure
@@ -92,8 +100,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Read back from the interfaces rather than assuming the call did
             // what it said. The preference file is input, not output, and has
             // been observed disagreeing with what is actually running.
-            accessPointIsUp = await accessPoint.isUp()
-            refreshStatusItem()
+            //
+            // AND WAIT FOR IT. Measured on hardware 2026-08-20: the helper
+            // returns as soon as configd accepts the change, but `bridge100`
+            // took a further EIGHT SECONDS to appear (raise logged at
+            // 20:53:36, address at 20:53:44). Reading once, immediately, always
+            // saw "down" — so the menu kept offering Start for a network that
+            // was already up, and the logs show it being clicked five times.
+            await settle(expecting: !wasUp)
+        }
+    }
+
+    /// Polls until the access point reaches the expected state, or gives up.
+    ///
+    /// Gives up rather than waiting forever, and shows whatever is true when it
+    /// does: a button stuck on "Working…" is worse than one that admits the
+    /// state it can actually see.
+    private func settle(expecting expected: Bool) async {
+        for _ in 0 ..< 20 {
+            let up = await accessPoint.isUp()
+            if up != accessPointIsUp {
+                accessPointIsUp = up
+                refreshStatusItem()
+            }
+            if up == expected { return }
+            try? await Task.sleep(for: .seconds(1))
         }
     }
 
