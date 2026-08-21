@@ -48,10 +48,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Registering does not raise the access point. That is deliberate:
         // installing the app should not silently take over the Wi-Fi radio.
         accessPoint.register()
-        // Before anything asks the helper to do work, make sure it is the
-        // helper this build shipped. See `replaceIfStale`.
+        // Report — never fix — a helper left over from an older build. See
+        // `reportIfStale`: the only restart an app can perform also returns the
+        // service to needing approval, which leaves no helper at all.
         Task { @MainActor in
-            await accessPoint.replaceIfStale()
+            await accessPoint.reportIfStale()
             refreshAccessPointState()
             hostAccessPointIfNeeded()
         }

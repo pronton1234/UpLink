@@ -63,7 +63,7 @@ final class AccessPointHost {
     /// Unregistering and registering again is the one restart an unprivileged
     /// app can perform. The service is already approved, so this does not ask
     /// the user for anything.
-    func replaceIfStale() async {
+    func reportIfStale() async {
         guard isRegistered else { return }
         let mine = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
         let theirs = await build()
@@ -71,21 +71,28 @@ final class AccessPointHost {
         // A helper too old to answer at all is exactly the case this exists
         // for, so a nil is treated as stale rather than as a reason to stop.
         guard theirs != mine else { return }
-        log.error("helper is build \(theirs ?? "unknown", privacy: .public), app is \(mine, privacy: .public) — replacing")
 
-        let service = SMAppService.daemon(plistName: Self.plistName)
-        do {
-            try await service.unregister()
-            try service.register()
-            log.error("helper replaced")
-        } catch {
-            // Reported, not fatal. A stale helper still works; it is simply
-            // working from yesterday's idea of what to do.
-            log.error("could not replace the helper: \(error.localizedDescription, privacy: .public)")
-        }
-        connection?.invalidate()
-        connection = nil
+        // SAID, NOT ACTED ON, and that is the correction.
+        //
+        // This used to unregister and register again, which is the only restart
+        // an unprivileged app can perform on a system daemon. It works, and it
+        // returns the service to *needing approval* — so the helper does not
+        // come back until the user visits Login Items. Measured 2026-08-21: it
+        // left the machine with no helper at all, which is strictly worse than
+        // the stale one it replaced. A repair that can leave the system worse
+        // than it found it must not run unattended.
+        //
+        // A stale helper still works; it is working from an older idea of what
+        // to do. So the drift is reported and the user decides.
+        isStale = true
+        log.error(
+            "helper is build \(theirs ?? "too old to say", privacy: .public), app is \(mine, privacy: .public) — toggle UpLink off and on in Login Items to update it"
+        )
     }
+
+    /// Whether the running helper predates this build. Surfaced in the menu, so
+    /// it is visible rather than buried in a log nobody reads.
+    private(set) var isStale = false
 
     /// The build the running helper was launched from, or nil if it is too old
     /// to say.
