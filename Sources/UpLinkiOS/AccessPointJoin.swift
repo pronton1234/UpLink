@@ -76,18 +76,55 @@ enum AccessPointJoin {
         } catch let error as NSError {
             // "Already associated" is success wearing an error's clothes, and
             // treating it as a failure would make every reconnect look broken.
+            // NAMED, not described. `localizedDescription` for this domain is
+            // very often the empty string, which reached the diagnostic log as
+            // "join FAILED: <unknown>" and said nothing at all — while the
+            // phone silently stayed off the network and every downstream
+            // symptom looked like an unreachable listener.
+            let reason = Self.describe(error)
             if error.domain == NEHotspotConfigurationErrorDomain,
                error.code == NEHotspotConfigurationError.alreadyAssociated.rawValue {
-                log.info("already on \(credentials.ssid, privacy: .public)")
+                // Logged as its own outcome. Treating it as success is right,
+                // but it hid a real failure for an entire evening: every
+                // "join: OK" was this, because the network had been joined by
+                // hand, and the moment it was not the join failed outright.
+                PhoneDiagnosticLog.shared.write("join: already associated")
                 return
             }
             if error.domain == NEHotspotConfigurationErrorDomain,
                error.code == NEHotspotConfigurationError.userDenied.rawValue {
                 throw Failure.denied
             }
-            log.error("join failed: \(error.localizedDescription, privacy: .public)")
-            throw Failure.failed(error.localizedDescription)
+            log.error("join failed: \(reason, privacy: .public)")
+            throw Failure.failed(reason)
         }
+    }
+
+    /// Turns an `NEHotspotConfiguration` error into something worth reading.
+    ///
+    /// The framework's `localizedDescription` is frequently empty here, so the
+    /// domain and code are spelled out and the known cases are named.
+    private static func describe(_ error: NSError) -> String {
+        guard error.domain == NEHotspotConfigurationErrorDomain else {
+            let text = error.localizedDescription
+            return text.isEmpty ? "\(error.domain) \(error.code)" : text
+        }
+        let name: String
+        switch NEHotspotConfigurationError(rawValue: error.code) {
+        case .invalidWPAPassphrase: name = "the network password is wrong"
+        case .invalidSSID: name = "no network name matched"
+        case .userDenied: name = "you declined the join"
+        case .pending: name = "a join is already in progress"
+        case .systemConfiguration: name = "iOS refused the configuration"
+        case .unknown: name = "iOS reported an unspecified failure"
+        case .joinOnceNotSupported: name = "joinOnce is not supported here"
+        case .alreadyAssociated: name = "already on this network"
+        case .applicationIsNotInForeground:
+            name = "the app must be in the foreground to join"
+        case .invalidSSIDPrefix: name = "the network-name prefix was rejected"
+        default: name = "code \(error.code)"
+        }
+        return "\(name) [NEHotspotConfigurationError \(error.code)]"
     }
 
     /// Forgets the Mac's network.
