@@ -938,7 +938,7 @@ final class MenuBarModel {
         // showing a code that cannot possibly be used and letting the user
         // discover that by typing it.
         guard case let .ready(udid, port, _) = relayState else {
-            status = .failed("Connect your iPhone with a cable before pairing.")
+            status = .failed("Start the UpLink network and join it from your iPhone before pairing.")
             notifyObservers()
             return
         }
@@ -974,7 +974,7 @@ final class MenuBarModel {
             let reply = await self?.sendToExtension("pair:\(code.digits)")
             if reply?.hasPrefix("error") == true {
                 self?.log.error("pairing could not start: \(reply ?? "", privacy: .public)")
-                self?.status = .failed("Couldn't start pairing. Check the cable and try again.")
+                self?.status = .failed("Couldn't start pairing. Check your iPhone is on the UpLink network and try again.")
                 // Take the code down with it. Leaving it up rendered a
                 // six-digit code that could not possibly work, indefinitely,
                 // because this path returned before anything cleared it.

@@ -370,22 +370,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.menu = buildMenu()
         // Reflect a degraded bridge in the menu bar itself, not just inside the
         // menu — the user should not have to open it to find out.
-        // The glyph distinguishes "no cable" from "cable, something else
-        // wrong", because those need different things from the user and the
-        // whole point of a menu bar icon is to answer at a glance.
+        //
+        // The glyphs are about the RADIO now, not a cable. Each one answers a
+        // different question at a glance, which is the whole point of a menu
+        // bar icon: is the network up, has the phone arrived, is traffic
+        // actually going out over cellular.
         let symbol: String
         switch model.status {
-        case .connected(_, .cellular): symbol = "personalhotspot"
+        // Bridging, over cellular: the thing the product exists to do.
+        case .connected(_, .cellular): symbol = "antenna.radiowaves.left.and.right"
+        // Connected but NOT over cellular. Deliberately an alarm rather than a
+        // quieter variant — a bridge that silently egresses over Wi-Fi looks
+        // identical to one that works and is the failure worth shouting about.
         case .connected: symbol = "exclamationmark.triangle"
+        // No access point: nothing can reach this Mac at all.
         case .accessPointDown: symbol = "wifi.slash"
-        case .waitingForPhone: symbol = "wifi"
-        case .waitingForCable: symbol = "cable.connector.slash"
-        case .deviceNotResponding, .deviceNotPaired: symbol = "cable.connector"
-        case .connecting: symbol = "cable.connector"
+        // Hosting, waiting for the phone to join.
+        case .waitingForPhone, .waitingForCable: symbol = "wifi"
+        // The phone is on the network but not yet bridging.
+        case .deviceNotResponding, .deviceNotPaired: symbol = "wifi.exclamationmark"
+        case .connecting: symbol = "wifi"
         case .pairingLost: symbol = "exclamationmark.triangle"
         case .failed, .needsApproval: symbol = "exclamationmark.triangle"
-        case .switchedOff: symbol = "personalhotspot.slash"
-        case .installingExtension: symbol = "personalhotspot.slash"
+        case .switchedOff: symbol = "antenna.radiowaves.left.and.right.slash"
+        case .installingExtension: symbol = "antenna.radiowaves.left.and.right.slash"
         }
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "UpLink")
         image?.isTemplate = true
@@ -542,11 +550,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func notifyCableRemoved() {
         let content = UNMutableNotificationContent()
         content.title = "iPhone disconnected"
-        content.body = "UpLink stopped bridging when the cable came out."
+        content.body = "UpLink stopped bridging when your iPhone left the network."
         content.sound = nil
 
         let request = UNNotificationRequest(
-            identifier: "uplink.cable-removed",
+            identifier: "uplink.phone-left",
             content: content,
             trigger: nil
         )
