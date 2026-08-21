@@ -56,17 +56,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hostAccessPointIfNeeded()
         }
 
-        // THE NETWORK IS ALWAYS UP, and that is the design rather than a
-        // convenience. The phone cannot ask the Mac to start hosting, because
-        // asking requires the very network that is not up yet — so a Mac that
-        // waits to be asked can never be reached, and every session begins with
-        // the user walking to the laptop, which is the friction this product
-        // exists to remove.
+        // WITHOUT THIS THE APP DOES NOTHING AT ALL, and it was deleted by a
+        // tidy-up that removed an adjacent dead function and took 58 lines.
         //
-        // The Mac does not sleep and has no other network to return to, so
-        // there is nothing being taken away by hosting continuously. Stopping
-        // stays available in the menu for when the user genuinely wants the
-        // radio back.
+        // `start()` is what brings up the route tunnel and the proxy extension
+        // and begins polling them. Without it the app launches, shows a menu
+        // bar, advertises over Bluetooth and answers the phone — while the
+        // route tunnel stays Disconnected, the extension never runs, and not a
+        // single IPC message is exchanged. Every symptom sits downstream: the
+        // phone joins, the Mac announces a peer nothing receives, no session
+        // forms, no flow is claimed, and the phone waits forever for a Mac that
+        // is running and idle.
+        model.start()
+
+        // The doorbell the phone rings to start us. The phone cannot ask over
+        // the access point, because asking is what raises it.
         startBeaconUnlessItCrashedLastTime()
 
         // TELLING THE EXTENSION WHERE THE PHONE IS, which is a different job

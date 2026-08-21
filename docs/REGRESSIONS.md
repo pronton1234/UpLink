@@ -1371,3 +1371,30 @@ one was safe to repeat and the other was not:
 inside it and decide about each one. A timer is a schedule, not a subject —
 things end up in one because they need the same interval, not because they are
 the same job.
+
+## The app launched and started nothing, 2026-08-21
+
+After a reboot cleared twenty stale system extensions, the Mac still carried no
+data. The state told the story:
+
+```
+UpLink Route  ...  (Disconnected)      ← route tunnel never started
+com.uplink.app.proxy                    ← extension not running
+"ipc: received" in 20s: 0               ← was hundreds per minute
+```
+
+`model.start()` was gone from `applicationDidFinishLaunching`. It had been
+removed by a tidy-up deleting an adjacent dead function, which took 58 lines
+instead of the intended 20.
+
+That single call is what brings up the route tunnel and the proxy extension and
+begins polling them. Without it the app still launches, shows a menu bar,
+advertises over Bluetooth, raises the access point on request and answers the
+phone — so it looks entirely alive. Everything that fails is downstream: the
+phone joins, the Mac announces a peer nothing is listening for, no session
+forms, no flow is claimed, and the phone waits forever for a Mac that is running
+and idle.
+
+**Rule this encodes.** Deleting code by locating a start and scanning for the
+next closing brace will take whatever is between them. Count the lines removed
+against the lines intended, and check what the deletion's neighbours were.
