@@ -144,38 +144,52 @@ else
     fail "no live session (last event: ${SESSION:-none})"
 fi
 
-# THIS CHECK IS INVERTED FROM WHAT IT USED TO BE, deliberately.
+# THIS CHECK HAS NOW BEEN INVERTED TWICE. The history matters, because each
+# inversion was right at the time and reading only the latest one is how the
+# bearer got chosen wrongly once already.
 #
-# It used to fail on `%en*` with "peer link is over a CABLE — unplug it, this is
-# not the test", and require `%awdl0`. The transport is now the cable and only
-# the cable: `usbmuxd` needs no network interface, which is the whole point,
-# because AWDL could not be made to hold with the Mac's Wi-Fi associated to
-# nothing. So the cable is now the pass condition and AWDL is the failure.
-USB=$(/usr/bin/log show --last 5m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
-      | grep -E "usb: relaying|usb: attached" | tail -1)
-if [[ -n "$USB" ]]; then
-    green "    the cable is carrying the link (${USB##*usb: })"
+#   1. AWDL era      — required `%awdl0`, failed on `%en*` ("unplug the cable,
+#                      this is not the test").
+#   2. Cable era     — required usbmux, failed on any `awdl` at all.
+#   3. Now           — requires the access point, fails on BOTH of the above.
+#
+# AWDL is a failure here for a specific reason and not merely because it is old:
+# macOS schedules it around the infrastructure Wi-Fi link, so with the Mac
+# associated to nothing the kernel disables its timers. That is the deployment
+# configuration, so a run that succeeded over AWDL would be proving something
+# about a link that cannot exist in the car. See docs/REGRESSIONS.md.
+#
+# The cable is a failure for the ordinary reason: it works, and it is not what
+# is being tested.
+if /sbin/ifconfig bridge100 >/dev/null 2>&1; then
+    green "    the access point is up (bridge100)"
 else
-    fail "no usbmux relay in the log — the Mac never reached the phone over the cable"
+    fail "bridge100 is absent — the Mac is not hosting its network, so there is no link to test"
 fi
 
-# Any AWDL at all now means the old path has come back from the dead, which
-# would make every measurement below meaningless in the usual way: it would
-# work, and it would not be proving what it claims to prove.
+# `en0` reads `status: inactive` while hosting, because the radio runs on a
+# dedicated `ap1` bridged into bridge100. That is expected and is NOT evidence
+# of a fault — checking en0 here would fail every correct run.
+if /sbin/ifconfig ap1 2>/dev/null | grep -q RUNNING; then
+    green "    the radio is running on ap1, as it must while hosting"
+else
+    warn "    ap1 is not RUNNING — the access point may be up without a radio"
+fi
+
 if /usr/bin/log show --last 5m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
    | grep -q "awdl"; then
-    fail "AWDL appears in the log — the wired path is not the one being used"
+    fail "AWDL appears in the log — the link is not the access point, and AWDL cannot hold this configuration"
 else
     green "    no AWDL anywhere in the log"
 fi
 
 PEER=$(/usr/bin/log show --last 5m --predicate 'subsystem == "com.uplink.app"' --style compact 2>/dev/null \
-       | grep "accept: inbound" | tail -1)
+       | grep -E "session started|accept: inbound" | tail -1)
 case "$PEER" in
-    *127.0.0.1*|*loopback*) green "    session arrived over the loopback relay, as it must" ;;
-    *%awdl0*)  fail "session arrived over AWDL, not the cable" ;;
-    "")        warn "    no accept line in the Mac log (the phone logs this side now)" ;;
-    *)         warn "    unexpected peer endpoint: ${PEER##*from }" ;;
+    *%awdl0*)               fail "session arrived over AWDL, not the access point" ;;
+    *usb:*|*127.0.0.1*)     fail "session arrived over the CABLE — unplug it, this is not the test" ;;
+    "")                     warn "    no session line in the Mac log (the phone logs its own side)" ;;
+    *)                      green "    session arrived over the access point (${PEER##*peer=})" ;;
 esac
 
 blue "==> 3. Make a real request, and prove the bridge carried it"
