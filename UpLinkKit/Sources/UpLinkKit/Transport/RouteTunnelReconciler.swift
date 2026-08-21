@@ -102,6 +102,7 @@ public enum RouteTunnelReconciler {
     public static func next(
         status: RouteTunnelStatus,
         sessionLive: Bool,
+        hostingAccessPoint: Bool = false,
         needsRebuild: Bool = false
     ) -> RouteTunnelAction {
         // A configuration known to be unusable is replaced, not retried. This
@@ -133,6 +134,22 @@ public enum RouteTunnelReconciler {
             return .wait
 
         case .connected, .reasserting:
+            // WHILE HOSTING, THE MODE NEVER MOVES, and that is measured rather
+            // than cautious.
+            //
+            // Internet Sharing is sourced from this tunnel, so every mode change
+            // reconfigures the interface it is sharing from, and macOS rebuilds
+            // the access point underneath it. On 2026-08-20 that made a loop:
+            // a session started, the mode went standby → capture, sharing
+            // deleted its routes, bridge100 vanished, the phone was dropped,
+            // the session died, and the mode went back — every twenty seconds,
+            // taking a bridge that was carrying real traffic with it.
+            //
+            // Capture is the right resting place while hosting: the Mac has no
+            // other network then — en0 is inactive, given over to the radio —
+            // so the routes and resolver this installs harm nothing and are
+            // needed the instant a session arrives.
+            if hostingAccessPoint { return .setMode(.capture) }
             return .setMode(sessionLive ? .capture : .standby)
         }
     }

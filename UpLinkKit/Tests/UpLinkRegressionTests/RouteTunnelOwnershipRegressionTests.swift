@@ -101,3 +101,50 @@ struct RouteTunnelOwnershipRegressionTests {
         #expect(reconciler.tunnelUp, "the Mac was stranded with no way to rebuild the tunnel")
     }
 }
+
+// SYMPTOM, on hardware 2026-08-20, and it destroyed a bridge that was carrying
+// real traffic — Chrome's TCP :443 and a pile of QUIC flows were crossing it:
+//
+//     23:44:36.282  capture policy: peer=192.168.2.3   ← session starting
+//     23:44:36.722  utun5 removed default route         ← standby → capture
+//     23:44:37.410  InternetSharing: deleted routes     ← sharing rebuilds
+//     23:44:40      bridge100: absent                   ← the phone is dropped
+//
+// Internet Sharing is sourced from this tunnel, so every mode change
+// reconfigures the interface it shares from and macOS rebuilds the access
+// point underneath it. The phone lost its lease, the session died, the mode
+// went back to standby, and the whole thing repeated every twenty seconds.
+//
+// Capture is the right resting place while hosting: en0 is inactive then,
+// given over to the radio, so the routes cost nothing and are needed the
+// instant a session arrives.
+
+@Suite("Regression: the route mode never moves while hosting")
+struct RouteModeWhileHostingRegressionTests {
+
+    @Test("A session starting does not change the mode while hosting")
+    func hostingPinsCaptureWithSession() {
+        #expect(RouteTunnelReconciler.next(
+            status: .connected, sessionLive: true, hostingAccessPoint: true
+        ) == .setMode(.capture))
+    }
+
+    // The half that actually broke it: without a session the reconciler wanted
+    // standby, and wanting it was enough to tear the access point down.
+    @Test("A session ending does not drop the mode to standby while hosting")
+    func hostingPinsCaptureWithoutSession() {
+        #expect(RouteTunnelReconciler.next(
+            status: .connected, sessionLive: false, hostingAccessPoint: true
+        ) == .setMode(.capture))
+    }
+
+    @Test("Not hosting, the old behaviour is unchanged")
+    func withoutHostingNothingChanges() {
+        #expect(RouteTunnelReconciler.next(
+            status: .connected, sessionLive: false, hostingAccessPoint: false
+        ) == .setMode(.standby))
+        #expect(RouteTunnelReconciler.next(
+            status: .connected, sessionLive: true, hostingAccessPoint: false
+        ) == .setMode(.capture))
+    }
+}

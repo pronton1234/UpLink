@@ -1165,3 +1165,41 @@ Two guards now, and each is necessary on its own:
 its remedy. A repair that is destructive when wrong must wait for evidence that
 would be silly to doubt — and must never run while the thing it protects is
 working.
+
+## The route tunnel was tearing down the access point, 2026-08-20
+
+The first bridge to carry real traffic — Chrome's TCP :443 and a pile of QUIC
+flows — died after twenty-three seconds, and the log shows the machinery eating
+itself:
+
+```
+23:44:36.282  capture policy: peer=192.168.2.3   ← session starting
+23:44:36.722  utun5 removed default route         ← standby → capture
+23:44:36.731  utun5 added default route
+23:44:37.410  InternetSharing: deleted routes     ← sharing rebuilds
+23:44:40      bridge100: absent                    ← the phone is dropped
+```
+
+Internet Sharing is sourced from `UpLink Route`, so **every mode change
+reconfigures the interface it is sharing from** and macOS rebuilds the access
+point underneath it. The phone lost its lease and rejoined as `192.168.2.3`, the
+session died, the mode fell back to standby, and the cycle repeated about every
+twenty seconds.
+
+Nothing here was broken on its own. The route tunnel's standby mode exists so
+the Mac's own network is untouched when not bridging, and it is right; sourcing
+the access point from that tunnel is what makes it come up with no internet
+behind it, and that is right too. Together they form a loop.
+
+While hosting, the mode is now pinned to `.capture`. That is the correct resting
+place rather than a compromise: `en0` is inactive while hosting, given over to
+the radio, so the routes and resolver cost nothing and are needed the moment a
+session arrives.
+
+| Test | Guards against |
+| --- | --- |
+| `RouteModeWhileHostingRegressionTests` | The mode moving while an access point is up. Covers the half that actually bit — no session, where the reconciler wanted standby and wanting it was enough — and asserts the non-hosting behaviour is untouched. |
+
+**Rule this encodes.** Two correct mechanisms can compose into a loop. When one
+supplies the other's foundation, the supplier must be stable for as long as the
+consumer is up, whatever its own logic would otherwise prefer.

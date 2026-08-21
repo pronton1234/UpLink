@@ -729,6 +729,10 @@ final class MenuBarModel {
         switch RouteTunnelReconciler.next(
             status: status,
             sessionLive: sessionLive,
+            // While the access point is up, the mode is pinned: Internet
+            // Sharing is sourced from this tunnel and rebuilds the access point
+            // on every reconfiguration. See RouteTunnelReconciler.
+            hostingAccessPoint: TransportParameters.hostedNetworkAddress() != nil,
             needsRebuild: routeManagerNeedsRebuild
         ) {
         case .wait:
