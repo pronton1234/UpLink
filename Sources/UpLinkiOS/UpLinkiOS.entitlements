@@ -20,6 +20,16 @@
 	         --domain-identifier group.com.uplink.app \
 	         --source Library/Caches/uplink-phone.log \
            --destination <absolute path> -->
+	<!-- Lets the app join the Mac's network with NEHotspotConfiguration, which
+	     is what makes the whole flow one button: no trip to Settings, no
+	     network picked out of a list, no password typed. Without it,
+	     `apply(_:)` fails at runtime while the build stays green.
+
+	     Requires the Hotspot capability on the App ID. It is free with any
+	     Apple Developer account -- there is no recurring cost anywhere in this
+	     product. -->
+	<key>com.apple.developer.networking.HotspotConfiguration</key>
+	<true/>
 	<key>com.apple.security.application-groups</key>
 	<array>
 		<string>group.com.uplink.app</string>
