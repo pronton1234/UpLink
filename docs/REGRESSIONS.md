@@ -1268,3 +1268,32 @@ silently prevented the Mac from hosting at launch at all.
 already available to ask. Prefer the deterministic request; add the background
 repair only when nobody can be present, and never to an operation that rebuilds
 the thing it is repairing.
+
+## The root daemon was never the code we were shipping, 2026-08-21
+
+For most of a night, fixes were installed, verified on disk, and not running.
+
+**Replacing the app does not restart a running LaunchDaemon**, and nothing short
+of root can restart one — `launchctl kickstart` answers `Operation not
+permitted`. So the helper went on executing whatever binary it had started with
+while the app, the code on disk, and every version string said otherwise. It
+showed `runs = 1` and a build four releases behind the app it was embedded in.
+
+Every symptom this produced pointed at code that was not executing, which is the
+most expensive kind of wrong: each one had a plausible explanation in the source
+being read, and none of those explanations were being tested by the machine.
+
+Two things now make it impossible rather than something to remember:
+
+- `helperBuild` on the XPC protocol. A helper too old to implement it fails the
+  call, and that failure is itself the answer — so this detects the case it was
+  written for, not merely the case after it.
+- `replaceIfStale()` at launch: unregister, register. That is the one restart an
+  unprivileged app can perform on a system daemon, it is silent because the
+  service is already approved, and it runs before anything asks the helper for
+  work.
+
+**Rule this encodes.** When a component's lifetime is not tied to the thing that
+deploys it, its version is a fact that must be checked at runtime, not assumed
+from the build. Anything long-lived and separately launched — daemons, network
+extensions, agents — needs to say what it is, out loud, on every start.

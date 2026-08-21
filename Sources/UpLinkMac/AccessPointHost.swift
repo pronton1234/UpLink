@@ -50,6 +50,54 @@ final class AccessPointHost {
         return created
     }
 
+    /// Replaces a helper still running an older build of this app.
+    ///
+    /// **Replacing the app does not restart a running LaunchDaemon**, and
+    /// nothing short of root can restart one — `launchctl kickstart` answers
+    /// "Operation not permitted". So the daemon goes on running whatever binary
+    /// it started with, indefinitely, while the app, the code on disk and every
+    /// version string all say otherwise. Fixes were shipped to a machine that
+    /// never loaded them for most of a night, and every symptom pointed at code
+    /// that was not executing.
+    ///
+    /// Unregistering and registering again is the one restart an unprivileged
+    /// app can perform. The service is already approved, so this does not ask
+    /// the user for anything.
+    func replaceIfStale() async {
+        guard isRegistered else { return }
+        let mine = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        let theirs = await build()
+
+        // A helper too old to answer at all is exactly the case this exists
+        // for, so a nil is treated as stale rather than as a reason to stop.
+        guard theirs != mine else { return }
+        log.error("helper is build \(theirs ?? "unknown", privacy: .public), app is \(mine, privacy: .public) — replacing")
+
+        let service = SMAppService.daemon(plistName: Self.plistName)
+        do {
+            try await service.unregister()
+            try service.register()
+            log.error("helper replaced")
+        } catch {
+            // Reported, not fatal. A stale helper still works; it is simply
+            // working from yesterday's idea of what to do.
+            log.error("could not replace the helper: \(error.localizedDescription, privacy: .public)")
+        }
+        connection?.invalidate()
+        connection = nil
+    }
+
+    /// The build the running helper was launched from, or nil if it is too old
+    /// to say.
+    private func build() async -> String? {
+        await withCheckedContinuation { continuation in
+            proxy { helper, _ in
+                guard let helper else { return continuation.resume(returning: nil) }
+                helper.helperBuild { continuation.resume(returning: $0) }
+            }
+        }
+    }
+
     /// Records the password the user set on the network in System Settings.
     func setPassphrase(_ passphrase: String) {
         UserDefaults.standard.set(passphrase, forKey: Self.passphraseKey)

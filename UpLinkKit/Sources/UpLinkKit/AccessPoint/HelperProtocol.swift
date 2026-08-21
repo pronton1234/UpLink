@@ -27,6 +27,19 @@ import Foundation
 
     /// Whether the access point is currently up, as the helper sees it.
     func accessPointStatus(withReply reply: @escaping (Bool) -> Void)
+
+    /// The build of the app this helper was launched from.
+    ///
+    /// Exists because **replacing the app does not restart a running
+    /// LaunchDaemon**, and nothing short of root can restart one. A stale
+    /// helper looks identical to a current one from every angle: the app is
+    /// new, the code on disk is new, and the daemon quietly goes on running
+    /// whatever it started with. That cost most of a night, repeatedly, with
+    /// every symptom pointing at code that was not executing.
+    ///
+    /// An older helper does not implement this at all, and the call failing is
+    /// itself the answer.
+    func helperBuild(withReply reply: @escaping (String) -> Void)
 }
 
 public enum UpLinkHelper {

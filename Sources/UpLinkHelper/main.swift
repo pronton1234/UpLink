@@ -62,6 +62,10 @@ final class HelperService: NSObject, NSXPCListenerDelegate, UpLinkHelperProtocol
     func accessPointStatus(withReply reply: @escaping (Bool) -> Void) {
         reply(AccessPointControl.isUp())
     }
+
+    func helperBuild(withReply reply: @escaping (String) -> Void) {
+        reply(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown")
+    }
 }
 
 let delegate = HelperService()

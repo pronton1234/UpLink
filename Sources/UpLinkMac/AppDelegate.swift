@@ -48,7 +48,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Registering does not raise the access point. That is deliberate:
         // installing the app should not silently take over the Wi-Fi radio.
         accessPoint.register()
-        refreshAccessPointState()
+        // Before anything asks the helper to do work, make sure it is the
+        // helper this build shipped. See `replaceIfStale`.
+        Task { @MainActor in
+            await accessPoint.replaceIfStale()
+            refreshAccessPointState()
+            hostAccessPointIfNeeded()
+        }
 
         // THE NETWORK IS ALWAYS UP, and that is the design rather than a
         // convenience. The phone cannot ask the Mac to start hosting, because
@@ -61,7 +67,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // there is nothing being taken away by hosting continuously. Stopping
         // stays available in the menu for when the user genuinely wants the
         // radio back.
-        hostAccessPointIfNeeded()
         startBeacon()
 
         // NO TIMER HERE, DELIBERATELY, and it was here for four hours.
