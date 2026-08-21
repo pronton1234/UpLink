@@ -854,9 +854,16 @@ final class MenuBarModel {
         // No access point means no network to find the phone on, and the lease
         // file outlives the network — so this check is what stops a stale entry
         // being announced as a live peer.
-        guard FileManager.default.fileExists(atPath: "/dev/null"),
-              (try? String(contentsOfFile: DHCPLease.path, encoding: .utf8)) != nil,
-              isHostingAccessPoint() else { return }
+        // ONE definition of "are we hosting", shared with everything else.
+        //
+        // This used to have its own, testing bridge100 for IFF_RUNNING while
+        // the dial binding, the route-mode pin and the failsafe all tested it
+        // for an IPv4 address. Those are not the same question, and the bridge
+        // does not reliably carry IFF_RUNNING — so the Mac would raise the
+        // access point, bind its dial to it, and never tell the extension the
+        // phone was there. Observed 2026-08-21: the phone joined and listened
+        // for 72 seconds while the Mac announced nothing at all.
+        guard TransportParameters.hostedNetworkAddressExists else { return }
 
         guard let contents = try? String(contentsOfFile: DHCPLease.path, encoding: .utf8),
               let lease = DHCPLease.mostRecent(in: contents) else { return }
@@ -873,20 +880,6 @@ final class MenuBarModel {
         _ = await sendToExtension(message)
     }
 
-    /// Whether this Mac is currently hosting its access point.
-    ///
-    /// Read from the interfaces. The preference file says what was asked for,
-    /// which has repeatedly not been what is running.
-    private func isHostingAccessPoint() -> Bool {
-        var addresses: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&addresses) == 0, let first = addresses else { return false }
-        defer { freeifaddrs(addresses) }
-        for pointer in sequence(first: first, next: { $0.pointee.ifa_next })
-        where String(cString: pointer.pointee.ifa_name) == "bridge100" {
-            return pointer.pointee.ifa_flags & UInt32(IFF_RUNNING) != 0
-        }
-        return false
-    }
 
     private func sendToExtension(_ message: String) async -> String? {
         guard let session = manager?.connection as? NETunnelProviderSession else { return nil }

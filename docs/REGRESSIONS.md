@@ -1504,3 +1504,28 @@ Three things were wrong, and each alone was enough:
 a single point of failure wherever it is weakest — and the place it is weakest is
 exactly where the product is meant to be used. Prefer behaviour that needs no
 channel at all when it costs nothing.
+
+## Two definitions of "are we hosting", 2026-08-21
+
+The phone joined the access point and listened on it for 72 seconds. The Mac
+announced nothing, never dialled, and the bridge never formed — while the access
+point was up the whole time and the Bluetooth doorbell had worked perfectly.
+
+`announcePeerIfPossible` had its own idea of what hosting meant: `bridge100`
+carrying `IFF_RUNNING`. Everything else — the dial binding, the route-mode pin,
+the self-hosting failsafe — asked whether `bridge100` had an **IPv4 address**.
+Those are different questions, and a bridge interface does not reliably carry
+`IFF_RUNNING`.
+
+So the Mac would raise the access point, correctly bind its dial to it, and
+never tell the extension the phone was there. Every part worked and one of them
+was answering a different question.
+
+There is now one definition, `TransportParameters.hostedNetworkAddressExists`,
+and the duplicate is deleted rather than corrected — a second copy that agrees
+today is a second copy that can disagree tomorrow.
+
+**Rule this encodes.** When several places need the same fact, they must call
+the same function. Two implementations of one predicate is a bug with a delay on
+it: they agree until the day the underlying flag behaves differently, and then
+only one of them is wrong.
