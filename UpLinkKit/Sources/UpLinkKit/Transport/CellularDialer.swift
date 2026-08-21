@@ -13,17 +13,27 @@ public actor CellularDialer: DestinationDialer {
 
     private let queue: DispatchQueue
     private let requiredInterface: NWInterface.InterfaceType?
+    private let bearer: WirelessBearer
 
     /// - Parameter requiredInterface: `.cellular` in production. Injectable so
     ///   the spike apps and the Simulator (which has no cellular radio) can run
     ///   the same code path unpinned.
-    public init(queue: DispatchQueue, requiredInterface: NWInterface.InterfaceType? = .cellular) {
+    /// - Parameter bearer: which link carries the peer connection. Determines
+    ///   the interfaces a destination dial must refuse — see ``WirelessBearer``.
+    public init(
+        queue: DispatchQueue,
+        requiredInterface: NWInterface.InterfaceType? = .cellular,
+        bearer: WirelessBearer = .hostedAP
+    ) {
         self.queue = queue
         self.requiredInterface = requiredInterface
+        self.bearer = bearer
     }
 
     public func connect(to destination: StreamOpen) async throws -> DestinationConnection {
-        let parameters = Self.parameters(for: destination, requiredInterface: requiredInterface)
+        let parameters = Self.parameters(
+            for: destination, requiredInterface: requiredInterface, bearer: bearer
+        )
 
         let endpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host(destination.host),
@@ -43,7 +53,8 @@ public actor CellularDialer: DestinationDialer {
     /// these parameters itself would prove nothing about what ships.
     static func parameters(
         for destination: StreamOpen,
-        requiredInterface: NWInterface.InterfaceType?
+        requiredInterface: NWInterface.InterfaceType?,
+        bearer: WirelessBearer
     ) -> NWParameters {
         let parameters: NWParameters
         switch destination.proto {
@@ -79,12 +90,20 @@ public actor CellularDialer: DestinationDialer {
         // successful cellular dial. Prohibiting the interface outright is the
         // half that cannot be negotiated away.
         //
-        // Wired only. Loopback is deliberately NOT prohibited: a destination on
-        // the phone's own loopback is not a way around the bridge, and banning
-        // it breaks every integration test that points "the internet" at a
-        // local server — which is how the datagram and refused-destination
-        // suites are able to run without a network at all.
-        parameters.prohibitedInterfaceTypes = [.wiredEthernet]
+        // AND THE SAME HAZARD EXISTS WIRELESSLY, one interface over. With the
+        // phone associated to an access point the Mac hosts, a dial satisfied
+        // over Wi-Fi leaves the phone, crosses the access point and arrives
+        // back at the Mac — the identical loop, reached by a different radio.
+        //
+        // So the prohibited set is not a property of this dialer, it is a
+        // property of whichever link is carrying the peer connection. Asking
+        // the bearer is what stops the two from drifting apart when one is
+        // added. Loopback is deliberately NOT prohibited by any of them: a
+        // destination on the phone's own loopback is not a way around the
+        // bridge, and banning it breaks every integration test that points
+        // "the internet" at a local server — which is how the datagram and
+        // refused-destination suites are able to run without a network at all.
+        parameters.prohibitedInterfaceTypes = bearer.prohibitedEgressInterfaces
 
         // Never route a proxied connection through a proxy configured on the
         // phone — that would silently re-route the user's traffic somewhere

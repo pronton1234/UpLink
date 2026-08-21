@@ -191,6 +191,11 @@ struct HelloBindingRegressionTests {
 }
 
 // REGRESSION: the phone must never egress back up the cable it is bridging for.
+//
+// The bearer is named explicitly below rather than defaulted, because this
+// suite is about the CABLE's hazard specifically. The same defect over the
+// wireless bearer — where the phone is associated to a network the Mac hosts —
+// is guarded separately in EgressLoopRegressionTests.
 @Suite("Regression: the phone's egress must not follow the cable back")
 struct CellularEgressRegressionTests {
 
@@ -203,7 +208,7 @@ struct CellularEgressRegressionTests {
         for proto in [StreamOpen.Proto.tcp, .udp] {
             let destination = StreamOpen(proto: proto, host: "example.com", port: 443)
             let parameters = CellularDialer.parameters(
-                for: destination, requiredInterface: .cellular
+                for: destination, requiredInterface: .cellular, bearer: .usbmux
             )
             let prohibited = parameters.prohibitedInterfaceTypes ?? []
 
@@ -230,7 +235,8 @@ struct CellularEgressRegressionTests {
     func unpinnedStillRefusesTheCable() {
         let parameters = CellularDialer.parameters(
             for: StreamOpen(proto: .tcp, host: "example.com", port: 443),
-            requiredInterface: nil
+            requiredInterface: nil,
+            bearer: .usbmux
         )
         #expect(parameters.requiredInterfaceType != .cellular)
         #expect((parameters.prohibitedInterfaceTypes ?? []).contains(.wiredEthernet))

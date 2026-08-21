@@ -826,3 +826,40 @@ the case the subset left out.
 Pinned by `RouteTunnelRestartRegressionTests`, which walks the reported sequence
 as transitions and asserts that no combination of inputs can ever tear the
 tunnel down.
+
+## Wireless bearer, 2026-08-20 — the peer link's own interface is an egress path
+
+`CellularDialer` has always prohibited `.wiredEthernet`, and the comment above
+that line explains why: plugging the phone into the Mac gives the phone a wired
+interface, so a Mac with any route to share lets the phone dial out through it.
+The bridge then carries traffic from the Mac to the phone and straight back to
+the Mac, bypassing nothing while reporting a healthy session, and the egress
+report says `.wiredEthernet` only after the fact.
+
+The wireless bearer recreates that hazard exactly, one interface over. With the
+phone associated to an access point the Mac hosts, a destination dial satisfied
+over Wi-Fi leaves the phone, crosses the access point and arrives back at the
+Mac. Same loop, different radio.
+
+`requiredInterfaceType` does not close it. It is documented as a preference
+Network.framework may fall back from, which is precisely how a Wi-Fi fallback
+was once observed being reported as a successful cellular dial. Prohibition is
+the half that cannot be negotiated away.
+
+**The fix is where the rule lives, not what it says.** A literal
+`[.wiredEthernet]` in the dialer is correct while there is one bearer and wrong
+the moment there are three, because the set is not a property of the dialer — it
+is a property of whichever link is carrying the peer connection.
+`WirelessBearer.prohibitedEgressInterfaces` owns it, so adding a bearer cannot
+leave the prohibition behind. This is the same shape as the identifiers that
+were scattered across four targets until one file owned them.
+
+| Test | Guards against |
+| --- | --- |
+| `EgressLoopRegressionTests` | A proxied dial re-entering the Mac over the access point. Asserts `.wifi` prohibited under `.hostedAP`, cellular still required, and — separately — that the cable's prohibition is unchanged, so adopting the wireless bearer cannot quietly widen or narrow the USB path. |
+| `CellularEgressRegressionTests` | Unchanged, now naming `.usbmux` explicitly rather than relying on a default. A cable regression that silently started testing a different bearer would be worse than no test. |
+
+Loopback stays permitted under every bearer, deliberately. A destination on the
+phone's own loopback is not a way around the bridge, and banning it breaks every
+integration test that points "the internet" at a local server — which is how the
+datagram and refused-destination suites run with no network at all.
