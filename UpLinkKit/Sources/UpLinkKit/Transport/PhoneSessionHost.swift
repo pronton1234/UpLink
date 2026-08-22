@@ -291,7 +291,17 @@ public actor PhoneSessionHost {
 
         listener.start(queue: queue)
         self.listener = listener
-        log.error("listening on 127.0.0.1:\(self.port, privacy: .public) as '\(self.deviceName, privacy: .public)' sessionKeys=\(sessionKeys.count, privacy: .public) pairingCode=\(pairingKey != nil, privacy: .public)")
+        log.error("listening on port \(self.port, privacy: .public) as '\(self.deviceName, privacy: .public)' sessionKeys=\(sessionKeys.count, privacy: .public) pairingCode=\(pairingKey != nil, privacy: .public)")
+        // ALSO where it can be read off the device.
+        //
+        // The key count is the number that decides whether multi-PSK selection
+        // is even being asked for. One key is the case the cable proved; more
+        // than one is a case this project has never observed working, and the
+        // README says so. A handshake that hangs rather than being refused
+        // looks identical either way, so the count has to be visible.
+        PhoneDiagnosticLog.shared.write(
+            "listener armed: sessionKeys=\(sessionKeys.count) pairingCode=\(pairingKey != nil)"
+        )
     }
 
     /// The long-term key shared with one paired Mac.
