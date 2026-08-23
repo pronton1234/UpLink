@@ -222,7 +222,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.observe { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
-                beacon.setSessionLive(self.model.status.isConnected)
+                let connected = self.model.status.isConnected
+                beacon.setSessionLive(connected)
+
+                // A SESSION ENDING RE-ARMS THE GUARD, so the Mac stops hosting
+                // on its own if the phone does not come back.
+                //
+                // Stop on the phone asks the Mac to lower over Bluetooth, and
+                // that request can simply not arrive — out of range, radio off,
+                // the app suspended before it went out. Without this the Mac
+                // went on hosting indefinitely with nothing connected, which is
+                // what the user saw: Stop pressed, and Internet Sharing still
+                // running.
+                //
+                // Nothing is lost if the phone does return: the guard checks
+                // for a live session before acting, and reconnecting inside the
+                // window simply cancels it.
+                if self.wasConnected, !connected { self.stopHostingIfNothingConnects() }
+                self.wasConnected = connected
             }
         }
     }
@@ -308,6 +325,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// handshake — measured at roughly twenty seconds end to end when it works.
     private static let strandingTimeout: TimeInterval = 50
     private var strandingGuard: Timer?
+    /// Last observed session state, so the transition to "ended" can be seen.
+    private var wasConnected = false
     /// Whether the Mac had a network of its own when it started hosting.
     private var hadAnotherNetworkBeforeHosting = false
 

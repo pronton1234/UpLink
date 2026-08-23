@@ -133,6 +133,34 @@ enum AccessPointJoin {
     /// app installed, but naming it explicitly keeps that true if the app ever
     /// installs more than one.
     static func leave(_ credentials: AccessPointCredentials) {
-        NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: credentials.ssid)
+        leave()
+    }
+
+    /// Leaves the Mac's network, whatever it turned out to be called.
+    ///
+    /// **Asks iOS which networks we configured rather than guessing one.** The
+    /// old version removed `credentials.ssid` — the name this app would have
+    /// chosen — while the join matches a PREFIX, because the Mac's real network
+    /// name cannot be set or read (see `join`). So it removed a network that
+    /// was never joined and left the real one in place: the phone stayed on an
+    /// access point with no internet behind it after the user pressed Stop,
+    /// which is the worst state available, and it looked like Stop had done
+    /// nothing.
+    ///
+    /// Every configured network carrying our prefix is removed, not just the
+    /// first. Repeated joins under different names are exactly what this
+    /// product produces.
+    static func leave() {
+        NEHotspotConfigurationManager.shared.getConfiguredSSIDs { ssids in
+            let ours = ssids.filter { $0.hasPrefix(AccessPointCredentials.ssidPrefix) }
+            guard !ours.isEmpty else {
+                PhoneDiagnosticLog.shared.write("leave: nothing configured to remove")
+                return
+            }
+            for ssid in ours {
+                NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: ssid)
+            }
+            PhoneDiagnosticLog.shared.write("leave: removed \(ours.joined(separator: ", "))")
+        }
     }
 }

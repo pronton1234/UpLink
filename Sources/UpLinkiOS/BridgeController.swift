@@ -3,6 +3,7 @@ import NetworkExtension
 import Network
 import CryptoKit
 import Observation
+import UIKit
 import OSLog
 import UpLinkKit
 
@@ -424,12 +425,24 @@ final class BridgeController {
         // is being torn down as this runs, so a message down it would race the
         // teardown and lose. The doorbell is still there either way.
         //
-        // Fire and forget. If the Mac does not hear it the worst case is an
-        // access point left running, which is the state it is designed to sit
-        // in anyway — never a failure the user has to act on.
-        Task { [remote] in
-            _ = await remote.send(.lowerAccessPoint)
+        // Held open while it goes out. This used to be fire-and-forget, and
+        // iOS suspends a backgrounded app within seconds — which is exactly
+        // when Stop is pressed and the user puts the phone down. The command
+        // never left, the Mac kept hosting, and Stop appeared to do nothing.
+        let task = UIApplication.shared.beginBackgroundTask(withName: "uplink.lower")
+        Task { [remote, diagnostics] in
+            let delivered = await remote.send(.lowerAccessPoint)
+            diagnostics.write(delivered
+                ? "leave: told the Mac to stop hosting"
+                : "leave: could NOT reach the Mac over Bluetooth — it may still be hosting")
+            UIApplication.shared.endBackgroundTask(task)
         }
+
+        // AND LEAVE THE NETWORK. Without this the phone stays joined to an
+        // access point with nothing behind it: no internet, no bridge, and
+        // nothing on screen explaining why. Stop has to give the phone its own
+        // connectivity back, not just end the session.
+        AccessPointJoin.leave()
     }
 
     /// Asks the extension what it is actually observing.

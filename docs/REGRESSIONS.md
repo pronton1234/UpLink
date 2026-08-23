@@ -1529,3 +1529,35 @@ today is a second copy that can disagree tomorrow.
 the same function. Two implementations of one predicate is a bug with a delay on
 it: they agree until the day the underlying flag behaves differently, and then
 only one of them is wrong.
+
+## Stop did not stop, 2026-08-22
+
+Pressing Stop on the phone ended the session and left everything else running:
+the phone stayed joined to the Mac's access point — a network with nothing
+behind it, so no internet — and the Mac went on hosting. From the outside Stop
+appeared to do nothing at all.
+
+Three separate faults, each sufficient on its own:
+
+- **The phone never left the network.** `leave()` existed and was called from
+  nowhere.
+- **It would have removed the wrong one.** It asked for `credentials.ssid`, the
+  name this app would have chosen, while the join matches a **prefix** because
+  the Mac's real network name can be neither set nor read. So it removed a
+  network that was never joined. Every configured SSID carrying our prefix is
+  now removed, asked of iOS rather than assumed — repeated joins under different
+  names are exactly what this product produces.
+- **The request to the Mac could evaporate.** It was fire-and-forget in a
+  `Task`, and iOS suspends a backgrounded app within seconds — which is
+  precisely when Stop is pressed and the phone is put down. It is held open with
+  a background task now, and the outcome is written to the readable log.
+
+And the Mac no longer depends on that request arriving. A session ending
+re-arms the guard that lowers the access point when nothing connects, so a
+command lost to range, a radio switched off, or an app suspended too early costs
+nothing. In a car it deliberately keeps hosting: there is no network to go back
+to, and lowering would leave the phone no way in.
+
+**Rule this encodes.** A teardown has as many steps as the setup did. Ending the
+session was one of three things starting it had done, and the other two were
+left running — each in a state that looks like the feature is broken.
