@@ -270,6 +270,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
+    /// Gives the Mac its own network back if hosting produced no bridge.
+    ///
+    /// **Hosting costs the user everything until it pays off.** Raising the
+    /// access point takes the Wi-Fi radio, so from that moment the Mac has no
+    /// internet of its own — and if no session forms, it has none at all. That
+    /// is strictly worse than never having tried, and it is the state the user
+    /// found themselves in: the network "working" meant the internet was gone.
+    ///
+    /// So hosting is on probation. If no session appears within the window, the
+    /// access point comes down and the Mac rejoins whatever it was on. The
+    /// phone can always ask again — the doorbell is listening, and the failsafe
+    /// re-hosts on its own when there is no network to lose.
+    private func stopHostingIfNothingConnects() {
+        strandingGuard?.invalidate()
+        strandingGuard = Timer.scheduledTimer(
+            withTimeInterval: Self.strandingTimeout, repeats: false
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                guard !self.model.status.isConnected else { return }
+                guard TransportParameters.hostedNetworkAddressExists else { return }
+                // Only when there is something to go back to. With no other
+                // network — the car — coming down strands the Mac just as
+                // surely, and leaves the phone no way in either.
+                guard self.macHasAnotherNetwork() || self.hadAnotherNetworkBeforeHosting else { return }
+
+                self.logAccessPoint.error(
+                    "no bridge after \(Int(Self.strandingTimeout), privacy: .public)s — giving the Mac its network back"
+                )
+                Task { _ = await self.accessPoint.lower(); await self.settle(expecting: false) }
+            }
+        }
+    }
+
+    /// Long enough for the phone to join, be announced, and complete a
+    /// handshake — measured at roughly twenty seconds end to end when it works.
+    private static let strandingTimeout: TimeInterval = 50
+    private var strandingGuard: Timer?
+    /// Whether the Mac had a network of its own when it started hosting.
+    private var hadAnotherNetworkBeforeHosting = false
+
     private func hostAccessPointIfNeeded() {
         guard !accessPointStoppedByUser, !accessPointBusy else { return }
         // NEVER while a session is live. Raising re-applies the Internet
@@ -301,8 +342,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // would have silently stopped the Mac hosting at launch at all.
             accessPointBusy = true
             lastRaise = Date()
+            hadAnotherNetworkBeforeHosting = macHasAnotherNetwork()
             refreshStatusItem()
             let failure = await accessPoint.raise()
+            stopHostingIfNothingConnects()
             accessPointBusy = false
             if let failure {
                 // Not an alert. This runs unattended and on a timer; a modal
