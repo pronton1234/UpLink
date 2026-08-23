@@ -28,18 +28,50 @@ blue "==> 1. The bearer"
   || fail "no access point — bridge100 is absent. Tap Connect on the phone."
 green "    access point up on $(/sbin/ifconfig bridge100 | awk '/inet /{print $2}')"
 
-# Read from the lease rather than assumed. A hardcoded .2 once reported a
-# healthy phone as absent because it had been given .3.
-PHONE=$(/usr/bin/awk -F= '/ip_address/{a=$2} END{print a}' /var/db/dhcpd_leases 2>/dev/null)
+# THE SAME RULE THE APP USES: newest lease by expiry, not last in the file.
+#
+# This script used to take whichever entry appeared last, and reported a working
+# bridge as broken because of it. iOS randomises its MAC per join, so every join
+# leaves another entry behind, and the file accumulates dead ones -- here, a .2
+# that expired two days ago sitting after a live .3. The app picks by expiry
+# (DHCPLease.mostRecent), so the two disagreed about which address was the
+# phone, and only the script was wrong.
+# Hex is converted in the shell because macOS awk has no strtonum -- a GNU
+# extension. Written with it, this printed nothing at all and the script then
+# failed on an empty address, which is a worse answer than the wrong one.
+PHONE=$(
+  /usr/bin/awk -F= '/ip_address/{ip=$2} /lease=/{print $2, ip}' \
+      /var/db/dhcpd_leases 2>/dev/null |
+  while read -r hex ip; do printf '%d %s\n' "$hex" "$ip"; done |
+  sort -rn | head -1 | cut -d' ' -f2
+)
 [ -n "$PHONE" ] || fail "no DHCP lease — the phone has not joined the network"
 
 /sbin/route -n get "$PHONE" 2>/dev/null | grep -q 'interface: bridge100' \
   || fail "$PHONE does not route over bridge100 — packets would leave on the wrong interface"
 green "    phone at $PHONE, routed over bridge100"
 
-/usr/sbin/arp -n "$PHONE" 2>/dev/null | grep -qv 'no entry' \
-  || fail "$PHONE does not answer ARP — the phone is not on the network"
-green "    phone answers on the link"
+# NOT A FAILURE, and it used to be one. An ARP entry expires after a few
+# minutes of no traffic to that host, so its absence means "nobody has spoken to
+# the phone recently", not "the phone is gone" -- and this script is usually run
+# when nothing has. It reported a bridge that was carrying data as broken.
+#
+# What settles it is the session, checked next. This line is a hint, not a gate.
+if /usr/sbin/arp -n "$PHONE" 2>/dev/null | grep -q 'no entry'; then
+  echo "    (no ARP entry for $PHONE — normal when the link has been idle)"
+else
+  green "    phone answers on the link"
+fi
+
+# LINK QUALITY, because range is what fails in a car and nothing else here
+# would show it. A bridge that works at arm's length and not from the boot is
+# not a logic fault, and every check above passes in both cases.
+echo "    link quality (10 pings):"
+/sbin/ping -c 10 -i 0.3 -W 1000 "$PHONE" 2>/dev/null | tail -2 | sed 's/^/      /' \
+  || echo "      (no reply — iOS may be ignoring ICMP; not conclusive on its own)"
+echo "      loss above a few percent, or RTT in the tens of ms, means the radio"
+echo "      is struggling. 5 GHz does not go through seat backs; a 2.4 GHz"
+echo "      channel in Wi-Fi Options trades speed for reach."
 
 blue "==> 2. Is traffic really crossing it?"
 
