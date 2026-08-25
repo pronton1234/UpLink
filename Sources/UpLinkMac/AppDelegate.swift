@@ -110,9 +110,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // genuinely alone.
         Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, !self.macHasAnotherNetwork() else { return }
+                guard let self else { return }
                 guard !TransportParameters.hostedNetworkAddressExists else { return }
                 guard !self.model.status.isConnected else { return }
+
+                // SUSTAINED ABSENCE, NEVER A SINGLE READING, and the difference
+                // is the whole bug.
+                //
+                // Hosting takes the Wi-Fi radio, so the moment it starts the
+                // Mac cannot see its own network any more — which means this
+                // check can never disagree with itself afterwards. One
+                // momentary reading is therefore enough to latch hosting on
+                // permanently, and closing the lid is exactly the kind of event
+                // that produces one: Wi-Fi drops for a second, the failsafe
+                // fires, the radio is seized, and en0 can never come back.
+                //
+                // Reported from a closed laptop sitting in a place with working
+                // internet, which then started sharing and stayed that way.
+                guard !self.macHasAnotherNetwork() else {
+                    if self.noNetworkStreak > 0 {
+                        self.logAccessPoint.error("network is back — not hosting")
+                    }
+                    self.noNetworkStreak = 0
+                    return
+                }
+                self.noNetworkStreak += 1
+                guard self.noNetworkStreak >= Self.noNetworkChecksBeforeHosting else {
+                    self.logAccessPoint.error(
+                        "no network seen (\(self.noNetworkStreak, privacy: .public)/\(Self.noNetworkChecksBeforeHosting, privacy: .public)) — waiting before hosting"
+                    )
+                    return
+                }
+                self.noNetworkStreak = 0
 
                 // A Stop means "give me my network back". With no network to
                 // give back it means nothing, so it is not allowed to strand
@@ -325,6 +354,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// handshake — measured at roughly twenty seconds end to end when it works.
     private static let strandingTimeout: TimeInterval = 50
     private var strandingGuard: Timer?
+    /// Consecutive checks that found no network of our own.
+    private var noNetworkStreak = 0
+    /// Three minutes at the sixty-second interval. Long enough that a Wi-Fi
+    /// blip, a lid closing, or a DHCP renewal cannot trigger a takeover the
+    /// Mac has no way to reverse; short enough to be a backstop in a car, where
+    /// the phone's doorbell is the fast path anyway.
+    private static let noNetworkChecksBeforeHosting = 3
+
     /// Last observed session state, so the transition to "ended" can be seen.
     private var wasConnected = false
     /// Whether the Mac had a network of its own when it started hosting.

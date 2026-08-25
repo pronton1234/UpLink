@@ -1561,3 +1561,33 @@ to, and lowering would leave the phone no way in.
 **Rule this encodes.** A teardown has as many steps as the setup did. Ending the
 session was one of three things starting it had done, and the other two were
 left running — each in a state that looks like the feature is broken.
+
+## A closed lid with working internet started hosting, 2026-08-22
+
+Reported from a laptop closed and left somewhere with a working network. It
+began sharing anyway and stayed that way.
+
+The failsafe hosts when the Mac has no network of its own to lose, and it acted
+on a **single reading**. That is enough, because the decision destroys the
+evidence for itself: hosting takes the Wi-Fi radio, so from the instant it
+starts the Mac cannot see its own network any more and the check can never
+disagree with itself afterwards.
+
+So one momentary reading latches hosting on permanently — and closing a lid is
+exactly the kind of event that produces one. Wi-Fi drops for a second, the
+failsafe fires, the radio is seized, and `en0` has no way back.
+
+Absence must now be sustained across three consecutive checks — three minutes —
+before hosting begins, and any sight of a network resets the count. In a car
+this costs nothing: the phone's Bluetooth doorbell is the fast path, and the
+failsafe is only the backstop for when it cannot reach.
+
+The check itself was deliberately **not** changed to require a default route.
+While the route tunnel is capturing, the Mac's default route is `utun5`, so a
+non-tunnel-route test would read as "no network" exactly when the Mac is
+working normally — trading this bug for a worse one.
+
+**Rule this encodes.** An automatic action that destroys the evidence for its
+own trigger can never correct itself. Require the condition to persist for
+longer than any transient that could produce it, and be sure the test would
+still be true a minute later.
